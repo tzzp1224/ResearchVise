@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+config/.env
+
+# Logs
+*.log
+
+# Test artifacts
+junit*.xml
+test-results/
+
+# Generated runtime and output data
+data/.slidev_runtime/
+data/outputs/
+data/qdrant_db/
+data/notebooklm_profile/
