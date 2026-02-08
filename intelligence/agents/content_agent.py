@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 import json
 import logging
 import asyncio
+import re
 
 from intelligence.llm import BaseLLM, get_llm, Message
 from intelligence.state import (
@@ -64,6 +65,10 @@ ONE_PAGER_PROMPT = """你是一个资深研究工程师。请根据以下事实�
 8. 相关资源链接（论文/代码/文档）
 9. resources 里只能使用真实可访问的 http(s) 链接；不要输出“请搜索/待补充/占位符”文本
 10. 若无法确认链接，请省略该条资源，不要编造
+11. technical_deep_dive 必须包含“实现细节 + 设计考量 + 失效边界”，至少 3 条
+12. key_findings 至少 2 条为“横向对比”（与其他技术/方案相比的差异、收益与代价）
+13. implementation_notes 必须包含可执行步骤（配置、依赖、监控指标、回滚策略）
+14. 严禁泛泛而谈或营销措辞，优先写可验证、可复现、可度量结论
 
 请以 JSON 格式输出：
 {{
@@ -96,6 +101,9 @@ VIDEO_BRIEF_PROMPT = """你是一个技术视频导演+编导。请根据以下�
 6. 每个段落给出建议时长（秒），总时长 120-360 秒
 7. visual_prompt 要可直接用于文生视频模型，包含镜头语言、场景、风格、画面元素
 8. 每个 segment 必须包含 duration_sec(int) 和 visual_prompt(non-empty string)
+9. 段落结构必须覆盖：机制实现 -> 指标/实验 -> 横向对比 -> 局限性/风险 -> 工程落地
+10. talking_points 必须包含可量化或可执行信息（指标、参数、代价、决策依据），避免空泛描述
+11. 至少 1 个段落明确说明“与主流替代方案的对比与取舍”
 
 请以 JSON 格式输出：
 {{
@@ -198,20 +206,9 @@ class ContentAgent:
             return_exceptions=True,
         )
         
-        timeline, one_pager, video_brief = results
-        
-        # 处理异常
-        if isinstance(timeline, Exception):
-            logger.error(f"Timeline generation failed: {timeline}")
-            timeline = None
-        
-        if isinstance(one_pager, Exception):
-            logger.error(f"One-pager generation failed: {one_pager}")
-            one_pager = None
-            
-        if isinstance(video_brief, Exception):
-            logger.error(f"Video brief generation failed: {video_brief}")
-            video_brief = None
+        timeline = self._unwrap_result("Timeline", results[0])
+        one_pager = self._unwrap_result("One-pager", results[1])
+        video_brief = self._unwrap_result("Video brief", results[2])
         
         logger.info("Content generation completed")
         
@@ -221,6 +218,23 @@ class ContentAgent:
             "one_pager": one_pager,
             "video_brief": video_brief,
         }
+
+    @staticmethod
+    def _unwrap_result(label: str, result: Any) -> Any:
+        if isinstance(result, Exception):
+            logger.error(f"{label} generation failed: {result}")
+            return None
+        return result
+
+    async def _request_json(self, prompt: str, label: str) -> Optional[Dict[str, Any]]:
+        response = await self.llm.achat(prompt)
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", response)
+            if json_match:
+                return json.loads(json_match.group())
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.warning(f"{label} parse error: {exc}")
+        return None
     
     def _format_facts(self, facts: List[Dict]) -> str:
         """格式化事实列表"""
@@ -240,28 +254,19 @@ class ContentAgent:
     ) -> Optional[List[Dict]]:
         """生成时间轴"""
         prompt = TIMELINE_PROMPT.format(topic=topic, facts=facts_context)
-        
-        response = await self.llm.achat(prompt)
-        
-        try:
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
-                events = data.get("events", [])
-                return [
-                    TimelineEvent(
-                        date=e.get("date", ""),
-                        title=e.get("title", ""),
-                        description=e.get("description", ""),
-                        importance=int(e.get("importance", 3)),
-                        source_refs=e.get("source_refs", []),
-                    ).to_dict()
-                    for e in events
-                ]
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Timeline parse error: {e}")
-        
+        data = await self._request_json(prompt, "Timeline")
+        if data:
+            events = data.get("events", [])
+            return [
+                TimelineEvent(
+                    date=e.get("date", ""),
+                    title=e.get("title", ""),
+                    description=e.get("description", ""),
+                    importance=int(e.get("importance", 3)),
+                    source_refs=e.get("source_refs", []),
+                ).to_dict()
+                for e in events
+            ]
         return None
     
     async def _generate_one_pager(
@@ -271,29 +276,20 @@ class ContentAgent:
     ) -> Optional[Dict]:
         """生成一页纸摘要"""
         prompt = ONE_PAGER_PROMPT.format(topic=topic, facts=facts_context)
-        
-        response = await self.llm.achat(prompt)
-        
-        try:
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
-                return OnePager(
-                    title=data.get("title", topic),
-                    executive_summary=data.get("executive_summary", ""),
-                    key_findings=data.get("key_findings", []),
-                    metrics=data.get("metrics", {}),
-                    strengths=data.get("strengths", []),
-                    weaknesses=data.get("weaknesses", []),
-                    technical_deep_dive=data.get("technical_deep_dive", []),
-                    implementation_notes=data.get("implementation_notes", []),
-                    risks_and_mitigations=data.get("risks_and_mitigations", []),
-                    resources=data.get("resources", []),
-                ).to_dict()
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"One-pager parse error: {e}")
-        
+        data = await self._request_json(prompt, "One-pager")
+        if data:
+            return OnePager(
+                title=data.get("title", topic),
+                executive_summary=data.get("executive_summary", ""),
+                key_findings=data.get("key_findings", []),
+                metrics=data.get("metrics", {}),
+                strengths=data.get("strengths", []),
+                weaknesses=data.get("weaknesses", []),
+                technical_deep_dive=data.get("technical_deep_dive", []),
+                implementation_notes=data.get("implementation_notes", []),
+                risks_and_mitigations=data.get("risks_and_mitigations", []),
+                resources=data.get("resources", []),
+            ).to_dict()
         return None
     
     async def _generate_video_brief(
@@ -303,27 +299,18 @@ class ContentAgent:
     ) -> Optional[Dict]:
         """生成视频简报"""
         prompt = VIDEO_BRIEF_PROMPT.format(topic=topic, facts=facts_context)
-        
-        response = await self.llm.achat(prompt)
-        
-        try:
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
-                return VideoBrief(
-                    title=data.get("title", topic),
-                    duration_estimate=data.get("duration_estimate", "5-7 minutes"),
-                    hook=data.get("hook", ""),
-                    segments=data.get("segments", []),
-                    target_audience=data.get("target_audience", ""),
-                    visual_style=data.get("visual_style", ""),
-                    conclusion=data.get("conclusion", ""),
-                    call_to_action=data.get("call_to_action", ""),
-                ).to_dict()
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Video brief parse error: {e}")
-        
+        data = await self._request_json(prompt, "Video brief")
+        if data:
+            return VideoBrief(
+                title=data.get("title", topic),
+                duration_estimate=data.get("duration_estimate", "5-7 minutes"),
+                hook=data.get("hook", ""),
+                segments=data.get("segments", []),
+                target_audience=data.get("target_audience", ""),
+                visual_style=data.get("visual_style", ""),
+                conclusion=data.get("conclusion", ""),
+                call_to_action=data.get("call_to_action", ""),
+            ).to_dict()
         return None
     
     async def generate_single(
@@ -344,12 +331,12 @@ class ContentAgent:
             生成的内容
         """
         facts_context = self._format_facts(facts)
-        
-        if output_type == "timeline":
-            return await self._generate_timeline(topic, facts_context)
-        elif output_type == "one_pager":
-            return await self._generate_one_pager(topic, facts_context)
-        elif output_type == "video_brief":
-            return await self._generate_video_brief(topic, facts_context)
-        else:
+        handlers = {
+            "timeline": self._generate_timeline,
+            "one_pager": self._generate_one_pager,
+            "video_brief": self._generate_video_brief,
+        }
+        handler = handlers.get(output_type)
+        if not handler:
             raise ValueError(f"Unknown output type: {output_type}")
+        return await handler(topic, facts_context)
