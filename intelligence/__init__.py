@@ -11,11 +11,20 @@ from .llm import (
     get_llm,
 )
 from .state import AgentState, SearchResult as StateSearchResult
-from .agents import SearchAgent, AnalystAgent, ContentAgent
+from .agents import (
+    SearchAgent,
+    AnalystAgent,
+    ContentAgent,
+    PlannerAgent,
+    CriticAgent,
+    ChatAgent,
+)
 from .graph import create_research_graph, run_research, stream_research, ResearchGraph
 from .pipeline import (
     run_research_end_to_end,
     run_research_from_search_results,
+    chat_over_knowledge_base,
+    chat_over_kb,
     aggregated_result_to_search_results,
     evaluate_output_depth,
 )
@@ -35,6 +44,9 @@ __all__ = [
     "SearchAgent",
     "AnalystAgent",
     "ContentAgent",
+    "PlannerAgent",
+    "CriticAgent",
+    "ChatAgent",
     # Graph
     "create_research_graph",
     "run_research",
@@ -43,6 +55,8 @@ __all__ = [
     # Pipeline
     "run_research_end_to_end",
     "run_research_from_search_results",
+    "chat_over_knowledge_base",
+    "chat_over_kb",
     "aggregated_result_to_search_results",
     "evaluate_output_depth",
 ]

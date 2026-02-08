@@ -8,401 +8,230 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import json
 import logging
-from urllib.parse import urlparse
 
 from aggregator import DataAggregator
-from intelligence.agents import AnalystAgent, ContentAgent
+from config import get_research_cache_settings
+from intelligence.agents import (
+    AnalystAgent,
+    ChatAgent,
+    ContentAgent,
+    CriticAgent,
+    PlannerAgent,
+    SearchAgent,
+)
 from intelligence.llm import BaseLLM, get_llm
-from models import AggregatedResult
+from intelligence.pipeline_helpers import (
+    aggregated_result_to_search_results,
+    evaluate_output_depth,
+    evaluate_research_quality,
+    normalize_one_pager_resources,
+    normalize_video_brief,
+)
+from intelligence.tools.rag_tools import add_to_knowledge_base, close_knowledge_base
 from outputs import export_research_outputs
 from outputs.video_generator import BaseVideoGenerator, create_video_generator
+from storage import ResearchArtifactStore
 
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_FACT_CATEGORIES = {
-    "architecture",
-    "performance",
-    "training",
-    "comparison",
-    "limitation",
+_RESULT_SNAPSHOT_FILE = "research_result_snapshot.json"
+_ARTIFACT_SCHEMA_VERSION = "2026-02-08-slidev-v2"
+
+_AGGREGATOR_FLAG_TO_SOURCE = {
+    "enable_arxiv": "arxiv",
+    "enable_huggingface": "huggingface",
+    "enable_twitter": "twitter",
+    "enable_reddit": "reddit",
+    "enable_github": "github",
+    "enable_semantic_scholar": "semantic_scholar",
+    "enable_stackoverflow": "stackoverflow",
+    "enable_hackernews": "hackernews",
+}
+
+_SOURCE_ALIASES = {
+    "semantic-scholar": "semantic_scholar",
+    "semantic scholar": "semantic_scholar",
+    "stack-overflow": "stackoverflow",
+    "stack overflow": "stackoverflow",
+    "hn": "hackernews",
 }
 
 
-def _is_valid_http_url(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    url = value.strip()
-    if not url:
-        return False
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _looks_placeholder_url(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    url = value.strip().lower()
-    if not url:
-        return True
-    if "example.com" in url:
-        return True
-    if "your-repo" in url or "your_org" in url or "your-project" in url:
-        return True
-    if "placeholder" in url or "todo" in url:
-        return True
-    return False
-
-
-def _normalize_one_pager_resources(
-    *,
-    one_pager: Optional[Dict[str, Any]],
-    facts: List[Dict[str, Any]],
-    search_results: List[Dict[str, Any]],
-    max_resources: int = 8,
-) -> Optional[Dict[str, Any]]:
-    if not one_pager:
-        return one_pager
-
-    normalized = dict(one_pager)
-    id_to_result = {
-        str(item.get("id", "")).strip(): item
-        for item in search_results
-        if str(item.get("id", "")).strip()
-    }
-
-    resources: List[Dict[str, str]] = []
-    seen_urls = set()
-
-    for resource in normalized.get("resources", []) or []:
-        if not isinstance(resource, dict):
+def _normalize_sources(values: Optional[List[str]]) -> List[str]:
+    if not values:
+        return []
+    normalized: List[str] = []
+    seen = set()
+    for item in values:
+        key = str(item or "").strip().lower().replace("-", "_")
+        if not key:
             continue
-        url = str(resource.get("url", "")).strip()
-        title = str(resource.get("title", "")).strip() or "Resource"
-        if not _is_valid_http_url(url) or _looks_placeholder_url(url):
+        key = _SOURCE_ALIASES.get(key, key)
+        if key in seen:
             continue
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
-        resources.append({"title": title, "url": url})
-        if len(resources) >= max_resources:
-            break
-
-    evidence_ids: List[str] = []
-    for fact in facts:
-        for evidence in fact.get("evidence", []) or []:
-            evidence_id = str(evidence).strip()
-            if evidence_id and evidence_id not in evidence_ids:
-                evidence_ids.append(evidence_id)
-
-    for evidence_id in evidence_ids:
-        item = id_to_result.get(evidence_id)
-        if not item:
-            continue
-        url = str(item.get("url", "")).strip()
-        if not _is_valid_http_url(url) or url in seen_urls:
-            continue
-        title = str(item.get("title", "")).strip() or evidence_id
-        resources.append({"title": title, "url": url})
-        seen_urls.add(url)
-        if len(resources) >= max_resources:
-            break
-
-    if len(resources) < 3:
-        preferred_sources = ["arxiv", "semantic_scholar", "huggingface", "github", "stackoverflow"]
-        source_rank = {source: idx for idx, source in enumerate(preferred_sources)}
-        sorted_results = sorted(
-            search_results,
-            key=lambda item: (
-                source_rank.get(str(item.get("source", "")).strip(), len(preferred_sources)),
-                str(item.get("title", "")).lower(),
-            ),
-        )
-        for item in sorted_results:
-            url = str(item.get("url", "")).strip()
-            if not _is_valid_http_url(url) or url in seen_urls:
-                continue
-            title = str(item.get("title", "")).strip() or str(item.get("id", "Resource")).strip()
-            resources.append({"title": title, "url": url})
-            seen_urls.add(url)
-            if len(resources) >= max_resources:
-                break
-
-    normalized["resources"] = resources
+        seen.add(key)
+        normalized.append(key)
     return normalized
 
 
-def _normalize_video_brief(
+def _sources_from_aggregator_kwargs(kwargs: Dict[str, Any]) -> List[str]:
+    sources: List[str] = []
+    for flag, source in _AGGREGATOR_FLAG_TO_SOURCE.items():
+        if bool(kwargs.get(flag, False)):
+            sources.append(source)
+    return sorted(sources)
+
+
+def _aggregator_kwargs_from_sources(sources: List[str]) -> Dict[str, bool]:
+    allowed = set(_normalize_sources(sources))
+    if not allowed:
+        return {}
+    return {
+        flag: source in allowed for flag, source in _AGGREGATOR_FLAG_TO_SOURCE.items()
+    }
+
+
+def _summarize_search_results(search_results: List[Dict[str, Any]]) -> Dict[str, int]:
+    summary: Dict[str, int] = {}
+    for item in search_results:
+        source = str(item.get("source", "")).strip() or "unknown"
+        summary[source] = summary.get(source, 0) + 1
+    summary["total"] = len(search_results)
+    return summary
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _result_snapshot_path(output_dir: Path) -> Path:
+    return output_dir / _RESULT_SNAPSHOT_FILE
+
+
+def _write_result_snapshot(output_dir: Path, payload: Dict[str, Any]) -> Path:
+    snapshot_path = _result_snapshot_path(output_dir)
+    snapshot_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return snapshot_path
+
+
+def _read_result_snapshot(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _build_artifact_summary_text(topic: str, result: Dict[str, Any]) -> str:
+    lines = [str(topic or "").strip()]
+    one_pager = result.get("one_pager") or {}
+    summary = str(one_pager.get("executive_summary", "")).strip()
+    if summary:
+        lines.append(summary)
+
+    key_findings = [
+        str(item).strip()
+        for item in (one_pager.get("key_findings") or [])
+        if str(item).strip()
+    ]
+    if key_findings:
+        lines.extend(key_findings[:6])
+
+    facts = result.get("facts") or []
+    for fact in facts[:8]:
+        claim = str((fact or {}).get("claim", "")).strip()
+        if claim:
+            lines.append(claim)
+
+    return "\n".join([line for line in lines if line]).strip() or str(topic or "").strip()
+
+
+def _video_artifact_exists(payload: Dict[str, Any]) -> bool:
+    artifact = payload.get("video_artifact") or {}
+    output_path = str(artifact.get("output_path") or "").strip()
+    if not output_path:
+        return False
+    return Path(output_path).exists()
+
+
+def _search_results_to_documents(search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    for item in search_results:
+        metadata = dict(item.get("metadata", {}) or {})
+        metadata["source"] = str(item.get("source", "")).strip() or metadata.get("source", "unknown")
+        url = str(item.get("url", "")).strip()
+        if url:
+            metadata["url"] = url
+        documents.append(
+            {
+                "id": str(item.get("id", "")).strip(),
+                "content": f"{item.get('title', '')}\n\n{item.get('content', '')}",
+                "metadata": metadata,
+                "type": "search_result",
+            }
+        )
+    return documents
+
+
+async def _warmup_knowledge_base_from_search_results(search_results: List[Dict[str, Any]]) -> None:
+    if not search_results:
+        return
+    documents = _search_results_to_documents(search_results)
+    await add_to_knowledge_base(documents)
+
+
+def _load_video_flow(metadata_path: Path) -> Dict[str, Any]:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if isinstance(metadata, dict) and isinstance(metadata.get("flow"), dict):
+            return metadata["flow"]
+    except Exception:
+        pass
+    return {}
+
+
+async def _generate_video_artifact(
     *,
     topic: str,
-    video_brief: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not video_brief:
-        return video_brief
-
-    normalized = dict(video_brief)
-    raw_segments = list(normalized.get("segments") or [])
-
-    if not raw_segments:
-        raw_segments = [
-            {
-                "title": f"{topic} technical overview",
-                "content": f"Explain core mechanisms, benchmarks, and deployment trade-offs for {topic}.",
-                "talking_points": ["architecture", "performance", "deployment"],
-            }
-        ]
-
-    segment_count = max(1, min(5, len(raw_segments)))
-    fallback_duration = max(35, min(90, int(210 / segment_count)))
-    segments: List[Dict[str, Any]] = []
-
-    for idx, seg in enumerate(raw_segments[:5], 1):
-        title = str(seg.get("title", "")).strip() or f"Segment {idx}"
-        content = str(seg.get("content", "")).strip() or f"Technical segment about {topic}."
-        talking_points = list(seg.get("talking_points") or [])
-
-        duration_raw = seg.get("duration_sec")
-        try:
-            duration_sec = int(duration_raw)
-        except Exception:
-            duration_sec = fallback_duration
-        duration_sec = max(20, min(120, duration_sec))
-
-        visual_prompt = str(seg.get("visual_prompt", "")).strip()
-        if not visual_prompt:
-            visual_prompt = (
-                f"technical explainer for {topic}, segment '{title}', "
-                "cinematic macro hardware shots, architecture diagrams, "
-                "benchmark overlays, precise engineering visual language"
-            )
-
-        segments.append(
-            {
-                "title": title,
-                "content": content,
-                "talking_points": [str(p).strip() for p in talking_points if str(p).strip()],
-                "duration_sec": duration_sec,
-                "visual_prompt": visual_prompt,
-            }
-        )
-
-    normalized["segments"] = segments
-    return normalized
-
-
-def _safe_iso(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    text = str(value).strip()
-    return text or None
-
-
-def aggregated_result_to_search_results(result: AggregatedResult) -> List[Dict[str, Any]]:
-    """
-    将聚合层数据统一转换为 Agent 搜索结果格式。
-    """
-    items: List[Dict[str, Any]] = []
-
-    for paper in result.papers:
-        items.append(
-            {
-                "id": f"{paper.source.value}_{paper.id}",
-                "source": paper.source.value,
-                "title": paper.title,
-                "content": paper.abstract,
-                "url": paper.url,
-                "metadata": {
-                    "authors": [a.name for a in paper.authors],
-                    "published_date": _safe_iso(paper.published_date),
-                    "updated_date": _safe_iso(paper.updated_date),
-                    "categories": paper.categories,
-                    "citation_count": paper.citation_count,
-                    **paper.extra,
-                },
-            }
-        )
-
-    for model in result.models:
-        items.append(
-            {
-                "id": f"hf_model_{model.id}",
-                "source": "huggingface",
-                "title": model.name,
-                "content": model.description or "",
-                "url": model.url,
-                "metadata": {
-                    "author": model.author,
-                    "downloads": model.downloads,
-                    "likes": model.likes,
-                    "tags": model.tags,
-                    "created_at": _safe_iso(model.created_at),
-                    "updated_at": _safe_iso(model.updated_at),
-                    **model.extra,
-                },
-            }
-        )
-
-    for dataset in result.datasets:
-        items.append(
-            {
-                "id": f"hf_dataset_{dataset.id}",
-                "source": "huggingface",
-                "title": dataset.name,
-                "content": dataset.description or "",
-                "url": dataset.url,
-                "metadata": {
-                    "author": dataset.author,
-                    "downloads": dataset.downloads,
-                    "tags": dataset.tags,
-                    **dataset.extra,
-                },
-            }
-        )
-
-    for post in result.social_posts:
-        items.append(
-            {
-                "id": f"{post.source.value}_{post.id}",
-                "source": post.source.value,
-                "title": f"{post.author} @ {post.source.value}",
-                "content": post.content,
-                "url": post.url,
-                "metadata": {
-                    "author": post.author,
-                    "likes": post.likes,
-                    "comments": post.comments,
-                    "reposts": post.reposts,
-                    "created_at": _safe_iso(post.created_at),
-                    **post.extra,
-                },
-            }
-        )
-
-    for repo in result.github_repos:
-        items.append(
-            {
-                "id": f"github_repo_{repo.id}",
-                "source": "github",
-                "title": repo.full_name,
-                "content": repo.description or "",
-                "url": repo.url,
-                "metadata": {
-                    "owner": repo.owner,
-                    "language": repo.language,
-                    "stars": repo.stars,
-                    "forks": repo.forks,
-                    "watchers": repo.watchers,
-                    "topics": repo.topics,
-                    "updated_at": _safe_iso(repo.updated_at),
-                    **repo.extra,
-                },
-            }
-        )
-
-    for question in result.stackoverflow_questions:
-        items.append(
-            {
-                "id": f"stackoverflow_{question.id}",
-                "source": "stackoverflow",
-                "title": question.title,
-                "content": question.body or "",
-                "url": question.url,
-                "metadata": {
-                    "author": question.author,
-                    "tags": question.tags,
-                    "score": question.score,
-                    "view_count": question.view_count,
-                    "answer_count": question.answer_count,
-                    "is_answered": question.is_answered,
-                    **question.extra,
-                },
-            }
-        )
-
-    for hn in result.hackernews_items:
-        items.append(
-            {
-                "id": f"hackernews_{hn.id}",
-                "source": "hackernews",
-                "title": hn.title,
-                "content": hn.text or "",
-                "url": hn.url or hn.hn_url,
-                "metadata": {
-                    "author": hn.author,
-                    "points": hn.points,
-                    "comment_count": hn.comment_count,
-                    "created_at": _safe_iso(hn.created_at),
-                    **hn.extra,
-                },
-            }
-        )
-
-    return items
-
-
-def evaluate_output_depth(
-    *,
+    output_dir: Path,
+    generated: Dict[str, Any],
     facts: List[Dict[str, Any]],
-    one_pager: Optional[Dict[str, Any]],
-    video_brief: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    对输出深度做简单可解释评分，便于判断是否满足“技术细节充足”。
-    """
-    score = 0
-    max_score = 13
+    video_generator: Optional[BaseVideoGenerator],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    generator = video_generator or create_video_generator(provider="slidev")
 
-    fact_categories = {str(f.get("category", "")).strip().lower() for f in facts}
-    covered_required = sorted(list(_REQUIRED_FACT_CATEGORIES.intersection(fact_categories)))
-    facts_with_evidence = [f for f in facts if f.get("evidence")]
-    high_confidence = [f for f in facts if float(f.get("confidence", 0.0)) >= 0.7]
-
-    if len(facts) >= 8:
-        score += 2
-    if len(covered_required) >= 4:
-        score += 2
-    if len(facts_with_evidence) >= max(4, len(facts) // 3):
-        score += 1
-    if len(high_confidence) >= max(4, len(facts) // 3):
-        score += 1
-
-    one_pager = one_pager or {}
-    if len(one_pager.get("key_findings", [])) >= 5:
-        score += 1
-    if len(one_pager.get("metrics", {})) >= 3:
-        score += 1
-    if len(one_pager.get("technical_deep_dive", [])) >= 2:
-        score += 1
-    if len(one_pager.get("implementation_notes", [])) >= 2:
-        score += 1
-    if len(one_pager.get("risks_and_mitigations", [])) >= 2:
-        score += 1
-
-    video_brief = video_brief or {}
-    segments = list(video_brief.get("segments", []))
-    if len(segments) >= 3:
-        score += 1
-    if segments and all(
-        bool(seg.get("visual_prompt")) and bool(seg.get("duration_sec")) for seg in segments
-    ):
-        score += 1
-
-    return {
-        "score": score,
-        "max_score": max_score,
-        "pass": score >= 8,
-        "fact_count": len(facts),
-        "fact_categories": sorted(list(fact_categories)),
-        "covered_required_categories": covered_required,
-        "facts_with_evidence": len(facts_with_evidence),
-        "high_confidence_facts": len(high_confidence),
-    }
+    try:
+        artifact = await generator.generate(
+            topic=topic,
+            out_dir=output_dir,
+            video_brief=generated.get("video_brief"),
+            one_pager=generated.get("one_pager"),
+            facts=facts,
+        )
+        flow = _load_video_flow(Path(artifact.metadata_path))
+        payload: Dict[str, Any] = {
+            "provider": artifact.provider,
+            "output_path": str(artifact.output_path),
+            "metadata_path": str(artifact.metadata_path),
+        }
+        for key in ("narration_audio_path", "narration_script_path"):
+            value = flow.get(key)
+            if value:
+                payload[key] = str(value)
+        return payload, None
+    except Exception as exc:
+        message = str(exc)
+        logger.warning(f"Video generation failed, keeping document outputs: {message}")
+        return None, message
 
 
 async def run_research_from_search_results(
@@ -414,84 +243,101 @@ async def run_research_from_search_results(
     generate_video: bool = False,
     video_generator: Optional[BaseVideoGenerator] = None,
     enable_knowledge_indexing: bool = True,
+    enable_critic_gate: bool = True,
+    critic_threshold: float = 0.65,
 ) -> Dict[str, Any]:
     """
     使用已准备好的搜索结果执行 Phase 3 + Phase 4。
     """
     llm = llm or get_llm()
 
-    analyst = AnalystAgent(
-        llm=llm,
-        enable_knowledge_indexing=enable_knowledge_indexing,
-    )
-    analysis = await analyst.analyze(topic, search_results)
-    facts = analysis.get("facts", [])
+    try:
+        analyst = AnalystAgent(
+            llm=llm,
+            enable_knowledge_indexing=enable_knowledge_indexing,
+        )
+        analysis = await analyst.analyze(topic, search_results)
+        facts = analysis.get("facts", [])
 
-    content_agent = ContentAgent(llm=llm)
-    generated = await content_agent.generate(topic, facts)
-    generated["one_pager"] = _normalize_one_pager_resources(
-        one_pager=generated.get("one_pager"),
-        facts=facts,
-        search_results=search_results,
-    )
-    generated["video_brief"] = _normalize_video_brief(
-        topic=topic,
-        video_brief=generated.get("video_brief"),
-    )
+        content_agent = ContentAgent(llm=llm)
+        generated = await content_agent.generate(topic, facts)
+        generated["one_pager"] = normalize_one_pager_resources(
+            one_pager=generated.get("one_pager"),
+            facts=facts,
+            search_results=search_results,
+        )
+        generated["video_brief"] = normalize_video_brief(
+            topic=topic,
+            video_brief=generated.get("video_brief"),
+        )
 
-    output_dir = out_dir or Path("data") / "outputs" / (
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{topic.replace(' ', '_')}"
-    )
-    written_files = export_research_outputs(
-        output_dir,
-        topic=topic,
-        timeline=generated.get("timeline"),
-        one_pager=generated.get("one_pager"),
-        video_brief=generated.get("video_brief"),
-        write_report=True,
-    )
+        output_dir = out_dir or Path("data") / "outputs" / (
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{topic.replace(' ', '_')}"
+        )
+        written_files = export_research_outputs(
+            output_dir,
+            topic=topic,
+            timeline=generated.get("timeline"),
+            one_pager=generated.get("one_pager"),
+            video_brief=generated.get("video_brief"),
+            write_report=True,
+        )
 
-    depth = evaluate_output_depth(
-        facts=facts,
-        one_pager=generated.get("one_pager"),
-        video_brief=generated.get("video_brief"),
-    )
+        depth = evaluate_output_depth(
+            facts=facts,
+            one_pager=generated.get("one_pager"),
+            video_brief=generated.get("video_brief"),
+        )
 
-    video_artifact = None
-    video_error = None
-    if generate_video:
-        generator = video_generator or create_video_generator(provider="slidev")
-        try:
-            artifact = await generator.generate(
-                topic=topic,
-                out_dir=output_dir,
-                video_brief=generated.get("video_brief"),
-                one_pager=generated.get("one_pager"),
+        quality_metrics = None
+        quality_gate_pass = None
+        quality_recommendations: List[str] = []
+        if enable_critic_gate:
+            critic = CriticAgent(quality_threshold=critic_threshold)
+            critic_result = await critic.evaluate(
                 facts=facts,
+                search_results=search_results,
+                one_pager=generated.get("one_pager"),
+                video_brief=generated.get("video_brief"),
+                knowledge_gaps=analysis.get("knowledge_gaps", []),
             )
-            video_artifact = {
-                "provider": artifact.provider,
-                "output_path": str(artifact.output_path),
-                "metadata_path": str(artifact.metadata_path),
-            }
-        except Exception as e:
-            video_error = str(e)
-            logger.warning(f"Video generation failed, keeping document outputs: {e}")
+            quality_metrics = critic_result.get("quality_metrics")
+            quality_gate_pass = bool(critic_result.get("pass", False))
+            quality_recommendations = list(critic_result.get("recommendations", []))
 
-    return {
-        "topic": topic,
-        "search_results_count": len(search_results),
-        "facts": facts,
-        "knowledge_gaps": analysis.get("knowledge_gaps", []),
-        "timeline": generated.get("timeline"),
-        "one_pager": generated.get("one_pager"),
-        "video_brief": generated.get("video_brief"),
-        "depth_assessment": depth,
-        "output_dir": str(output_dir),
-        "written_files": {k: str(v) for k, v in written_files.items()},
-        "video_artifact": video_artifact,
-        "video_error": video_error,
-    }
+        video_artifact = None
+        video_error = None
+        if generate_video:
+            video_artifact, video_error = await _generate_video_artifact(
+                topic=topic,
+                output_dir=output_dir,
+                generated=generated,
+                facts=facts,
+                video_generator=video_generator,
+            )
+
+        return {
+            "topic": topic,
+            "search_results_count": len(search_results),
+            "search_results": search_results,
+            "facts": facts,
+            "knowledge_gaps": analysis.get("knowledge_gaps", []),
+            "timeline": generated.get("timeline"),
+            "one_pager": generated.get("one_pager"),
+            "video_brief": generated.get("video_brief"),
+            "depth_assessment": depth,
+            "quality_metrics": quality_metrics,
+            "quality_gate_pass": quality_gate_pass,
+            "quality_recommendations": quality_recommendations,
+            "output_dir": str(output_dir),
+            "written_files": {k: str(v) for k, v in written_files.items()},
+            "video_artifact": video_artifact,
+            "video_error": video_error,
+            "cache_hit": False,
+        }
+    finally:
+        if enable_knowledge_indexing:
+            close_knowledge_base()
 
 
 async def run_research_end_to_end(
@@ -505,29 +351,280 @@ async def run_research_end_to_end(
     video_generator: Optional[BaseVideoGenerator] = None,
     enable_knowledge_indexing: bool = True,
     aggregator_kwargs: Optional[Dict[str, Any]] = None,
+    user_query: Optional[str] = None,
+    allowed_sources: Optional[List[str]] = None,
+    use_agentic_search: bool = True,
+    enable_planner: bool = True,
+    enable_critic_gate: bool = True,
+    critic_threshold: float = 0.65,
+    search_max_iterations: int = 8,
 ) -> Dict[str, Any]:
     """
     完整端到端流程：
-    topic -> DataAggregator -> AnalystAgent -> ContentAgent -> export -> (optional) video.
+    Planner -> ReAct Search -> AnalystAgent -> ContentAgent -> CriticGate -> export -> (optional) video.
     """
-    aggregator_kwargs = aggregator_kwargs or {}
+    llm = llm or get_llm()
+    aggregator_kwargs = dict(aggregator_kwargs or {})
 
-    async with DataAggregator(**aggregator_kwargs) as aggregator:
-        aggregated = await aggregator.aggregate(
-            topic=topic,
-            max_results_per_source=max_results_per_source,
-            show_progress=show_progress,
+    resolved_sources = _normalize_sources(allowed_sources)
+    if not resolved_sources:
+        resolved_sources = _sources_from_aggregator_kwargs(aggregator_kwargs)
+
+    planned_topic = topic
+    planner_output: Dict[str, Any] = {
+        "is_technical": True,
+        "normalized_topic": topic,
+        "query_rewrites": [topic],
+        "research_questions": [],
+        "search_plan": [],
+        "reason": "planner skipped",
+    }
+    if enable_planner:
+        planner = PlannerAgent(llm=llm)
+        planner_output = await planner.plan(topic=topic, user_query=user_query)
+        normalized_topic = str(planner_output.get("normalized_topic") or "").strip()
+        if normalized_topic:
+            planned_topic = normalized_topic
+        if not bool(planner_output.get("is_technical", True)):
+            reason = str(planner_output.get("reason") or "non-technical request").strip()
+            quality = evaluate_research_quality(
+                facts=[],
+                search_results=[],
+                one_pager=None,
+                video_brief=None,
+                knowledge_gaps=[reason],
+                threshold=critic_threshold,
+            )
+            return {
+                "topic": planned_topic,
+                "input_topic": topic,
+                "blocked": True,
+                "blocked_reason": reason,
+                "planner": planner_output,
+                "search_results_count": 0,
+                "search_results": [],
+                "facts": [],
+                "knowledge_gaps": [f"Planner blocked request: {reason}"],
+                "timeline": None,
+                "one_pager": None,
+                "video_brief": None,
+                "depth_assessment": evaluate_output_depth(
+                    facts=[],
+                    one_pager=None,
+                    video_brief=None,
+                ),
+                "quality_metrics": quality,
+                "quality_gate_pass": False,
+                "quality_recommendations": list(quality.get("recommendations", [])),
+                "output_dir": None,
+                "written_files": {},
+                "video_artifact": None,
+                "video_error": None,
+                "aggregated_summary": {"total": 0},
+                "search_trace": [],
+                "search_coverage": {},
+                "search_strategy": "blocked",
+                "cache_hit": False,
+            }
+
+    cache_cfg = get_research_cache_settings()
+    cache_enabled = bool(cache_cfg.enabled)
+    cache_min_quality = _safe_float(cache_cfg.min_quality_score, default=0.0)
+
+    if cache_enabled:
+        store = None
+        try:
+            store = ResearchArtifactStore(collection_name=cache_cfg.collection_name)
+            candidates = store.find_similar(
+                query=planned_topic,
+                score_threshold=_safe_float(cache_cfg.similarity_threshold, 0.82),
+                top_k=max(1, int(cache_cfg.top_k)),
+            )
+            for candidate in candidates:
+                if str(candidate.get("artifact_schema_version", "")).strip() != _ARTIFACT_SCHEMA_VERSION:
+                    continue
+                if _safe_float(candidate.get("quality_score"), 0.0) < cache_min_quality:
+                    continue
+                snapshot_path = Path(str(candidate.get("snapshot_path", "")).strip())
+                if not snapshot_path.exists():
+                    continue
+
+                cached = _read_result_snapshot(snapshot_path)
+                if not cached:
+                    continue
+                if generate_video and bool(cache_cfg.require_video_for_video_request):
+                    if not _video_artifact_exists(cached):
+                        continue
+
+                cached["input_topic"] = topic
+                cached["topic"] = cached.get("topic") or planned_topic
+                cached["planner"] = planner_output
+                cached["cache_hit"] = True
+                cached["cache_score"] = _safe_float(candidate.get("score"), 0.0)
+                cached["cache_matched_topic"] = str(candidate.get("topic", "")).strip() or cached["topic"]
+                cached["search_strategy"] = "cache_reuse"
+                cached.setdefault("search_trace", [])
+                cached.setdefault("search_coverage", {})
+                cached.setdefault("aggregated_summary", {"total": cached.get("search_results_count", 0)})
+                if enable_knowledge_indexing:
+                    try:
+                        cached_results = list(cached.get("search_results") or [])
+                        await _warmup_knowledge_base_from_search_results(cached_results)
+                    except Exception as exc:
+                        logger.warning(f"Cache hit KB warmup skipped: {exc}")
+                    finally:
+                        close_knowledge_base()
+                return cached
+        except Exception as exc:
+            logger.warning(f"Research artifact cache lookup skipped: {exc}")
+        finally:
+            if store is not None:
+                store.close()
+
+    search_results: List[Dict[str, Any]] = []
+    aggregated_summary: Dict[str, Any] = {}
+    search_trace: List[Dict[str, Any]] = []
+    search_coverage: Dict[str, Any] = {}
+    search_strategy = "aggregator"
+
+    if use_agentic_search:
+        search_agent = SearchAgent(
+            llm=llm,
+            max_iterations=max(1, int(search_max_iterations)),
+            min_total_results=max(8, max_results_per_source * 2),
+            allowed_sources=resolved_sources or None,
         )
+        search_output = await search_agent.run(
+            {
+                "topic": planned_topic,
+                "user_query": user_query,
+                "query_rewrites": planner_output.get("query_rewrites", []),
+                "research_questions": planner_output.get("research_questions", []),
+                "search_plan": planner_output.get("search_plan", []),
+                "max_results_per_source": max_results_per_source,
+            }
+        )
+        search_results = list(search_output.get("search_results", []))
+        search_trace = list(search_output.get("search_trace", []))
+        search_coverage = dict(search_output.get("coverage", {}))
+        search_strategy = str(search_output.get("strategy", "react_agent"))
+        aggregated_summary = _summarize_search_results(search_results)
 
-    search_results = aggregated_result_to_search_results(aggregated)
+    if not search_results:
+        fallback_kwargs = dict(aggregator_kwargs)
+        if resolved_sources:
+            fallback_kwargs.update(_aggregator_kwargs_from_sources(resolved_sources))
+        async with DataAggregator(**fallback_kwargs) as aggregator:
+            aggregated = await aggregator.aggregate(
+                topic=planned_topic,
+                max_results_per_source=max_results_per_source,
+                show_progress=show_progress,
+            )
+        search_results = aggregated_result_to_search_results(aggregated)
+        aggregated_summary = aggregated.summary()
+        if search_trace:
+            search_strategy = f"{search_strategy}+aggregator_fallback"
+        else:
+            search_strategy = "aggregator"
+            search_coverage = {}
+
     result = await run_research_from_search_results(
-        topic=topic,
+        topic=planned_topic,
         search_results=search_results,
         llm=llm,
         out_dir=out_dir,
         generate_video=generate_video,
         video_generator=video_generator,
         enable_knowledge_indexing=enable_knowledge_indexing,
+        enable_critic_gate=enable_critic_gate,
+        critic_threshold=critic_threshold,
     )
-    result["aggregated_summary"] = aggregated.summary()
+    result["input_topic"] = topic
+    result["search_results"] = search_results
+    result["planner"] = planner_output
+    result["aggregated_summary"] = aggregated_summary
+    result["search_trace"] = search_trace
+    result["search_coverage"] = search_coverage
+    result["search_strategy"] = search_strategy
+    result["cache_hit"] = False
+
+    output_dir_text = str(result.get("output_dir") or "").strip()
+    snapshot_path: Optional[Path] = None
+    if output_dir_text:
+        output_dir_path = Path(output_dir_text)
+        try:
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+            snapshot_path = _write_result_snapshot(output_dir_path, result)
+            result["result_snapshot_path"] = str(snapshot_path)
+        except Exception as exc:
+            logger.warning(f"Failed to write result snapshot: {exc}")
+
+    if cache_enabled and snapshot_path is not None:
+        store = None
+        try:
+            store = ResearchArtifactStore(collection_name=cache_cfg.collection_name)
+            manifest_path = str((result.get("written_files") or {}).get("manifest_json", "")).strip() or None
+            video_output_path = str((result.get("video_artifact") or {}).get("output_path", "")).strip() or None
+            store.index_artifact(
+                topic=planned_topic,
+                summary_text=_build_artifact_summary_text(planned_topic, result),
+                output_dir=output_dir_text,
+                snapshot_path=str(snapshot_path),
+                manifest_path=manifest_path,
+                video_output_path=video_output_path,
+                quality_score=_safe_float((result.get("quality_metrics") or {}).get("overall_score"), 0.0),
+                quality_gate_pass=bool(result.get("quality_gate_pass", False)),
+                search_results_count=int(result.get("search_results_count", 0)),
+                artifact_schema_version=_ARTIFACT_SCHEMA_VERSION,
+            )
+        except Exception as exc:
+            logger.warning(f"Research artifact cache index skipped: {exc}")
+        finally:
+            if store is not None:
+                store.close()
     return result
+
+
+async def chat_over_knowledge_base(
+    *,
+    question: str,
+    llm: Optional[BaseLLM] = None,
+    top_k: int = 6,
+    sources: Optional[List[str]] = None,
+    year_filter: Optional[int] = None,
+    use_hybrid: bool = True,
+) -> Dict[str, Any]:
+    """
+    基于向量知识库进行对话问答。
+    """
+    try:
+        chat_agent = ChatAgent(llm=llm or get_llm(), default_top_k=top_k)
+        return await chat_agent.ask(
+            question=question,
+            top_k=top_k,
+            sources=sources,
+            year_filter=year_filter,
+            use_hybrid=use_hybrid,
+        )
+    finally:
+        close_knowledge_base()
+
+
+async def chat_over_kb(
+    *,
+    question: str,
+    llm: Optional[BaseLLM] = None,
+    top_k: int = 6,
+    sources: Optional[List[str]] = None,
+    year_filter: Optional[int] = None,
+    use_hybrid: bool = True,
+) -> Dict[str, Any]:
+    """chat_over_knowledge_base 的简写别名。"""
+    return await chat_over_knowledge_base(
+        question=question,
+        llm=llm,
+        top_k=top_k,
+        sources=sources,
+        year_filter=year_filter,
+        use_hybrid=use_hybrid,
+    )
