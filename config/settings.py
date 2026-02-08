@@ -137,6 +137,23 @@ class LLMSettings(BaseSettings):
         env_prefix = "LLM_"
 
 
+class ResearchCacheSettings(BaseSettings):
+    """研究产物缓存配置（相似查询复用）"""
+
+    enabled: bool = Field(default=True, description="是否启用研究产物缓存")
+    similarity_threshold: float = Field(default=0.82, description="命中相似缓存的最低相似度阈值")
+    top_k: int = Field(default=3, description="相似查询检索候选数")
+    min_quality_score: float = Field(default=0.0, description="可复用缓存的最小质量分")
+    require_video_for_video_request: bool = Field(
+        default=True,
+        description="当用户请求视频时，缓存必须包含可用视频产物",
+    )
+    collection_name: str = Field(default="research_artifacts", description="缓存索引集合名")
+
+    class Config:
+        env_prefix = "RESEARCH_CACHE_"
+
+
 class Settings(BaseSettings):
     """主配置类 - 聚合所有子配置"""
     
@@ -153,6 +170,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    research_cache: ResearchCacheSettings = Field(default_factory=ResearchCacheSettings)
     
     class Config:
         env_file = ".env"
@@ -180,6 +198,7 @@ class Settings(BaseSettings):
             embedding=EmbeddingSettings(),
             storage=StorageSettings(),
             llm=LLMSettings(),
+            research_cache=ResearchCacheSettings(),
         )
 
 
@@ -220,3 +239,7 @@ def get_storage_settings() -> StorageSettings:
 
 def get_llm_settings() -> LLMSettings:
     return get_settings().llm
+
+
+def get_research_cache_settings() -> ResearchCacheSettings:
+    return get_settings().research_cache
