@@ -35,7 +35,7 @@
 | Phase 1 | 数据层 | ✅ 完成 | 多源数据抓取 (ArXiv, HuggingFace, Social) |
 | Phase 2 | 知识层 | ✅ 完成 | 数据处理 + 向量存储 |
 | Phase 3 | 智能层 | ✅ 完成 | LLM + RAG + LangGraph Agent 编排 |
-| Phase 4 | 输出层 | ✅ 完成 | Timeline / One-Pager / Video Brief 渲染与导出 (Markdown/Mermaid/JSON) |
+| Phase 4 | 输出层 | ✅ 完成 | Timeline / One-Pager / Video Brief + Slidev 成片视频（含旁白音轨） |
 | Phase 5 | 接口层 | 🔲 待开发 | CLI, Web UI, API |
 
 ## 📁 项目结构
@@ -228,10 +228,16 @@ python demo_phase4.py --topic "FlashAttention" -n 3 --sources "arxiv,huggingface
 # macOS:
 brew install ffmpeg
 
-# 8. 运行 Phase 4 + 视频产物（Slidev 讲解视频）
-python demo_phase4.py --topic "FlashAttention" -n 3 --sources "arxiv,github" --generate-video
+# 8. 安装免费高质量 TTS（推荐）
+pip install edge-tts
 
-# 9. 命令行搜索 (Phase 1)
+# 9. 运行 Phase 4 + 视频产物（Slidev 讲解视频 + 自动旁白音轨）
+python demo_phase4.py --topic "FlashAttention" -n 3 --sources "arxiv,github" --generate-video --tts-provider auto --tts-speed 1.2 --narration-model deepseek-chat
+
+# 10. Manus 端到端测试样例（多源 + 深度输出 + 成片视频）
+python demo_phase4.py --topic "manus" -n 5 --sources "arxiv,huggingface,github,semantic_scholar,stackoverflow,hackernews" --generate-video
+
+# 11. 命令行搜索 (Phase 1)
 python main.py --topic "DeepSeek" -n 20
 ```
 
@@ -340,11 +346,27 @@ LLM_GEMINI_API_KEY=AIza-xxx
 ### 视频生成配置 (Phase 4)
 
 说明:
-- 当前仅保留 Slidev 单路线：将 `video_brief + one_pager + facts` 生成 Slidev 幻灯片，导出 PNG 后使用 ffmpeg 合成 mp4。
+- 当前仅保留 Slidev 单路线：将 `video_brief + one_pager + facts` 生成 Slidev 幻灯片，并自动生成 TTS 旁白音轨，最终使用 ffmpeg 合成 mp4。
 - 默认不生成视频：只有显式传 `--generate-video` 才会进入视频流程。
 - 即使视频生成失败，文档产物（report/one-pager/timeline/video-brief）仍会完整导出。
 - 可通过 `--slides-target-duration-sec` 与 `--slides-fps` 控制讲解视频时长和帧率。
+- 默认启用旁白：可用 `--disable-narration` 输出静音视频；可用 `--tts-provider` / `--tts-voice` / `--tts-speed` 控制音色与语速。
+- 每页旁白先由小模型重写（默认 `deepseek-chat`，可用 `--narration-model` 调整），避免逐字念 PPT。
+- 翻页时长由每页真实音轨时长决定，不再按固定秒数硬切页，避免长时间静默空窗。
+- TTS provider 自动回退顺序：`edge-tts` -> `say`（macOS）-> `espeak`（Linux）。
 - 首次运行会自动在 `data/.slidev_runtime` 安装 `@slidev/cli + @slidev/theme-default + playwright-chromium`。
+
+推荐环境变量（可选）：
+
+```env
+# Edge-TTS (回退优先级 1)
+# 推荐 voice: zh-CN-YunxiNeural / en-US-GuyNeural
+# 可用 --tts-voice 覆盖
+
+# 旁白脚本重写（可选）
+LLM_DEEPSEEK_API_KEY=sk-xxx
+VIDEO_NARRATION_DEEPSEEK_MODEL=deepseek-chat
+```
 
 **支持的 LLM 服务商：**
 
@@ -561,6 +583,9 @@ python demo_phase2.py
 
 # 运行 Phase 4 输出与视频测试
 python -m pytest tests/test_outputs.py tests/test_video_generator.py tests/test_end_to_end_pipeline.py tests/test_github_scraper_unit.py -q
+
+# 仅运行 Manus 端到端用例
+python -m pytest tests/test_end_to_end_pipeline.py -k manus -q
 ```
 
 ## 🗺️ 开发路线图
@@ -568,7 +593,7 @@ python -m pytest tests/test_outputs.py tests/test_video_generator.py tests/test_
 - [x] **Phase 1**: 数据抓取层 (ArXiv, HuggingFace, Twitter, Reddit, GitHub)
 - [x] **Phase 2**: 处理存储层 (Cleaner, Chunker, Embedder, VectorStore, Cache)
 - [x] **Phase 3**: 智能层 (LLM 抽象, 多 Agent 协作, LangGraph 编排)
-- [x] **Phase 4**: 输出层 (Timeline, One-Pager, Video Brief)
+- [x] **Phase 4**: 输出层 (Timeline, One-Pager, Video Brief, 带旁白音轨视频)
 - [ ] **Phase 5**: 接口层 (CLI 增强, Web UI, REST API)
 
 ## 📝 License

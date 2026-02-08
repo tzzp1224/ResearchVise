@@ -29,6 +29,7 @@ rich>=13.0.0             # 美化输出
 tenacity>=8.2.0          # 重试机制
 python-dateutil>=2.8.0
 numpy>=1.24.0
+edge-tts>=6.1.0          # 免费高质量 TTS (Microsoft Edge voices)
 
 # Phase 2: Processing & Storage
 qdrant-client>=1.7.0           # Qdrant 向量数据库 (支持元数据过滤、持久化、并发)
