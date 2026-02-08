@@ -24,6 +24,21 @@ def get_knowledge_base() -> QdrantVectorStore:
     return _vector_store
 
 
+def close_knowledge_base() -> None:
+    """关闭并重置全局知识库实例，避免解释器退出时的析构噪音。"""
+    global _vector_store
+    if _vector_store is None:
+        return
+    try:
+        close_fn = getattr(_vector_store, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception as e:
+        logger.debug(f"Failed to close knowledge base: {e}")
+    finally:
+        _vector_store = None
+
+
 async def vector_search(
     query: str,
     top_k: int = 5,

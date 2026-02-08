@@ -5,7 +5,10 @@ Agent Tools
 from .search_tools import (
     create_search_tools,
     arxiv_search,
+    semantic_scholar_search,
     huggingface_search,
+    stackoverflow_search,
+    hackernews_search,
     twitter_search,
     reddit_search,
     github_search,
@@ -20,7 +23,10 @@ __all__ = [
     # 搜索工具
     "create_search_tools",
     "arxiv_search",
+    "semantic_scholar_search",
     "huggingface_search",
+    "stackoverflow_search",
+    "hackernews_search",
     "twitter_search",
     "reddit_search",
     "github_search",
