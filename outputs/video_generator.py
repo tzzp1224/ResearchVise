@@ -6,7 +6,8 @@ Pipeline:
 1) video_brief + one_pager + facts -> 结构化 slide 计划
 2) 生成 Slidev markdown（支持公式/流程图/图像）
 3) Slidev export PNG
-4) ffmpeg 合成 MP4
+4) 基于 slide 内容生成旁白脚本并合成音轨
+5) ffmpeg 合成带音轨 MP4
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -24,6 +26,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import OnePager, VideoBrief
+from .video_narration import NarrationPipeline, NarrationSpec
 
 
 logger = logging.getLogger(__name__)
@@ -410,6 +413,11 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         runtime_dir: Optional[Path] = None,
         slidev_timeout_ms: int = 180000,
         slidev_wait_ms: int = 400,
+        enable_narration: bool = True,
+        tts_provider: str = "auto",
+        tts_voice: Optional[str] = None,
+        tts_speed: float = 1.2,
+        narration_model: str = "deepseek-chat",
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.target_duration_sec = int(target_duration_sec)
@@ -421,7 +429,22 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         self.runtime_dir = Path(runtime_dir) if runtime_dir else Path("data") / ".slidev_runtime"
         self.slidev_timeout_ms = int(slidev_timeout_ms)
         self.slidev_wait_ms = int(slidev_wait_ms)
+        self.enable_narration = bool(enable_narration)
+        self.tts_provider = _sanitize_text(tts_provider).lower().replace("-", "_") or "auto"
+        self.tts_voice = _sanitize_text(tts_voice or "")
+        self.tts_speed = float(max(0.8, min(1.5, tts_speed)))
+        self.narration_model = _sanitize_text(narration_model) or "deepseek-chat"
         self._progress_callback = progress_callback
+        self._narration_pipeline = NarrationPipeline(
+            tts_provider=self.tts_provider,
+            tts_voice=self.tts_voice,
+            tts_speed=self.tts_speed,
+            narration_model=self.narration_model,
+            run_subprocess=self._run_subprocess,
+            sanitize_text=_sanitize_text,
+            contains_cjk=_contains_cjk,
+            split_sentences=_split_sentences,
+        )
 
     def _emit_progress(self, message: str) -> None:
         logger.info("[SlidevVideo] %s", message)
@@ -456,6 +479,15 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             ).strip()
             tail = "\n".join(combined.splitlines()[-20:])
             raise VideoGenerationError(f"{context} failed: {tail or 'unknown error'}")
+
+    def _narration(self) -> NarrationPipeline:
+        self._narration_pipeline.update_runtime(
+            tts_provider=self.tts_provider,
+            tts_voice=self.tts_voice,
+            tts_speed=self.tts_speed,
+            narration_model=self.narration_model,
+        )
+        return self._narration_pipeline
 
     def _resolve_target_duration(self, brief_duration: str, slide_count: int) -> int:
         candidate = _parse_duration_estimate_to_seconds(brief_duration)
@@ -681,13 +713,115 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             tags = ["Inputs", "Reasoning", "Outputs"]
         return {"title": _diagram_label(title), "tags": tags[:4]}
 
-    def _build_formula_payload(self, topic: str) -> Dict[str, Any]:
-        formulas = [
-            r"Utility = \alpha \cdot Quality + \beta \cdot Coverage - \gamma \cdot Latency - \delta \cdot Cost",
-            r"Precision@k = \frac{Relevant@k}{k}",
-            r"Throughput = \frac{Requests}{Second}",
-            r"CostPerReq = \frac{GPU\_Hours \cdot Price}{Requests}",
+    def _metric_symbol(self, metric_key: str, *, index: int = 0) -> str:
+        lowered = _sanitize_text(metric_key).lower()
+        symbol_map = [
+            (("latency", "delay", "p95", "p99", "延迟", "时延"), "LAT"),
+            (("throughput", "qps", "rps", "吞吐", "并发"), "THR"),
+            (("cost", "price", "费用", "成本"), "COST"),
+            (("precision", "准确", "em", "f1"), "ACC"),
+            (("recall", "召回"), "REC"),
+            (("coverage", "覆盖"), "COV"),
+            (("error", "风险", "fail", "oom"), "ERR"),
+            (("memory", "显存", "内存"), "MEM"),
         ]
+        for keywords, symbol in symbol_map:
+            if any(token in lowered for token in keywords):
+                return symbol
+
+        tokens = re.findall(r"[A-Za-z]+", lowered)
+        if tokens:
+            candidate = tokens[0][:4].upper()
+            return candidate or f"M_{index + 1}"
+        return f"M_{index + 1}"
+
+    def _topic_symbol(self, topic: str) -> str:
+        tokens = re.findall(r"[A-Za-z]+", _sanitize_text(topic))
+        if tokens:
+            return tokens[0][:4].upper()
+        return "SYS"
+
+    def _bullet_uniqueness_key(self, text: str) -> str:
+        cleaned = _sanitize_text(text)
+        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", cleaned)
+        cleaned = cleaned.lower()
+        cleaned = re.sub(r"(第\s*\d+\s*点|point\s*\d+)\s*[:：]?", "", cleaned)
+        cleaned = re.sub(r"\d+(?:\.\d+)?%?", "", cleaned)
+        cleaned = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", cleaned)
+        return cleaned
+
+    def _build_formula_payload(
+        self,
+        *,
+        topic: str,
+        metrics: Dict[str, str],
+        facts: Sequence[Dict[str, Any]],
+        key_findings: Sequence[str],
+    ) -> Dict[str, Any]:
+        topic_symbol = self._topic_symbol(topic)
+        metric_entries: List[Tuple[str, str, Optional[float]]] = []
+        used_symbols: Dict[str, int] = {}
+        for idx, (key, value) in enumerate(list(metrics.items())[:8]):
+            symbol = self._metric_symbol(str(key), index=idx)
+            dup_count = used_symbols.get(symbol, 0)
+            used_symbols[symbol] = dup_count + 1
+            if dup_count > 0:
+                symbol = f"{symbol}_{dup_count + 1}"
+            metric_entries.append((symbol, _sanitize_text(str(key)), _extract_numeric(str(value))))
+
+        positives: List[str] = []
+        negatives: List[str] = []
+        for symbol, name, _ in metric_entries:
+            lowered = name.lower()
+            if any(token in lowered for token in ["latency", "delay", "cost", "error", "risk", "延迟", "成本", "风险", "失效"]):
+                negatives.append(symbol)
+            else:
+                positives.append(symbol)
+
+        signed_terms: List[str] = []
+        for idx, symbol in enumerate(positives[:2], start=1):
+            signed_terms.append(f"+ w_{{{idx}}} \\cdot {symbol}")
+        for idx, symbol in enumerate(negatives[:2], start=1):
+            signed_terms.append(f"- \\lambda_{{{idx}}} \\cdot {symbol}")
+        if not signed_terms:
+            signed_terms = [
+                r"+ w_{1} \cdot Quality",
+                r"+ w_{2} \cdot Coverage",
+                r"- \lambda_{1} \cdot Latency",
+                r"- \lambda_{2} \cdot Cost",
+            ]
+
+        objective = f"Score_{{{topic_symbol}}} = " + " ".join(signed_terms).lstrip("+ ").strip()
+
+        primary_symbol = metric_entries[0][0] if metric_entries else "M"
+        normalized_metric = (
+            f"{primary_symbol}_{{norm}} = "
+            f"\\frac{{{primary_symbol} - {primary_symbol}_{{min}}}}{{{primary_symbol}_{{max}} - {primary_symbol}_{{min}} + \\varepsilon}}"
+        )
+
+        fact_count = max(1, min(12, len(list(facts))))
+        evidence = (
+            f"Evidence_{{{topic_symbol}}} = "
+            f"\\frac{{\\sum_{{i=1}}^{{{fact_count}}} c_i \\cdot w_i}}{{\\sum_{{i=1}}^{{{fact_count}}} w_i}}"
+        )
+
+        domain_text = " ".join(
+            [
+                _sanitize_text(topic),
+                " ".join([_sanitize_text(item) for item in key_findings[:4]]),
+                " ".join([_sanitize_text(str((fact or {}).get("claim", ""))) for fact in list(facts)[:4]]),
+            ]
+        ).lower()
+        if any(token in domain_text for token in ["retrieval", "rag", "检索", "召回"]):
+            domain_formula = r"Recall@k = \frac{Relevant@k}{Relevant\_Total}"
+        elif any(token in domain_text for token in ["video", "world model", "时序", "一致性"]):
+            domain_formula = r"TemporalConsistency_t = \frac{1}{N}\sum_{i=1}^{N}\mathbb{1}(state_i^{t} \approx state_i^{t-1})"
+        elif positives and negatives:
+            domain_formula = f"Efficiency = \\frac{{{positives[0]}}}{{{negatives[0]} + \\varepsilon}}"
+        else:
+            domain_formula = r"Throughput = \frac{Requests}{Second}"
+
+        formulas = [objective, normalized_metric, evidence, domain_formula]
         return {"formulas": formulas}
 
     def _build_image_payload(self, one_pager: OnePager) -> Dict[str, Any]:
@@ -774,6 +908,12 @@ class SlidevVideoGenerator(BaseVideoGenerator):
                 "复杂场景重点关注动作连续性与因果合理性。",
                 "输出质量通过可控性、稳定性与事实性联合评估。",
             ],
+            "关键公式与计算框架": [
+                "目标函数显式权衡质量、覆盖、延迟与成本四个维度。",
+                "指标需要归一化后再进入加权评分，避免量纲污染。",
+                "证据分数应按来源可信度进行加权平均。",
+                "公式服务于决策解释，必须与实验结论联合使用。",
+            ],
             "实验设置与指标口径": [
                 "评估必须同时覆盖质量、覆盖率、延迟与单位成本。",
                 "Precision@k 用于衡量检索命中质量。",
@@ -812,11 +952,19 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             ],
         }
 
+        def _resolve_template(title: str) -> List[str]:
+            if title in fallback_templates:
+                return fallback_templates[title]
+            for key, value in fallback_templates.items():
+                if title in key or key in title:
+                    return value
+            return []
+
         def fallback(points: Sequence[str], title: str) -> List[str]:
             items = self._fit_bullets(points, max_bullets=4, max_len=72, technical_only=True)
             if items:
                 return items
-            template = fallback_templates.get(title, [])
+            template = _resolve_template(title)
             if template:
                 return template[:4]
             return [f"{title}：技术证据不足，建议补充可复现实验与指标后重试。"]
@@ -937,7 +1085,12 @@ class SlidevVideoGenerator(BaseVideoGenerator):
                 ],
                 notes="先解释变量含义，再给数值口径。",
                 visual_kind="formula",
-                visual_payload=self._build_formula_payload(topic),
+                visual_payload=self._build_formula_payload(
+                    topic=topic,
+                    metrics=one_pager.metrics,
+                    facts=facts_sorted,
+                    key_findings=one_pager.key_findings,
+                ),
             )
         )
 
@@ -1041,17 +1194,72 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             )
 
         normalized: List[SlideSpec] = []
+        global_bullet_keys: set[str] = set()
+        seen_slide_signatures: set[str] = set()
+
+        def _append_unique_bullets(
+            target: List[str],
+            candidates: Sequence[str],
+            *,
+            local_keys: set[str],
+            max_items: int = 5,
+        ) -> None:
+            for raw in candidates:
+                if len(target) >= max_items:
+                    break
+                bullet = self._normalize_bullet_text(raw)
+                if not bullet:
+                    continue
+                key = self._bullet_uniqueness_key(bullet)
+                if not key or key in local_keys or key in global_bullet_keys:
+                    continue
+                local_keys.add(key)
+                global_bullet_keys.add(key)
+                target.append(bullet)
+
         for slide in slides:
             title = _sanitize_text(slide.title)
-            bullets = [self._normalize_bullet_text(item) for item in slide.bullets]
-            bullets = [item for item in bullets if item]
             notes = _sanitize_text(slide.notes)
-            if not title or not bullets:
+            if not title:
                 continue
+
+            local_keys: set[str] = set()
+            unique_bullets: List[str] = []
+            _append_unique_bullets(
+                unique_bullets,
+                slide.bullets,
+                local_keys=local_keys,
+                max_items=5,
+            )
+
+            if len(unique_bullets) < 2:
+                supplement_pool: List[str] = []
+                supplement_pool.extend(_resolve_template(title))
+                supplement_pool.extend(global_pool)
+                supplement_pool.extend(fact_bullets)
+                supplement_pool.extend(metric_lines)
+                _append_unique_bullets(
+                    unique_bullets,
+                    supplement_pool,
+                    local_keys=local_keys,
+                    max_items=5,
+                )
+
+            if len(unique_bullets) < 2:
+                continue
+
+            slide_signature = "|".join(
+                [title, slide.visual_kind]
+                + [self._bullet_uniqueness_key(item) for item in unique_bullets[:3]]
+            )
+            if slide_signature in seen_slide_signatures:
+                continue
+            seen_slide_signatures.add(slide_signature)
+
             normalized.append(
                 SlideSpec(
                     title=title,
-                    bullets=bullets[:5],
+                    bullets=unique_bullets[:5],
                     duration_sec=slide.duration_sec,
                     notes=notes,
                     visual_kind=slide.visual_kind,
@@ -1620,6 +1828,28 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         images = sorted(slides_dir.glob("*.png"), key=_key)
         return images
 
+    def _render_narration_segments(
+        self,
+        *,
+        slides: List[SlideSpec],
+        out_dir: Path,
+        ffmpeg_bin: str,
+    ) -> Dict[str, Any]:
+        try:
+            return self._narration().render_narration_segments(
+                slides=slides,
+                out_dir=out_dir,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+        except RuntimeError as e:
+            raise VideoGenerationError(str(e)) from e
+
+    def _concat_audio_segments(self, audio_paths: List[Path], output_path: Path, ffmpeg_bin: str) -> None:
+        try:
+            self._narration().concat_audio_segments(audio_paths, output_path, ffmpeg_bin)
+        except RuntimeError as e:
+            raise VideoGenerationError(str(e)) from e
+
     def _render_video_segments(
         self,
         image_paths: List[Path],
@@ -1661,7 +1891,13 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             segment_paths.append(segment_path)
         return segment_paths
 
-    def _concat_segments(self, segment_paths: List[Path], output_path: Path, ffmpeg_bin: str) -> None:
+    def _concat_segments(
+        self,
+        segment_paths: List[Path],
+        output_path: Path,
+        ffmpeg_bin: str,
+        narration_audio_path: Optional[Path] = None,
+    ) -> None:
         concat_path = output_path.parent / "video_segments_concat.txt"
 
         def _escape(path: str) -> str:
@@ -1669,6 +1905,10 @@ class SlidevVideoGenerator(BaseVideoGenerator):
 
         concat_lines = [f"file '{_escape(str(path.resolve()))}'" for path in segment_paths]
         concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        video_only_path = output_path
+        if narration_audio_path:
+            video_only_path = output_path.parent / f"{output_path.stem}.video_only.mp4"
 
         cmd = [
             ffmpeg_bin,
@@ -1690,9 +1930,37 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             "-an",
             "-movflags",
             "+faststart",
-            str(output_path),
+            str(video_only_path),
         ]
         self._run_subprocess(cmd, context="ffmpeg concat")
+
+        if not narration_audio_path:
+            return
+
+        mux_cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(video_only_path),
+            "-i",
+            str(narration_audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        self._run_subprocess(mux_cmd, context="ffmpeg mux narration")
+        video_only_path.unlink(missing_ok=True)
 
     def _generate_video_sync(
         self,
@@ -1760,6 +2028,35 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             if not image_paths:
                 raise VideoGenerationError("Slidev export output mismatch left no usable slides.")
 
+        narration_audio_path: Optional[Path] = None
+        narration_script_path: Optional[Path] = None
+        narration_dir: Optional[Path] = None
+        tts_providers: List[str] = []
+        narration_specs: List[NarrationSpec] = []
+        if self.enable_narration:
+            self._emit_progress("Generating narration audio track...")
+            narration_meta = self._render_narration_segments(
+                slides=slides,
+                out_dir=out_dir,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+            narration_script_path = narration_meta["script_path"]
+            narration_dir = narration_meta["narration_dir"]
+            tts_providers = list(narration_meta.get("providers_used") or [])
+            narration_specs = list(narration_meta.get("narration_specs") or [])
+            narration_durations = list(narration_meta.get("segment_durations") or [])
+            for idx, duration in enumerate(narration_durations):
+                if idx >= len(slides):
+                    break
+                slides[idx].duration_sec = max(1, int(math.ceil(float(duration) + 0.12)))
+            narration_audio_path = out_dir / "video_narration.m4a"
+            self._emit_progress("Concatenating narration audio...")
+            self._concat_audio_segments(
+                audio_paths=list(narration_meta["segment_paths"]),
+                output_path=narration_audio_path,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+
         segments_dir = out_dir / "video_segments"
         self._emit_progress("Rendering per-slide video segments...")
         segment_paths = self._render_video_segments(
@@ -1770,10 +2067,15 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         )
 
         self._emit_progress("Concatenating final video...")
-        self._concat_segments(segment_paths=segment_paths, output_path=output_path, ffmpeg_bin=ffmpeg_bin)
+        self._concat_segments(
+            segment_paths=segment_paths,
+            output_path=output_path,
+            ffmpeg_bin=ffmpeg_bin,
+            narration_audio_path=narration_audio_path,
+        )
 
         total_duration = int(sum(max(1, int(item.duration_sec)) for item in slides))
-        return {
+        flow: Dict[str, Any] = {
             "slide_count": len(slides),
             "estimated_duration_sec": total_duration,
             "slides_dir": str(slides_dir),
@@ -1787,6 +2089,17 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             "fps": self.fps,
             "resolution": f"{self.width}x{self.height}",
         }
+        if narration_audio_path:
+            flow["narration_audio_path"] = str(narration_audio_path)
+        if narration_script_path:
+            flow["narration_script_path"] = str(narration_script_path)
+        if narration_dir:
+            flow["narration_segments_dir"] = str(narration_dir)
+        if tts_providers:
+            flow["tts_providers"] = tts_providers
+        if narration_specs:
+            flow["narration_slide_count"] = len(narration_specs)
+        return flow
 
     async def generate(
         self,
