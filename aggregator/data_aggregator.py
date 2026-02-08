@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging
+import re
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -197,6 +198,66 @@ class DataAggregator:
             self._print_summary(result)
         
         return result
+
+    def _topic_query_candidates(self, topic: str) -> List[str]:
+        """
+        生成查询降级候选词，提升长查询在多源 API 的召回率。
+        例如: "MCP production deployment" -> ["MCP production deployment", "MCP", "Model Context Protocol"]
+        """
+        base = str(topic or "").strip()
+        if not base:
+            return []
+
+        candidates: List[str] = [base]
+        lower_base = base.lower()
+
+        tokens = re.findall(r"[A-Za-z0-9#+-]+", base)
+        stopwords = {
+            "production",
+            "deployment",
+            "deploy",
+            "prod",
+            "system",
+            "systems",
+            "implementation",
+            "architecture",
+            "analysis",
+            "research",
+            "study",
+            "with",
+            "for",
+            "and",
+            "the",
+            "in",
+            "of",
+            "to",
+        }
+
+        core_tokens = [t for t in tokens if t.lower() not in stopwords]
+        if core_tokens:
+            core = " ".join(core_tokens[:4]).strip()
+            if core and core.lower() != lower_base:
+                candidates.append(core)
+
+        acronyms = [t for t in tokens if t.isupper() and 2 <= len(t) <= 8]
+        for token in acronyms:
+            if token.lower() != lower_base and token not in candidates:
+                candidates.append(token)
+
+        token_set = {t.lower() for t in tokens}
+        if "mcp" in token_set and "model context protocol" not in {c.lower() for c in candidates}:
+            candidates.append("Model Context Protocol")
+
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            key = item.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item.strip())
+
+        return deduped[:3]
     
     async def _search_arxiv(
         self, 
@@ -209,11 +270,16 @@ class DataAggregator:
         if not scraper:
             return []
         
-        try:
-            return await scraper.search(topic, max_results, sort_by=sort_by)
-        except Exception as e:
-            logger.error(f"ArXiv search failed: {e}")
-            return []
+        for query in self._topic_query_candidates(topic):
+            try:
+                papers = await scraper.search(query, max_results, sort_by=sort_by)
+                if papers:
+                    if query != topic:
+                        logger.info(f"ArXiv fallback query hit: '{query}'")
+                    return papers
+            except Exception as e:
+                logger.warning(f"ArXiv search failed for query '{query}': {e}")
+        return []
     
     async def _search_huggingface(
         self, 
@@ -225,16 +291,19 @@ class DataAggregator:
         if not scraper:
             return [], []
         
-        try:
-            # 并行搜索模型和数据集
-            models, datasets = await asyncio.gather(
-                scraper.search_models(topic, max_results),
-                scraper.search_datasets(topic, max_results),
-            )
-            return models, datasets
-        except Exception as e:
-            logger.error(f"HuggingFace search failed: {e}")
-            return [], []
+        for query in self._topic_query_candidates(topic):
+            try:
+                models, datasets = await asyncio.gather(
+                    scraper.search_models(query, max_results),
+                    scraper.search_datasets(query, max_results),
+                )
+                if models or datasets:
+                    if query != topic:
+                        logger.info(f"HuggingFace fallback query hit: '{query}'")
+                    return models, datasets
+            except Exception as e:
+                logger.warning(f"HuggingFace search failed for query '{query}': {e}")
+        return [], []
     
     async def _search_twitter(
         self, 
@@ -347,11 +416,16 @@ class DataAggregator:
         if not scraper:
             return []
         
-        try:
-            return await scraper.search(topic, max_results)
-        except Exception as e:
-            logger.error(f"Semantic Scholar search failed: {e}")
-            return []
+        for query in self._topic_query_candidates(topic):
+            try:
+                papers = await scraper.search(query, max_results)
+                if papers:
+                    if query != topic:
+                        logger.info(f"Semantic Scholar fallback query hit: '{query}'")
+                    return papers
+            except Exception as e:
+                logger.warning(f"Semantic Scholar search failed for query '{query}': {e}")
+        return []
     
     async def _search_stackoverflow(
         self, 
@@ -363,11 +437,16 @@ class DataAggregator:
         if not scraper:
             return []
         
-        try:
-            return await scraper.search(topic, max_results)
-        except Exception as e:
-            logger.error(f"Stack Overflow search failed: {e}")
-            return []
+        for query in self._topic_query_candidates(topic):
+            try:
+                questions = await scraper.search(query, max_results)
+                if questions:
+                    if query != topic:
+                        logger.info(f"StackOverflow fallback query hit: '{query}'")
+                    return questions
+            except Exception as e:
+                logger.warning(f"Stack Overflow search failed for query '{query}': {e}")
+        return []
     
     async def _search_hackernews(
         self, 
