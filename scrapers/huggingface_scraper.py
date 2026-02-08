@@ -130,9 +130,6 @@ class HuggingFaceScraper(BaseScraper[Model]):
             kwargs["library"] = library
         if "library_name" in sig.parameters and library:
             kwargs["library_name"] = library
-        if "direction" in sig.parameters:
-            kwargs["direction"] = -1
-
         return list(self._api.list_models(**kwargs))
     
     async def search_datasets(
@@ -188,9 +185,6 @@ class HuggingFaceScraper(BaseScraper[Model]):
         sig = inspect.signature(self._api.list_datasets)
         if "task_categories" in sig.parameters and task:
             kwargs["task_categories"] = task
-        if "direction" in sig.parameters:
-            kwargs["direction"] = -1
-
         return list(self._api.list_datasets(**kwargs))
     
     async def search_papers(
