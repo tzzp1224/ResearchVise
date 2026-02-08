@@ -14,6 +14,7 @@ from .cache import (
     DiskCache,
     get_cache,
 )
+from .research_artifact_store import ResearchArtifactStore
 
 __all__ = [
     # Vector Store
@@ -26,4 +27,5 @@ __all__ = [
     "MemoryCache",
     "DiskCache",
     "get_cache",
+    "ResearchArtifactStore",
 ]

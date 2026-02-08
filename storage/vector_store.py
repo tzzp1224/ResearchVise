@@ -344,6 +344,18 @@ class QdrantVectorStore(BaseVectorStore):
     def count(self) -> int:
         """返回文档数量"""
         return self._client.get_collection(self.collection_name).points_count
+
+    def close(self) -> None:
+        """关闭底层客户端连接"""
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception as e:
+                logger.debug(f"Failed to close Qdrant client: {e}")
     
     def get_all(self, limit: int = 1000) -> List[Dict]:
         """获取所有文档 (调试用)"""
