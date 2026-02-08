@@ -60,6 +60,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="FPS for slides video rendering (default: 24)",
     )
     parser.add_argument(
+        "--disable-narration",
+        action="store_true",
+        help="Disable TTS narration track and export silent video only",
+    )
+    parser.add_argument(
+        "--tts-provider",
+        type=str,
+        default="auto",
+        help="TTS provider for narration: auto/edge-tts/say/espeak (default: auto)",
+    )
+    parser.add_argument(
+        "--tts-voice",
+        type=str,
+        default=None,
+        help="Optional TTS voice name (provider-specific)",
+    )
+    parser.add_argument(
+        "--tts-speed",
+        type=float,
+        default=1.2,
+        help="Narration speed multiplier (default: 1.2)",
+    )
+    parser.add_argument(
+        "--narration-model",
+        type=str,
+        default="deepseek-chat",
+        help="Small model used to rewrite per-slide narration scripts (default: deepseek-chat)",
+    )
+    parser.add_argument(
         "--disable-knowledge-indexing",
         action="store_true",
         help="Skip vector knowledge indexing step in analyst stage",
@@ -109,6 +138,11 @@ async def async_main(args: argparse.Namespace) -> int:
         video_generator = SlidevVideoGenerator(
             target_duration_sec=args.slides_target_duration_sec,
             fps=args.slides_fps,
+            enable_narration=not args.disable_narration,
+            tts_provider=args.tts_provider,
+            tts_voice=args.tts_voice,
+            tts_speed=args.tts_speed,
+            narration_model=args.narration_model,
             progress_callback=_video_progress,
         )
 
@@ -117,7 +151,8 @@ async def async_main(args: argparse.Namespace) -> int:
             f"Topic: {args.topic}\n"
             f"Max results/source: {args.max_results}\n"
             f"Sources: {','.join(sorted(selected_sources))}\n"
-            f"Generate video: {args.generate_video} ({video_provider})",
+            f"Generate video: {args.generate_video} ({video_provider})\n"
+            f"Narration: {not args.disable_narration} (tts={args.tts_provider})",
             title="Phase 4 E2E Run",
             border_style="blue",
         )
@@ -135,6 +170,9 @@ async def async_main(args: argparse.Namespace) -> int:
     )
 
     depth = result.get("depth_assessment", {})
+    quality = result.get("quality_metrics") or {}
+    planner = result.get("planner") or {}
+    cache_hit = bool(result.get("cache_hit", False))
     console.print("\n[bold]Run Summary[/bold]")
     console.print(f"- search_results: {result.get('search_results_count', 0)}")
     console.print(f"- facts: {len(result.get('facts', []))}")
@@ -142,6 +180,25 @@ async def async_main(args: argparse.Namespace) -> int:
         f"- depth_score: {depth.get('score', 0)}/{depth.get('max_score', 0)} "
         f"(pass={depth.get('pass', False)})"
     )
+    if quality:
+        console.print(
+            f"- quality_score: {quality.get('overall_score', 0)}/1.0 "
+            f"(pass={result.get('quality_gate_pass', False)})"
+        )
+    if planner:
+        console.print(
+            f"- planner_is_technical: {planner.get('is_technical', True)}"
+        )
+    console.print(f"- cache_hit: {cache_hit}")
+    if cache_hit:
+        try:
+            cache_score = float(result.get("cache_score", 0.0))
+        except Exception:
+            cache_score = 0.0
+        console.print(
+            f"- cache_score: {cache_score:.4f} "
+            f"(matched_topic={result.get('cache_matched_topic', '')})"
+        )
     console.print(f"- output_dir: {result.get('output_dir')}")
 
     written_files = result.get("written_files", {})
@@ -168,6 +225,12 @@ async def async_main(args: argparse.Namespace) -> int:
         console.print("\n[bold]Knowledge Gaps[/bold]")
         for gap in result["knowledge_gaps"][:6]:
             console.print(f"- {gap}")
+
+    recommendations = result.get("quality_recommendations") or []
+    if recommendations:
+        console.print("\n[bold]Critic Recommendations[/bold]")
+        for rec in recommendations[:5]:
+            console.print(f"- {rec}")
 
     return 0
 
