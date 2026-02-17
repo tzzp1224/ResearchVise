@@ -5,10 +5,9 @@ Vector Store
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import hashlib
 import logging
 from dataclasses import dataclass
-
-import numpy as np
 
 from processing.chunker import DocumentChunk
 from processing.embedder import BaseEmbedder, get_embedder
@@ -16,6 +15,18 @@ from utils.exceptions import VectorStoreError
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stable_hex_digest(value: Any, *, length: int = 16) -> str:
+    """Return deterministic digest prefix for persistent IDs."""
+    safe_len = max(8, int(length))
+    text = str(value)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:safe_len]
+
+
+def _stable_point_id(value: Any) -> int:
+    """Generate deterministic uint63-compatible point ID for Qdrant."""
+    return int(_stable_hex_digest(value, length=16), 16) & 0x7FFFFFFFFFFFFFFF
 
 
 @dataclass
@@ -212,8 +223,7 @@ class QdrantVectorStore(BaseVectorStore):
         
         # 生成 ID
         if ids is None:
-            import hashlib
-            ids = [hashlib.md5(doc.encode()).hexdigest()[:16] for doc in documents]
+            ids = [_stable_hex_digest(doc, length=16) for doc in documents]
         
         # 处理 metadata
         if metadatas is None:
@@ -221,7 +231,7 @@ class QdrantVectorStore(BaseVectorStore):
         
         # 构建 points
         points = []
-        for i, (doc, embedding, metadata, id_) in enumerate(zip(documents, embeddings, metadatas, ids)):
+        for doc, embedding, metadata, id_ in zip(documents, embeddings, metadatas, ids):
             # 清理 metadata (Qdrant 不支持 None 值和复杂嵌套)
             clean_meta = {k: v for k, v in metadata.items() if v is not None}
             for k, v in list(clean_meta.items()):
@@ -229,8 +239,9 @@ class QdrantVectorStore(BaseVectorStore):
                     clean_meta[k] = str(v)
             
             clean_meta["_content"] = doc
+            point_id = id_ if isinstance(id_, int) and not isinstance(id_, bool) else _stable_point_id(id_)
             points.append(PointStruct(
-                id=i if isinstance(id_, int) else hash(id_) & 0x7FFFFFFFFFFFFFFF,
+                id=point_id,
                 vector=embedding,
                 payload={**clean_meta, "_id": id_},
             ))
@@ -260,10 +271,11 @@ class QdrantVectorStore(BaseVectorStore):
         
         支持的过滤语法:
             - 精确匹配: {"source": "arxiv"}
+            - IN 查询: {"source": {"$in": ["arxiv", "github"]}}
             - 范围查询: {"year": {"$gte": 2024}}
             - 组合条件: {"source": "arxiv", "year": {"$gte": 2024}}
         """
-        from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
+        from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue, Range
         
         # 构建过滤器
         qdrant_filter = None
@@ -271,6 +283,17 @@ class QdrantVectorStore(BaseVectorStore):
             conditions = []
             for key, value in filter.items():
                 if isinstance(value, dict):
+                    if "$in" in value:
+                        candidates = value.get("$in")
+                        if isinstance(candidates, (list, tuple, set)):
+                            any_values = [item for item in candidates if item is not None]
+                        elif candidates is None:
+                            any_values = []
+                        else:
+                            any_values = [candidates]
+                        if any_values:
+                            conditions.append(FieldCondition(key=key, match=MatchAny(any=any_values)))
+                        continue
                     # 范围查询: {"year": {"$gte": 2025}}
                     range_params = {}
                     for op, val in value.items():
@@ -280,6 +303,10 @@ class QdrantVectorStore(BaseVectorStore):
                         elif op == "$lt": range_params["lt"] = val
                     if range_params:
                         conditions.append(FieldCondition(key=key, range=Range(**range_params)))
+                elif isinstance(value, (list, tuple, set)):
+                    any_values = [item for item in value if item is not None]
+                    if any_values:
+                        conditions.append(FieldCondition(key=key, match=MatchAny(any=any_values)))
                 else:
                     # 精确匹配
                     conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))

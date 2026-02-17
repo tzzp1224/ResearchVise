@@ -2,11 +2,13 @@
 RAG Tools
 知识库检索和存储工具
 """
+import asyncio
+import hashlib
 from typing import List, Dict, Any, Optional
 import logging
 
 from storage import QdrantVectorStore, get_vector_store
-from processing import clean_text, chunk_document, get_embedder
+from processing import clean_text, chunk_document
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,34 @@ def close_knowledge_base() -> None:
         logger.debug(f"Failed to close knowledge base: {e}")
     finally:
         _vector_store = None
+
+
+def _normalize_source_list(sources: Optional[List[str]]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for source in sources or []:
+        value = str(source or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _result_fingerprint(item: Dict[str, Any]) -> str:
+    item_id = str(item.get("id", "")).strip()
+    if item_id:
+        return f"id:{item_id}"
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        url = str(metadata.get("url", "")).strip()
+        if url:
+            return f"url:{url}"
+    content = str(item.get("content", "")).strip()
+    if content:
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:24]
+        return f"content:{digest}"
+    return ""
 
 
 async def vector_search(
@@ -136,22 +166,69 @@ async def hybrid_search(
     Returns:
         搜索结果
     """
-    filter_dict = {}
-    
-    if sources:
-        # Qdrant 不直接支持 IN 查询，需要多次查询合并
-        # 这里简化处理，只用第一个 source
-        if len(sources) == 1:
-            filter_dict["source"] = sources[0]
-    
+    source_list = _normalize_source_list(sources)
+    base_filter: Dict[str, Any] = {}
     if year_filter:
-        filter_dict["year"] = {"$gte": year_filter}
-    
-    return await vector_search(
-        query=query,
-        top_k=top_k,
-        filter=filter_dict if filter_dict else None,
+        base_filter["year"] = {"$gte": year_filter}
+
+    if not source_list:
+        return await vector_search(
+            query=query,
+            top_k=top_k,
+            filter=base_filter if base_filter else None,
+        )
+
+    if len(source_list) == 1:
+        single_filter = dict(base_filter)
+        single_filter["source"] = source_list[0]
+        return await vector_search(query=query, top_k=top_k, filter=single_filter)
+
+    in_filter = dict(base_filter)
+    in_filter["source"] = {"$in": source_list}
+    try:
+        return await vector_search(query=query, top_k=top_k, filter=in_filter)
+    except Exception as exc:
+        logger.warning(
+            "Hybrid search IN filter failed; falling back to per-source fan-out: %s",
+            exc,
+            exc_info=True,
+        )
+
+    async def _search_by_source(source: str):
+        source_filter = dict(base_filter)
+        source_filter["source"] = source
+        return await vector_search(query=query, top_k=top_k, filter=source_filter)
+
+    fanout_results = await asyncio.gather(
+        *[_search_by_source(source) for source in source_list],
+        return_exceptions=True,
     )
+
+    best_by_fingerprint: Dict[str, Dict[str, Any]] = {}
+    for source, batch in zip(source_list, fanout_results):
+        if isinstance(batch, Exception):
+            logger.error(
+                "Hybrid search fallback failed for source='%s': %s",
+                source,
+                batch,
+                exc_info=True,
+            )
+            continue
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            fingerprint = _result_fingerprint(item)
+            if not fingerprint:
+                continue
+            current = best_by_fingerprint.get(fingerprint)
+            current_score = float(current.get("score", 0.0) or 0.0) if current else float("-inf")
+            next_score = float(item.get("score", 0.0) or 0.0)
+            if next_score >= current_score:
+                best_by_fingerprint[fingerprint] = item
+
+    merged = list(best_by_fingerprint.values())
+    merged.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+    return merged[: max(1, int(top_k))]
 
 
 def create_rag_tools() -> List[Dict[str, Any]]:

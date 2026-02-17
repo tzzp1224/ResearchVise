@@ -1,20 +1,36 @@
 """
-Research Graph
-LangGraph 主图定义 - Plan-and-Execute 模式
+Deprecated Research Graph (Legacy Workflow)
+
+This module is a historical LangGraph implementation retained for backward compatibility
+only. It is no longer the authoritative production pipeline and should not receive new
+feature work.
+
+Authoritative entrypoint:
+    - ``intelligence.pipeline.run_research_end_to_end``
+    - File: ``intelligence/pipeline.py``
+
+Current end-to-end data flow lives in the pipeline module:
+Planner -> Search -> Analysis -> Content -> Critic -> Export (-> optional Video / Cache).
 """
-from typing import Dict, Any, Optional, Literal, Annotated, TypedDict, List, AsyncIterator
+import warnings
+from typing import Dict, Any, Optional, Literal, TypedDict, List, AsyncIterator
 import logging
-import operator
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
 
-from intelligence.llm import get_llm
 from intelligence.agents import SearchAgent, AnalystAgent, ContentAgent
 from intelligence.state import AgentPhase
 
 
 logger = logging.getLogger(__name__)
+
+warnings.warn(
+    "intelligence.graph.research_graph is deprecated; use "
+    "intelligence.pipeline.run_research_end_to_end in intelligence/pipeline.py.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 # 定义状态结构 (LangGraph 兼容)
