@@ -1,5 +1,30 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
+## Changelog (Last Updated: 2026-02-18)
+### Commit: Audit & De-placeholder Entry Cleanup (Commit 1)
+- 本次目标：
+  - 记录当前可复现实测证据（smoke 与点播链路）。
+  - 移除一个直接制造占位镜头的输出入口。
+  - 增加 `validate_artifacts_v2.py` 验收脚本骨架。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/e2e_smoke_v2.py`：
+    - 删除 `SmokeAdapter` 文本镜头产出逻辑，改为默认渲染路径（Seedance 不可用则走 fallback）。
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 校验 `script/onepager/storyboard/materials/mp4` 是否存在；
+    - blocklist（placeholder/dummy/lorem/todo/testsrc/colorbars）扫描；
+    - `ffprobe`/`ftyp` 基础视频校验；
+    - 输出 JSON 报告并返回 0/1 退出码。
+- 新增/删除文件：
+  - 新增：`scripts/validate_artifacts_v2.py`
+  - 修改：`scripts/e2e_smoke_v2.py`, `README.md`
+- 如何验证：
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke > /tmp/ara_v2_smoke/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_smoke/runs/<run_id> --render-dir /tmp/ara_v2_smoke/render_jobs/<render_job_id>`
+  - `pytest -q tests/v2/test_e2e_smoke_command.py`
+- 已知风险与回滚：
+  - 风险：当前 `validate_artifacts_v2.py` 仍是基础门禁，帧差与更严格质量规则后续 commit 增强。
+  - 回滚：`git revert <this_commit_sha>` 可恢复 smoke adapter 与当前门禁脚本变更。
+
 本文档说明当前仓库的真实实现状态、可运行命令、产物路径、Seedance 接入现状、限制与下一步。
 
 ## 1) 当前真实入口与数据流
@@ -142,6 +167,11 @@ python main.py worker-render-next
 python main.py status --run-id <run_id>
 ```
 
+注意：当前 `main.py` 的状态存储为进程内内存，多条独立 `python main.py ...` 命令不会共享队列状态。
+要稳定复现整条链路，优先使用：
+- 同进程脚本（`scripts/e2e_smoke_v2.py`）
+- 或启动一个常驻 API 进程后通过 HTTP 顺序调用 enqueue/worker 接口
+
 ### 6.2 daily 模拟跑一次（CLI）
 ```bash
 python main.py daily-subscribe --user-id u1 --run-at 08:00 --tz America/Los_Angeles --top-k 3
@@ -183,6 +213,21 @@ print('run_id=', d['run_id'])
 print('mp4=', mp4)
 print('valid_mp4=', d['render_status'].get('valid_mp4'))
 subprocess.run(['ffprobe','-hide_banner','-v','error','-show_format','-show_streams',mp4], check=False)
+PY
+```
+
+```bash
+python - <<'PY'
+import json, pathlib, subprocess
+p = pathlib.Path('/tmp/ara_v2_smoke/result.json')
+d = json.loads(p.read_text())
+run_dir = next(e['message'].split('output_dir=',1)[1] for e in d['events'] if e['event']=='run_started')
+render_dir = str(pathlib.Path(d['render_status']['output_path']).parent)
+subprocess.run([
+  'python', 'scripts/validate_artifacts_v2.py',
+  '--run-dir', run_dir,
+  '--render-dir', render_dir
+], check=False)
 PY
 ```
 

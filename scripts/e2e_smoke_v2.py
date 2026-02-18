@@ -12,23 +12,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from core import PromptSpec, RawItem, RunMode, RunRequest
+from core import RawItem, RunMode, RunRequest
 from orchestrator.queue import InMemoryRunQueue
 from orchestrator.service import RunOrchestrator
 from orchestrator.store import InMemoryRunStore
 from pipeline_v2.runtime import RunPipelineRuntime
-from render.adapters import BaseRendererAdapter, ShotRenderResult
 from render.manager import RenderManager
-
-
-class SmokeAdapter(BaseRendererAdapter):
-    provider = "smoke-renderer"
-
-    def render_shot(self, *, prompt_spec: PromptSpec, output_dir: Path, mode: str, budget: dict, run_id: str, render_job_id: str) -> ShotRenderResult:
-        _ = mode, budget, run_id, render_job_id
-        target = output_dir / f"shot_{prompt_spec.shot_idx:03d}.mp4"
-        target.write_bytes(f"smoke-shot-{prompt_spec.shot_idx}".encode("utf-8"))
-        return ShotRenderResult(shot_idx=prompt_spec.shot_idx, success=True, output_path=str(target), cost=0.1)
 
 
 def _connector_overrides() -> dict:
@@ -97,7 +86,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
-    render_manager = RenderManager(renderer_adapter=SmokeAdapter(), work_dir=out_dir / "render_jobs")
+    # Intentionally uses default renderer path (Seedance unavailable -> fallback motion render).
+    render_manager = RenderManager(work_dir=out_dir / "render_jobs")
     runtime = RunPipelineRuntime(
         orchestrator=orchestrator,
         render_manager=render_manager,
