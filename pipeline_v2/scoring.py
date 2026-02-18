@@ -1,0 +1,162 @@
+"""Explainable scoring and ranking for canonical items."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import math
+import re
+from typing import Dict, List, Sequence
+
+from core import NormalizedItem, RankedItem
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def score_novelty(item: NormalizedItem) -> float:
+    """Novelty favors recency and release-like artifacts."""
+    published = item.published_at
+    if published is None:
+        recency = 0.45
+    else:
+        dt = published
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        days_old = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
+        recency = max(0.0, 1.0 - days_old / 45.0)
+
+    body = str(item.body_md or "")
+    token_diversity = len(set(re.findall(r"[a-zA-Z0-9_]+", body.lower()))) / max(
+        1.0, len(re.findall(r"[a-zA-Z0-9_]+", body.lower()))
+    )
+    release_bonus = 0.12 if str(item.metadata.get("item_type", "")).lower() == "release" else 0.0
+    return _clamp01(0.62 * recency + 0.26 * token_diversity + release_bonus)
+
+
+def score_talkability(item: NormalizedItem) -> float:
+    """Talkability reflects community traction and shareability."""
+    metadata = dict(item.metadata or {})
+    stars = float(metadata.get("stars", 0) or 0)
+    downloads = float(metadata.get("downloads", 0) or 0)
+    likes = float(metadata.get("likes", 0) or 0)
+    points = float(metadata.get("points", 0) or 0)
+    comments = float(metadata.get("comment_count", metadata.get("comments", 0)) or 0)
+
+    engagement = stars + 0.35 * downloads + 1.2 * likes + 1.4 * points + 1.6 * comments
+    engagement_score = _clamp01(math.log10(1.0 + max(0.0, engagement)) / 4.0)
+
+    title = str(item.title or "")
+    punch = 0.12 if any(marker in title for marker in [":", "?", "vs", "VS", "对比"]) else 0.0
+    return _clamp01(engagement_score + punch)
+
+
+def score_credibility(item: NormalizedItem) -> float:
+    """Credibility favors Tier A, citations, and explicit source quality labels."""
+    base = 0.78 if item.tier == "A" else 0.34
+    citation_bonus = min(0.22, 0.06 * len(item.citations))
+    label = str(item.metadata.get("credibility", "") or "").lower().strip()
+
+    if label == "high":
+        label_adj = 0.12
+    elif label == "medium":
+        label_adj = 0.03
+    elif label == "low":
+        label_adj = -0.08
+    else:
+        label_adj = 0.0
+
+    return _clamp01(base + citation_bonus + label_adj)
+
+
+def score_visual_assets(item: NormalizedItem) -> float:
+    """Visual asset score reflects render-friendly evidence density."""
+    metadata = dict(item.metadata or {})
+    flags = 0.0
+    for key in ("has_image", "has_video", "has_diagram", "demo_url"):
+        value = metadata.get(key)
+        if value:
+            flags += 0.2
+
+    text = f"{item.title}\n{item.body_md}".lower()
+    keyword_hits = sum(
+        1
+        for keyword in ("diagram", "chart", "benchmark", "architecture", "timeline", "screenshot", "demo")
+        if keyword in text
+    )
+    text_bonus = min(0.45, 0.08 * keyword_hits)
+
+    return _clamp01(0.25 + flags + text_bonus)
+
+
+def _weighted_total(scores: Dict[str, float]) -> float:
+    return _clamp01(
+        0.25 * scores["novelty"]
+        + 0.30 * scores["talkability"]
+        + 0.30 * scores["credibility"]
+        + 0.15 * scores["visual_assets"]
+    )
+
+
+def rank_items(
+    items: Sequence[NormalizedItem],
+    *,
+    tier_b_top3_talkability_threshold: float = 0.88,
+) -> List[RankedItem]:
+    """Rank items with explainable subscores and Tier B top3 gate."""
+    staged = []
+    for item in items:
+        scores = {
+            "novelty": score_novelty(item),
+            "talkability": score_talkability(item),
+            "credibility": score_credibility(item),
+            "visual_assets": score_visual_assets(item),
+        }
+        total = _weighted_total(scores)
+        # Tier B default exclusion from top3 can be overridden by exceptional talkability.
+        if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
+            margin = (scores["talkability"] - float(tier_b_top3_talkability_threshold)) / max(
+                1e-6, 1.0 - float(tier_b_top3_talkability_threshold)
+            )
+            total = _clamp01(total + 0.08 + 0.12 * _clamp01(margin))
+        staged.append((item, scores, total))
+
+    staged.sort(key=lambda row: row[2], reverse=True)
+
+    # Tier B items should not enter top3 unless talkability is extremely high.
+    top: List[tuple] = []
+    deferred_tier_b: List[tuple] = []
+    for row in staged:
+        item, scores, _total = row
+        if len(top) < 3 and item.tier == "B" and scores["talkability"] < float(tier_b_top3_talkability_threshold):
+            deferred_tier_b.append(row)
+            continue
+        top.append(row)
+
+    ordered = top + deferred_tier_b
+    ranked: List[RankedItem] = []
+    for idx, (item, scores, total) in enumerate(ordered, start=1):
+        reasons = [
+            f"novelty={scores['novelty']:.2f}",
+            f"talkability={scores['talkability']:.2f}",
+            f"credibility={scores['credibility']:.2f}",
+            f"visual_assets={scores['visual_assets']:.2f}",
+            f"tier={item.tier}",
+        ]
+        if item.tier == "B" and idx <= 3 and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
+            reasons.append("tier_b_top3_override=talkability")
+
+        ranked.append(
+            RankedItem(
+                rank=idx,
+                item=item,
+                total_score=total,
+                novelty_score=scores["novelty"],
+                talkability_score=scores["talkability"],
+                credibility_score=scores["credibility"],
+                visual_assets_score=scores["visual_assets"],
+                reasons=reasons,
+            )
+        )
+
+    return ranked

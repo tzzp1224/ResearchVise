@@ -48,6 +48,20 @@ class Citation(BaseModel):
     source: str = ""
 
 
+class RawItem(BaseModel):
+    """Connector output before normalization."""
+
+    id: str
+    source: str
+    title: str
+    url: str
+    body: str = ""
+    author: Optional[str] = None
+    published_at: Optional[datetime] = None
+    tier: Optional[Literal["A", "B"]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RunRequest(BaseModel):
     """Unified run request contract for daily and on-demand triggers."""
 
@@ -89,6 +103,28 @@ class NormalizedItem(BaseModel):
     lang: str = "en"
     hash: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CanonicalItem(NormalizedItem):
+    """Cluster-merged canonical item."""
+
+    cluster_size: int = 1
+    merged_ids: List[str] = Field(default_factory=list)
+    alias_titles: List[str] = Field(default_factory=list)
+    source_set: List[str] = Field(default_factory=list)
+
+
+class RankedItem(BaseModel):
+    """Explainable ranked item with score breakdown."""
+
+    rank: int
+    item: NormalizedItem
+    total_score: float
+    novelty_score: float
+    talkability_score: float
+    credibility_score: float
+    visual_assets_score: float
+    reasons: List[str] = Field(default_factory=list)
 
 
 class Shot(BaseModel):
