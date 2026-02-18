@@ -195,3 +195,5 @@ class RenderStatus(BaseModel):
     max_retries: int = 1
     failed_shot_indices: List[int] = Field(default_factory=list)
     output_path: Optional[str] = None
+    valid_mp4: Optional[bool] = None
+    probe_error: Optional[str] = None

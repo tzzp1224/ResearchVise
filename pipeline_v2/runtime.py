@@ -113,6 +113,8 @@ class RunPipelineRuntime:
                         "render_job_id": status.render_job_id,
                         "retry_count": status.retry_count,
                         "failed_shot_indices": list(status.failed_shot_indices or []),
+                        "valid_mp4": status.valid_mp4,
+                        "probe_error": status.probe_error,
                     },
                 ),
             )

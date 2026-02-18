@@ -140,6 +140,8 @@ def render_worker_next() -> Dict[str, Any]:
         "state": status.state,
         "progress": status.progress,
         "output_path": status.output_path,
+        "valid_mp4": status.valid_mp4,
+        "probe_error": status.probe_error,
         "retry_count": status.retry_count,
         "errors": list(status.errors or []),
     }
@@ -157,6 +159,8 @@ def confirm_render(render_job_id: str, approved: bool = True) -> Dict[str, Any]:
         "state": status.state,
         "progress": status.progress,
         "output_path": status.output_path,
+        "valid_mp4": status.valid_mp4,
+        "probe_error": status.probe_error,
         "errors": list(status.errors or []),
     }
 
