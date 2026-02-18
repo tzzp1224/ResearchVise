@@ -34,6 +34,7 @@ _DENYLIST_DOMAINS = {
     "www.github.com/sponsors",
     "localhost",
     "127.0.0.1",
+    "0.0.0.0",
 }
 _IMAGE_SUFFIXES = (".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico")
 _ASSET_SUFFIXES = _IMAGE_SUFFIXES + (".mp4", ".webm", ".mov", ".m4v", ".wav", ".mp3")
@@ -62,6 +63,15 @@ _TOOLING_DOMAINS = {
     "www.openrouter.ai",
 }
 LinkCategory = Literal["evidence", "tooling", "asset", "blocked", "invalid"]
+
+
+def _is_local_host(host: str) -> bool:
+    value = str(host or "").strip().lower()
+    if not value:
+        return False
+    if value in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return True
+    return value.endswith(".localhost")
 
 
 def _strip_url_tail_noise(value: str) -> str:
@@ -149,7 +159,7 @@ def _hostname(url: str) -> str:
         parsed = urlparse(canonicalize_url(url))
     except ValueError:
         return ""
-    host = str(parsed.netloc or "").strip().lower()
+    host = str(parsed.hostname or parsed.netloc or "").strip().lower()
     if host.startswith("www."):
         host = host[4:]
     return host
@@ -165,10 +175,16 @@ def classify_link(url: str) -> LinkCategory:
     if not host:
         return "invalid"
 
-    if host in _DENYLIST_DOMAINS:
+    if host in _DENYLIST_DOMAINS or _is_local_host(host):
         return "blocked"
     if "github.com/sponsors" in lowered or "buymeacoffee.com" in lowered:
         return "blocked"
+    if "aistudio.google.com/apikey" in lowered or "/apikey" in lowered:
+        return "tooling"
+    if "/v1/chat/completions" in lowered or "/compatible-mode/" in lowered:
+        return "tooling"
+    if host.startswith("api.") and "/docs" not in lowered and "/documentation" not in lowered:
+        return "tooling"
     if host in _TOOLING_DOMAINS or host.startswith("api.") and ("openai.com" in host or "deepseek.com" in host):
         return "tooling"
     if any(lowered.endswith(ext) for ext in _ASSET_SUFFIXES):

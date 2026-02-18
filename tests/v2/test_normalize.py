@@ -54,6 +54,7 @@ def test_extract_citations_excludes_tooling_links_and_canonicalizes_noise() -> N
         body=(
             "API endpoint https://api.openai.com/v1/chat/completions should not be citation.\n"
             "Install notes https://bun.sh/docs/runtime should be tooling.\n"
+            "Local test http://myapp.localhost:1355 should be dropped.\n"
             "Primary source [release](https://github.com/acme/agent/releases/tag/v1.2.0?utm_source=x).\n"
         ),
         metadata={},
@@ -62,6 +63,7 @@ def test_extract_citations_excludes_tooling_links_and_canonicalizes_noise() -> N
     urls = {item.url for item in citations}
     assert "https://api.openai.com/v1/chat/completions" not in urls
     assert "https://bun.sh/docs/runtime" not in urls
+    assert "https://myapp.localhost:1355" not in urls
     assert "https://github.com/acme/agent/releases/tag/v1.2.0" in urls
     assert "https://github.com/acme/agent" in urls
 

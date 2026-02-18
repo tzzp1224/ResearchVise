@@ -1,6 +1,37 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: P0 Onepager Gate + Evidence Scope + Link Hygiene (New)
+- 本次目标：
+  - 修复 live 场景下 Top picks 数量门禁“假通过”问题。
+  - 修复 onepager Evidence 噪声灌入与低质量链接（localhost/apikey/api endpoint）污染。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - live 门禁改为 `top_picks_count >= requested_top_k`（从 `run_context.ranking_stats` 读取）。
+    - 新增 onepager 一致性检查：header 的 `RequestedTopK/TopPicksCount` 必须与 run_context 和实际 heading 数一致。
+    - 新增 `candidate_shortage:*` 明确错误，避免“全绿但产品不可交付”。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager header 新增 `RequestedTopK`，并保持与 ranking_stats 对齐。
+    - Evidence 继续按 Top picks 聚合并去重，不再使用候选池全集刷屏。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py`：
+    - `classify_link` 增强：过滤 `*.localhost`/`127.0.0.1`/`0.0.0.0`、`aistudio.../apikey`、典型 API endpoint。
+    - `is_allowed_citation_url` 只允许 evidence 链接进入 script/onepager/prompt 引用。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - citations 全链路使用 canonical URL + evidence-only 过滤。
+  - 测试更新：
+    - `tests/v2/test_sanitize.py`、`tests/v2/test_normalize.py`、`tests/v2/test_validate_artifacts_v2.py` 增加 localhost/tooling/shortage 回归。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/{sanitize.py,normalize.py,report_export.py}`, `scripts/validate_artifacts_v2.py`, `tests/v2/{test_sanitize.py,test_normalize.py,test_validate_artifacts_v2.py}`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知风险与回滚：
+  - 风险：live 数据稀疏时会显式失败（candidate_shortage），不再“看起来通过”。
+  - 风险：更严格链接过滤会减少可用 citations 数量。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Canonical URLs + Evidence Dedup + Adaptive Relevance + Better Facts (New)
 - 本次目标：
   - 解决 live 产物中 URL 尾部噪声、tooling 链接误入 citations、Evidence 重复刷屏，以及 Top picks 在高阈值下过少的问题。

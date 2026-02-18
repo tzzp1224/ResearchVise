@@ -47,3 +47,5 @@ def test_canonicalize_url_removes_json_tail_and_normalizes_scheme() -> None:
 def test_classify_link_distinguishes_tooling_and_evidence() -> None:
     assert classify_link("https://bun.sh/docs/runtime") == "tooling"
     assert classify_link("https://github.com/org/repo/releases/tag/v1.0.0") == "evidence"
+    assert classify_link("http://myapp.localhost:3000/docs") == "blocked"
+    assert classify_link("https://aistudio.google.com/apikey") == "tooling"

@@ -317,16 +317,34 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         top_pick_headings = re.findall(r"^###\s+\d+\.\s+", onepager, flags=re.MULTILINE)
         domain_rows = re.findall(r"^-\s*Source Domain:\s*`[^`]+`", onepager, flags=re.MULTILINE)
         relevance_rows = [float(value) for value in re.findall(r"Topic Relevance:\s*`([0-9.]+)`", onepager)]
+        header_top_match = re.search(r"^- TopPicksCount:\s*`?(\d+)`?\s*$", onepager, flags=re.MULTILINE)
+        header_requested_match = re.search(r"^- RequestedTopK:\s*`?(\d+)`?\s*$", onepager, flags=re.MULTILINE)
+        header_top_count = int(header_top_match.group(1)) if header_top_match else len(top_pick_headings)
+        header_requested_top_k = int(header_requested_match.group(1)) if header_requested_match else 0
+        ranking_stats = dict(run_context.get("ranking_stats") or {})
+        expected_top_count = int(ranking_stats.get("top_picks_count", header_top_count) or header_top_count)
+        requested_top_k = int(ranking_stats.get("requested_top_k", header_requested_top_k) or header_requested_top_k)
         block_hits = _contains_blocklist(onepager)
         bad_urls = [url for url in urls if not is_allowed_citation_url(url)]
         report["checks"]["onepager_url_count_ge_3"] = len(urls) >= 3
-        report["checks"]["onepager_top_picks_ge_3"] = len(top_pick_headings) >= 3 if data_mode != "live" else len(top_pick_headings) >= 1
+        report["checks"]["onepager_top_picks_ge_3"] = (
+            len(top_pick_headings) >= max(1, requested_top_k if data_mode == "live" else 3)
+        )
         report["checks"]["onepager_domain_rows_ge_3"] = len(domain_rows) >= 3 if data_mode != "live" else len(domain_rows) >= 1
+        report["checks"]["onepager_top_count_consistent"] = bool(
+            header_top_count == len(top_pick_headings) == expected_top_count
+        )
+        report["checks"]["onepager_requested_top_k_consistent"] = bool(
+            requested_top_k <= 0 or header_requested_top_k == requested_top_k
+        )
         report["checks"]["onepager_blocklist_ok"] = len(block_hits) == 0
         report["checks"]["onepager_no_html_tokens"] = not contains_html_like_tokens(onepager)
         report["checks"]["onepager_citation_denylist_ok"] = len(bad_urls) == 0
         report["details"]["onepager_url_count"] = len(urls)
         report["details"]["onepager_top_pick_count"] = len(top_pick_headings)
+        report["details"]["onepager_header_top_count"] = header_top_count
+        report["details"]["onepager_header_requested_top_k"] = header_requested_top_k
+        report["details"]["requested_top_k"] = requested_top_k
         report["details"]["onepager_relevance_scores"] = relevance_rows
         if block_hits:
             report["errors"].append("onepager_blocklist:" + ",".join(block_hits))
@@ -343,6 +361,18 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["details"]["onepager_evidence_issues"] = evidence_issues
         if evidence_issues:
             report["errors"].append("evidence_dedup:" + ",".join(evidence_issues[:6]))
+        if data_mode == "live" and requested_top_k > 0 and len(top_pick_headings) < requested_top_k:
+            report["errors"].append(
+                f"candidate_shortage:requested_top_k={requested_top_k},actual_top_picks={len(top_pick_headings)}"
+            )
+        if not report["checks"]["onepager_top_count_consistent"]:
+            report["errors"].append(
+                f"onepager_top_count_mismatch:header={header_top_count},headings={len(top_pick_headings)},context={expected_top_count}"
+            )
+        if not report["checks"]["onepager_requested_top_k_consistent"]:
+            report["errors"].append(
+                f"onepager_requested_top_k_mismatch:header={header_requested_top_k},context={requested_top_k}"
+            )
 
     if facts_path.exists():
         facts_payload = _load_json(facts_path)

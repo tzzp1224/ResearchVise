@@ -297,6 +297,7 @@ def generate_onepager(
         f"- ExtractionStats: `{extraction_stats_line}`",
         f"- GeneratedAt(UTC): `{generated_at}`",
         f"- CandidateCount: `{candidate_count}`",
+        f"- RequestedTopK: `{requested_top_k}`",
         f"- TopPicksCount: `{top_picks_count}`",
         f"- FilteredByRelevance: `{filtered_by_relevance}`",
         f"- TopicRelevanceThresholdUsed: `{threshold_used:.2f}`",
