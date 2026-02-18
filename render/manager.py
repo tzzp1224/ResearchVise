@@ -97,6 +97,7 @@ class RenderJob:
     preview_completed: bool = False
     confirmed: bool = False
     preview_output_path: Optional[str] = None
+    seedance_success_count: int = 0
 
 
 class RenderManager:
@@ -131,6 +132,7 @@ class RenderManager:
             progress=0.0,
             timestamps=StatusTimestamps(),
             max_retries=max(0, max_retries),
+            seedance_used=False,
         )
 
         job = RenderJob(
@@ -243,6 +245,8 @@ class RenderManager:
 
         job.shot_outputs.clear()
         job.failed.clear()
+        job.seedance_success_count = 0
+        job.status.seedance_used = False
         self._set_running(job, phase="final")
         self._render_all_shots(job, mode="final")
 
@@ -264,6 +268,8 @@ class RenderManager:
             job.status.output_path = stitched
 
         self._update_output_validation(job)
+        if self._seedance_enabled() and job.seedance_success_count <= 0:
+            job.status.seedance_used = False
         self._set_completed(job)
         return RenderStatus(**job.status.model_dump())
 
@@ -735,7 +741,13 @@ class RenderManager:
             render_job_id=job.render_job_id,
         )
         job.total_cost += max(0.0, float(result.cost or 0.0))
+        if self._seedance_enabled() and result.success and result.output_path:
+            job.seedance_success_count += 1
+            job.status.seedance_used = True
         return result
+
+    def _seedance_enabled(self) -> bool:
+        return isinstance(self._adapter, SeedanceAdapter) and bool(getattr(self._adapter, "enabled", False))
 
     @staticmethod
     def _prompt_by_idx(prompt_specs: Sequence[PromptSpec], shot_idx: int) -> Optional[PromptSpec]:

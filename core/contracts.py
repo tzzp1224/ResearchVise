@@ -197,3 +197,4 @@ class RenderStatus(BaseModel):
     output_path: Optional[str] = None
     valid_mp4: Optional[bool] = None
     probe_error: Optional[str] = None
+    seedance_used: Optional[bool] = None

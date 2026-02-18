@@ -1,6 +1,30 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Seedance Optional Real HTTP Adapter (Commit 5)
+- 本次目标：
+  - 将 Seedance 从“仅注入回调”升级为“可选真实 HTTP 接入（默认关闭）”。
+  - 覆盖成功/鉴权失败/超时路径，并确保失败自动回退 fallback render。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/adapters/seedance.py`：
+    - 新增 env 配置读取：`SEEDANCE_ENABLED/SEEDANCE_BASE_URL/SEEDANCE_API_KEY/SEEDANCE_REGION/SEEDANCE_TIMEOUT_S`。
+    - 内置最小 HTTP client（`httpx`），支持 base64 输出落盘和 URL 下载落盘。
+    - 规范错误分类：鉴权失败、配额超限、超时、请求失败。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/core/contracts.py` 与 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/manager.py`：
+    - `RenderStatus` 增加 `seedance_used` 字段。
+    - 渲染流程记录 Seedance 是否真正产出镜头。
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_seedance_adapter.py`：
+    - 覆盖 disabled/mock-success/http-success/auth-failure/timeout。
+- 新增/删除文件：
+  - 新增：`tests/v2/test_seedance_adapter.py`
+  - 修改：`render/adapters/seedance.py`, `render/manager.py`, `core/contracts.py`
+- 如何验证：
+  - `pytest -q tests/v2/test_seedance_adapter.py tests/v2/test_render_manager.py tests/v2/test_contracts.py tests/v2/test_runtime_integration.py`
+  - `SEEDANCE_ENABLED=0 python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_c5 > /tmp/ara_v2_smoke_c5/result.json`
+- 已知风险与回滚：
+  - 风险：真实 API 的请求/响应字段在不同版本可能变化，必要时需适配具体 provider schema。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Minimum-Usable Audio & Subtitles (Commit 4)
 - 本次目标：
   - 将 `audio/subtitles` 从占位实现升级为最低可用的可交付链路。
@@ -160,7 +184,7 @@ CLI/API
 | G Storyboard Generator | ✅ | `pipeline_v2/storyboard_generator.py` `script_to_storyboard/validate_storyboard/auto_fix_storyboard` | 约束 5-8 镜头 |
 | H Prompt Compiler | ✅ | `pipeline_v2/prompt_compiler.py` `compile_shot_prompt/compile_storyboard/consistency_pack` | 输出 PromptSpec |
 | I Render Manager | 🟡 | `render/manager.py` `enqueue_render/process_next/retry_failed_shots/fallback_render/stitch_shots` | 任务编排完整；Seedance 真实调用见第 4 节 |
-| J Audio/Subtitles | 🟡 | `render/audio_subtitles.py` `tts_generate/align_subtitles/mix_bgm` | 当前为本地占位 WAV/SRT/BGM copy |
+| J Audio/Subtitles | ✅ | `render/audio_subtitles.py` `tts_generate/align_subtitles/mix_bgm` | 本地可听音轨 + 单调 SRT + 可选 BGM 混音 |
 | K Report & Export | ✅ | `pipeline_v2/report_export.py` `generate_onepager/generate_thumbnail/export_package` | 可产出 onepager/svg/zip |
 | L Notification | 🟡 | `pipeline_v2/notification.py` `notify_user/post_to_web/send_email` | 当前为本地 JSONL 记录，不是真实外发 |
 
@@ -178,22 +202,30 @@ CLI/API
 
 ## 4) Seedance 接入现状（结论）
 
-结论：`🟡 接了 adapter 边界，但默认 mock/不可用；未直接内置真实 Seedance HTTP/SDK 调用配置`
+结论：`🟡 已内置可选真实 HTTP 接入；默认关闭（SEEDANCE_ENABLED=0）`
 
 代码证据：
 - Adapter 边界：`render/adapters/base.py` `BaseRendererAdapter`
 - Seedance 适配器：`render/adapters/seedance.py` `SeedanceAdapter`
-  - 当前只调用注入的 `client` 回调
-  - 未内置固定 endpoint/SDK/client
-  - 未从 `config`/env 自动读取 key/region/base_url
+  - 支持 env 自动读取：`SEEDANCE_ENABLED/SEEDANCE_BASE_URL/SEEDANCE_API_KEY/SEEDANCE_REGION/SEEDANCE_TIMEOUT_S`
+  - 内置 `httpx` 最小 client，请求 `POST /v1/renders/shots`
+  - 支持响应 base64 输出或 output_url 下载并落盘
+  - 可继续注入 `client` 回调覆盖默认行为（测试/私有网关）
 
 ### 如何开启真实调用（当前版本）
-你需要在应用启动时注入一个真实 client 回调给 `SeedanceAdapter(client=...)`，并在回调里用你自己的 HTTP/SDK 调用。
+默认关闭：`SEEDANCE_ENABLED=0`（走 fallback motion render）
 
-建议环境变量（示例）：
+开启真实调用：
+- `SEEDANCE_ENABLED=1`
 - `SEEDANCE_BASE_URL=https://api.seedance.example`
 - `SEEDANCE_API_KEY=...`
 - `SEEDANCE_REGION=us`
+- `SEEDANCE_TIMEOUT_S=45`
+
+运行后可在 `render_status` 查看：
+- `seedance_used=true/false`
+- `valid_mp4=true/false`
+- `probe_error`
 
 风险提示：
 - 成本风险：镜头级调用会快速累积费用，务必设置 `max_total_cost` 和 `max_retries`。
@@ -303,13 +335,12 @@ PY
 ## 9) 已知限制与下一步
 
 已知限制：
-- 当前测试中的 renderer 多为 mock，镜头文件可能是占位文本；最终 MP4 由 stitch/fallback 合成为可播文件。
+- 当前测试中的 renderer 仍以 mock 为主；线上接入时需验证真实 Seedance 返回 schema 与下载链路。
 - Notification 仍是本地日志，不是实际 Webhook/SMTP 投递。
-- Seedance 真实 HTTP/SDK 未内置，需注入 client。
 - 队列与状态存储目前是内存实现，进程重启后丢失。
 
 下一步建议：
 1. 接入持久化队列（Redis/RQ/Celery）与 DB 状态表。
-2. 落地真实 Seedance client（含鉴权、超时、重试、限流）。
-3. 用真实音频与视频后期链替换占位实现（TTS/BGM/字幕对齐）。
+2. 增加 Seedance API 契约回归测试（响应字段变更报警 + 下载链路探针）。
+3. 提升音频链路到自然语音 TTS（当前为本地规则合成音轨）。
 4. 增加抓取质量指标（正文长度、引用密度、来源新鲜度）并纳入排序权重。
