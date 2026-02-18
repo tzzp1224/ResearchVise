@@ -1,6 +1,39 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Relevance Hard Gate + URL Validity + Local Asset References (New)
+- 本次目标：
+  - 强制 topic relevance 硬门禁，不再把低相关候选补齐进 Top picks。
+  - 修复 URL 尾引号/畸形格式问题并加入产物级合法性校验。
+  - 让分镜 overlay 不再硬截断，并把 `materials` 中截图计划落地到本地 `assets/`。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - live 模式只允许 `relevance_score >= threshold` 的候选进入 Top picks；不足 `top-k` 时允许少于 `top-k`。
+    - `ranking_stats` 新增 `candidate_count/top_picks_count/filtered_by_relevance/drop_reason_samples`。
+    - 新增 assets 物化流程：将 screenshot plan URL 转为 `run_dir/assets/*` 本地文件，并回填到 storyboard `reference_assets`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py` 与 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - 新增 `normalize_url/is_valid_http_url`，统一用于 citations/links/reference_assets。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - facts 去噪，移除 `Stars/Forks/LastPush` 拼接句与 markdown 残片，proof 优先绑定有效 citation。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/storyboard_generator.py` 与 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/manager.py`：
+    - 新增 `overlay_compact` 安全压缩（<=42 chars）与图片卡片优先渲染路径（有本地 asset 时优先图文卡）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增 `urls_valid`、`storyboard_overlay_safe`；live/smoke 分别执行不同 Top picks 最小数量门禁。
+  - 修改测试：
+    - `tests/v2/test_sanitize.py`, `tests/v2/test_script_storyboard_prompt.py`, `tests/v2/test_runtime_integration.py`, `tests/v2/test_validate_artifacts_v2.py`, `tests/v2/test_v2_webapp_api.py`。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/{runtime.py,sanitize.py,normalize.py,script_generator.py,storyboard_generator.py,report_export.py,__init__.py}`, `render/manager.py`, `scripts/validate_artifacts_v2.py`, `tests/v2/{test_sanitize.py,test_script_storyboard_prompt.py,test_runtime_integration.py,test_validate_artifacts_v2.py,test_v2_webapp_api.py}`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_check > /tmp/ara_v2_smoke_check/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_smoke_check/runs/<run_id> --render-dir /tmp/ara_v2_smoke_check/render_jobs/<render_job_id>`
+  - live 网络可用时：`python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3`
+- 已知风险与回滚：
+  - 风险：live 网络不可达时会因“无可用抓取内容”直接失败（设计上不回退 smoke）。
+  - 风险：relevance 硬门禁可能导致 live 场景 Top picks 少于 `top-k`（换取主题一致性）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: URL Parse Guard for Validator Crash (Hotfix)
 - 本次目标：
   - 修复 `run-once` 内置 validator 因畸形 URL 崩溃的问题（`Invalid IPv6 URL`）。

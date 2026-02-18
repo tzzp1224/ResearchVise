@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pipeline_v2.sanitize import is_allowed_citation_url, sanitize_markdown
+from pipeline_v2.sanitize import is_allowed_citation_url, is_valid_http_url, normalize_url, sanitize_markdown
 
 
 def test_sanitize_markdown_removes_html_badges_and_promotions() -> None:
@@ -30,3 +30,10 @@ def test_is_allowed_citation_url_applies_denylist() -> None:
     assert is_allowed_citation_url("https://buymeacoffee.com/foo") is False
     assert is_allowed_citation_url("https://example.com/chart.svg") is False
     assert is_allowed_citation_url("https://[invalid") is False
+
+
+def test_normalize_url_strips_trailing_quotes_and_validates() -> None:
+    raw = 'https://example.com/path?x=1"'
+    normalized = normalize_url(raw)
+    assert normalized == "https://example.com/path?x=1"
+    assert is_valid_http_url(normalized) is True

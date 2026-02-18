@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import zipfile
 
 from core import Artifact, ArtifactType, Citation, NormalizedItem, RankedItem
-from pipeline_v2.sanitize import is_allowed_citation_url
+from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
 
 
 _MAX_BULLETS_PER_PICK = 6
@@ -40,16 +40,32 @@ def _extract_citations(items: Sequence[object], citations: Sequence[Citation] | 
     for item in items:
         normalized = _extract_item(item)
         for citation in normalized.citations:
-            key = str(citation.url or "").strip() or f"{citation.title}|{citation.snippet}"
+            url = normalize_url(str(citation.url or "").strip())
+            key = url or f"{citation.title}|{citation.snippet}"
             if not key or key in seen:
                 continue
             seen.add(key)
+            if url:
+                citation = Citation(
+                    title=citation.title,
+                    url=url,
+                    snippet=citation.snippet,
+                    source=citation.source,
+                )
             merged.append(citation)
     for citation in list(citations or []):
-        key = str(citation.url or "").strip() or f"{citation.title}|{citation.snippet}"
+        url = normalize_url(str(citation.url or "").strip())
+        key = url or f"{citation.title}|{citation.snippet}"
         if not key or key in seen:
             continue
         seen.add(key)
+        if url:
+            citation = Citation(
+                title=citation.title,
+                url=url,
+                snippet=citation.snippet,
+                source=citation.source,
+            )
         merged.append(citation)
     return merged
 
@@ -151,7 +167,7 @@ def _citation_bullets(item: NormalizedItem) -> List[str]:
     lines: List[str] = []
     for citation in list(item.citations or [])[:2]:
         snippet = _compact_text(citation.snippet or citation.title or "", max_len=160)
-        url = str(citation.url or "").strip()
+        url = normalize_url(str(citation.url or "").strip())
         if url and not is_allowed_citation_url(url):
             continue
         if not snippet and not url:
@@ -208,6 +224,10 @@ def generate_onepager(
     data_mode = str(context.get("data_mode") or "live").strip().lower() or "live"
     connector_stats = dict(context.get("connector_stats") or {})
     extraction_stats = dict(context.get("extraction_stats") or {})
+    ranking_stats = dict(context.get("ranking_stats") or {})
+    candidate_count = int(ranking_stats.get("candidate_count", len(normalized_items)) or len(normalized_items))
+    filtered_by_relevance = int(ranking_stats.get("filtered_by_relevance", 0) or 0)
+    top_picks_count = len(normalized_items)
     connector_stats_line = json.dumps(connector_stats, ensure_ascii=False, sort_keys=True)
     extraction_stats_line = json.dumps(extraction_stats, ensure_ascii=False, sort_keys=True)
 
@@ -218,7 +238,9 @@ def generate_onepager(
         f"- ConnectorStats: `{connector_stats_line}`",
         f"- ExtractionStats: `{extraction_stats_line}`",
         f"- GeneratedAt(UTC): `{generated_at}`",
-        f"- CandidateCount: `{len(normalized_items)}`",
+        f"- CandidateCount: `{candidate_count}`",
+        f"- TopPicksCount: `{top_picks_count}`",
+        f"- FilteredByRelevance: `{filtered_by_relevance}`",
         f"- CitationCount: `{len(citation_list)}`",
         "",
         "## Top Picks",

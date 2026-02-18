@@ -38,13 +38,43 @@ _DENYLIST_DOMAINS = {
 _IMAGE_SUFFIXES = (".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico")
 
 
-def _normalize_url(url: str) -> str:
-    return str(url or "").strip().rstrip(".,;:")
+def normalize_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    value = value.strip("\"'`")
+    value = re.sub(r"[\s]+", "", value)
+    value = value.rstrip(".,;:")
+    while value and value[-1] in {"\"", "'", "`"}:
+        value = value[:-1].rstrip(".,;:")
+    if value.endswith(")") and "(" not in value:
+        value = value[:-1].rstrip(".,;:")
+    return value
+
+
+def is_valid_http_url(url: str) -> bool:
+    normalized = normalize_url(url)
+    if not normalized.startswith(("http://", "https://")):
+        return False
+    if " " in normalized:
+        return False
+    if len(normalized) > 2048:
+        return False
+    try:
+        parsed = urlparse(normalized)
+    except ValueError:
+        return False
+    if str(parsed.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = str(parsed.netloc or "").strip()
+    if not host or "." not in host and host not in {"localhost", "127.0.0.1"}:
+        return False
+    return True
 
 
 def _hostname(url: str) -> str:
     try:
-        parsed = urlparse(_normalize_url(url))
+        parsed = urlparse(normalize_url(url))
     except ValueError:
         return ""
     host = str(parsed.netloc or "").strip().lower()
@@ -54,8 +84,8 @@ def _hostname(url: str) -> str:
 
 
 def is_allowed_citation_url(url: str) -> bool:
-    normalized = _normalize_url(url)
-    if not normalized.startswith("http"):
+    normalized = normalize_url(url)
+    if not is_valid_http_url(normalized):
         return False
 
     host = _hostname(normalized)

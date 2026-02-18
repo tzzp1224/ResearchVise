@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Tuple
 
 from core import Shot, Storyboard
@@ -21,6 +22,59 @@ def _shot_scene(line_text: str) -> str:
     if "architecture" in lowered or "pipeline" in lowered:
         return "system diagram wall"
     return "technical studio"
+
+
+def overlay_compact(text: str, *, max_chars: int = 42, max_lines: int = 2) -> str:
+    """Compact overlay into readable short text for 9:16 cards."""
+    value = re.sub(r"<[^>]+>", " ", str(text or ""))
+    value = re.sub(r"\s+", " ", value).strip(" -:;,")
+    if not value:
+        return ""
+    if len(value) <= max_chars:
+        return value
+
+    parts = [piece.strip() for piece in re.split(r"[。.!?;；，,]", value) if piece.strip()]
+    if parts:
+        lead = parts[0]
+        if len(lead) <= max_chars:
+            return lead
+        value = lead
+
+    words = value.split()
+    if not words:
+        return value[: max_chars - 1].rstrip() + "…"
+
+    line_limit = max(10, int(max_chars / max_lines))
+    lines: List[str] = []
+    current: List[str] = []
+    for word in words:
+        candidate = " ".join(current + [word]).strip()
+        if current and len(candidate) > line_limit:
+            lines.append(" ".join(current))
+            current = [word]
+            if len(lines) >= max_lines:
+                break
+        else:
+            current.append(word)
+    if len(lines) < max_lines and current:
+        lines.append(" ".join(current))
+
+    compact = " / ".join(lines[:max_lines]).strip()
+    truncated = len(value) > len(compact)
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 1].rstrip()
+        truncated = True
+
+    if truncated:
+        compact = compact.rstrip(" .,:;/-")
+        if len(compact) >= max_chars:
+            compact = compact[: max_chars - 1].rstrip()
+        if compact and not compact.endswith("…"):
+            compact = f"{compact}…"
+
+    if len(compact) > max_chars:
+        compact = compact[:max_chars].rstrip()
+    return compact
 
 
 def script_to_storyboard(script: Dict[str, object], constraints: Dict[str, object]) -> Storyboard:
@@ -54,7 +108,7 @@ def script_to_storyboard(script: Dict[str, object], constraints: Dict[str, objec
                 scene=_shot_scene(text),
                 subject_id=f"subject_{idx}",
                 action=text or "Explain technical insight",
-                overlay_text=text[:72] if text else None,
+                overlay_text=overlay_compact(text) if text else None,
                 reference_assets=references,
             )
         )

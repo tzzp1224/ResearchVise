@@ -8,10 +8,17 @@ from typing import Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from core import NormalizedItem
-from pipeline_v2.sanitize import is_allowed_citation_url
+from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
 
 _FORBIDDEN_TOKENS = re.compile(r"\b(placeholder|dummy|lorem|todo|testsrc|colorbars)\b", re.IGNORECASE)
 _HTML_TAGS = re.compile(r"<[^>]+>")
+_MARKDOWN_NOISE = re.compile(r"^\s*[*#>\-|`]+\s*$")
+_FACT_NOISE_PATTERNS = (
+    re.compile(r"\bstars?\s*:\s*\d+", re.IGNORECASE),
+    re.compile(r"\bforks?\s*:\s*\d+", re.IGNORECASE),
+    re.compile(r"\blast(push|_push|_modified)?\s*:\s*", re.IGNORECASE),
+    re.compile(r"\b(?:readme|license|contributing)\b", re.IGNORECASE),
+)
 
 
 def _compact_text(value: str, max_len: int) -> str:
@@ -26,6 +33,8 @@ def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = _HTML_TAGS.sub(" ", value)
     value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", value)
     value = re.sub(r"https?://[^\s)\]>]+", "", value)
+    value = re.sub(r"[*_`]{1,3}", " ", value)
+    value = re.sub(r"\s*[-]{2,}\s*", " ", value)
     value = re.sub(r"\s+", " ", value).strip(" -:;,.")
     value = _FORBIDDEN_TOKENS.sub("", value)
     value = re.sub(r"\s{2,}", " ", value).strip()
@@ -43,12 +52,26 @@ def _split_sentences(text: str) -> List[str]:
         sentence = _clean_sentence(chunk, max_len=260)
         if len(sentence) < 20:
             continue
+        if _MARKDOWN_NOISE.match(sentence):
+            continue
         token = sentence.lower()
         if token in seen:
             continue
         seen.add(token)
         sentences.append(sentence)
     return sentences
+
+
+def _is_fact_noise(sentence: str) -> bool:
+    text = str(sentence or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in {"---", "*", "-"}:
+        return True
+    if any(pattern.search(text) for pattern in _FACT_NOISE_PATTERNS):
+        return True
+    return False
 
 
 def _domain(url: str) -> str:
@@ -83,10 +106,10 @@ def _body_text(item: NormalizedItem) -> str:
 def _links(item: NormalizedItem) -> List[str]:
     urls: List[str] = []
     for citation in list(item.citations or []):
-        url = str(citation.url or "").strip()
+        url = normalize_url(str(citation.url or "").strip())
         if is_allowed_citation_url(url) and url not in urls:
             urls.append(url)
-    item_url = str(item.url or "").strip()
+    item_url = normalize_url(str(item.url or "").strip())
     if is_allowed_citation_url(item_url) and item_url not in urls:
         urls.append(item_url)
     return urls[:4]
@@ -109,14 +132,26 @@ def _engagement_line(item: NormalizedItem) -> str:
 
 def _why_now(item: NormalizedItem) -> str:
     metadata = dict(item.metadata or {})
-    recency = metadata.get("published_recency")
+    quality_signals = dict(metadata.get("quality_signals") or {})
+    recency = quality_signals.get("update_recency_days") or metadata.get("published_recency")
     if recency not in (None, "", "unknown"):
         try:
             days = float(recency)
             return f"The update is recent (about {days:.1f} days old), so teams can apply these changes immediately."
         except Exception:
             pass
-    return _engagement_line(item)
+    points = int(float(metadata.get("points", 0) or 0))
+    comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
+    if points > 0 or comments > 0:
+        return f"Discussion is active with roughly {points} points and {comments} comments, which makes this actionable now."
+    return "signals insufficient for a strong timing claim; track another 24h for confirmation."
+
+
+def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
+    value = _clean_sentence(text, max_len=max_len)
+    value = re.sub(r"^(?:[-*•]+\s*)", "", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[str, object]:
@@ -127,33 +162,53 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
 
     what_it_is = ""
     for sentence in sentences:
-        if len(sentence) >= 32:
+        if len(sentence) >= 28 and not _is_fact_noise(sentence):
             what_it_is = sentence
             break
     if not what_it_is:
         what_it_is = f"{item.title} is a practical update that targets production engineering workflows."
+    what_it_is = _clean_fact_point(what_it_is, max_len=140)
 
     how_it_works: List[str] = []
     for sentence in sentences:
         if sentence.lower() == what_it_is.lower():
             continue
-        how_it_works.append(sentence)
+        if _is_fact_noise(sentence):
+            continue
+        point = _clean_fact_point(sentence, max_len=80)
+        if not point:
+            continue
+        how_it_works.append(point)
         if len(how_it_works) >= 3:
             break
 
     while len(how_it_works) < 3:
         fallback = _engagement_line(item) if len(how_it_works) == 0 else f"{item.title} provides concrete implementation signals for engineering teams this week."
-        how_it_works.append(_clean_sentence(fallback, max_len=180))
-
-    proof: List[str] = [_engagement_line(item)]
-    for citation in list(item.citations or [])[:3]:
-        snippet = _clean_sentence(citation.snippet or citation.title, max_len=180)
-        if snippet and snippet not in proof:
-            proof.append(snippet)
-        if len(proof) >= 3:
-            break
+        how_it_works.append(_clean_fact_point(fallback, max_len=80))
 
     links = _links(item)
+    proof: List[str] = []
+    proof_links: List[str] = []
+    for citation in list(item.citations or []):
+        citation_url = normalize_url(str(citation.url or "").strip())
+        if not is_allowed_citation_url(citation_url):
+            continue
+        snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
+        if snippet and snippet not in proof:
+            proof.append(snippet)
+            proof_links.append(citation_url)
+        if len(proof) >= 2:
+            break
+
+    if len(proof) < 2:
+        fallback = _clean_fact_point(_engagement_line(item), max_len=120)
+        if fallback:
+            proof.append(fallback)
+            proof_links.append(links[0] if links else "")
+    while len(proof) < 2:
+        proof.append("signals insufficient; verify from primary source before publishing.")
+        proof_links.append(links[0] if links else "")
+
     hook = (
         f"If you're tracking {topic_text}, this is one update worth watching today."
         if topic_text
@@ -164,10 +219,11 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
     return {
         "topic": topic_text or None,
         "hook": _clean_sentence(hook, max_len=170),
-        "what_it_is": _clean_sentence(what_it_is, max_len=190),
+        "what_it_is": _clean_sentence(what_it_is, max_len=140),
         "why_now": _clean_sentence(_why_now(item), max_len=190),
-        "how_it_works": [_clean_sentence(point, max_len=180) for point in how_it_works[:3]],
-        "proof": [_clean_sentence(point, max_len=180) for point in proof[:3]],
+        "how_it_works": [_clean_fact_point(point, max_len=80) for point in how_it_works[:3]],
+        "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],
+        "proof_links": [normalize_url(link) for link in proof_links[:2]],
         "links": links,
         "cta": _clean_sentence(cta, max_len=170),
     }
@@ -248,14 +304,16 @@ def generate_script(
         lines[-1]["duration_sec"] = round(float(target) - float(lines[-1]["start_sec"]), 2)
 
     evidence: List[Dict[str, str]] = []
+    proof_links = [normalize_url(str(url or "").strip()) for url in list(facts_payload.get("proof_links") or [])]
     for idx, proof in enumerate(list(facts_payload.get("proof") or [])[:3], start=1):
         text = _clean_sentence(str(proof), max_len=180)
         if not text:
             continue
+        linked = proof_links[min(idx - 1, len(proof_links) - 1)] if proof_links else ""
         evidence.append(
             {
                 "title": f"fact_{idx}",
-                "url": links[min(idx - 1, len(links) - 1)] if links else "",
+                "url": linked if is_allowed_citation_url(linked) else (links[min(idx - 1, len(links) - 1)] if links else ""),
                 "snippet": text,
             }
         )

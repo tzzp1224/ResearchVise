@@ -192,13 +192,19 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
 
     materials_payload = json.loads((run_dir / "materials.json").read_text(encoding="utf-8"))
     assert materials_payload["screenshot_plan"]
+    assert materials_payload["local_assets"]
+    assert all(Path(path).exists() for path in materials_payload["local_assets"])
     assert materials_payload["icon_keyword_suggestions"]
     assert materials_payload["broll_categories"]
     assert "quality_metrics" in materials_payload
     assert materials_payload["data_mode"] == "live"
+    board_payload = json.loads((run_dir / "storyboard.json").read_text(encoding="utf-8"))
+    assert any(str((shot or {}).get("reference_assets", [""])[0]).startswith(str(run_dir / "assets")) for shot in board_payload["shots"])
 
     onepager_text = (run_dir / "onepager.md").read_text(encoding="utf-8")
     assert "DataMode: `live`" in onepager_text
+    assert "CandidateCount: `" in onepager_text
+    assert "FilteredByRelevance: `" in onepager_text
 
     render_status = runtime.process_next_render()
     assert render_status is not None

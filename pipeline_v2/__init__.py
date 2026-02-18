@@ -14,7 +14,7 @@ from .scoring import (
     score_visual_assets,
 )
 from .script_generator import build_facts, generate_script, generate_variants
-from .storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
+from .storyboard_generator import auto_fix_storyboard, overlay_compact, script_to_storyboard, validate_storyboard
 from .notification import notify_user, post_to_web, send_email
 
 __all__ = [
@@ -46,6 +46,7 @@ __all__ = [
     "score_relevance",
     "score_talkability",
     "score_visual_assets",
+    "overlay_compact",
     "script_to_storyboard",
     "validate_storyboard",
 ]

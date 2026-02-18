@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from core import Citation, NormalizedItem, RawItem
-from pipeline_v2.sanitize import is_allowed_citation_url, sanitize_markdown
+from pipeline_v2.sanitize import is_allowed_citation_url, is_valid_http_url, normalize_url, sanitize_markdown
 
 
 _TIER_A_SOURCES = {
@@ -55,11 +55,12 @@ def _compact_text(value: Any, max_len: int = 300) -> str:
 def _count_links(body: str, url: str) -> int:
     links = set()
     for link in re.findall(r"https?://[^\s)\]>]+", str(body or "")):
-        token = str(link).strip().rstrip(".,;:")
-        if token:
+        token = normalize_url(link)
+        if token and is_valid_http_url(token):
             links.add(token)
-    if str(url or "").strip():
-        links.add(str(url).strip())
+    normalized_url = normalize_url(str(url or "").strip())
+    if normalized_url and is_valid_http_url(normalized_url):
+        links.add(normalized_url)
     return len(links)
 
 
@@ -109,8 +110,8 @@ def _count_non_badge_images(raw_text: str) -> int:
 
 
 def _is_high_quality_link(url: str) -> bool:
-    value = str(url or "").strip().lower()
-    if not value.startswith("http"):
+    value = normalize_url(str(url or "")).lower()
+    if not is_valid_http_url(value):
         return False
     host = str(urlparse(value).netloc or "").strip().lower()
     path = str(urlparse(value).path or "").strip().lower()
@@ -158,7 +159,7 @@ def extract_citations(item: Any) -> List[Citation]:
 
     for entry in list(metadata.get("citations") or []):
         if isinstance(entry, dict):
-            url = str(entry.get("url") or "").strip()
+            url = normalize_url(str(entry.get("url") or "").strip())
             if url and not is_allowed_citation_url(url):
                 continue
             citations.append(
@@ -170,7 +171,7 @@ def extract_citations(item: Any) -> List[Citation]:
                 )
             )
         elif isinstance(entry, str) and entry.strip().startswith("http"):
-            url = entry.strip()
+            url = normalize_url(entry.strip())
             if not is_allowed_citation_url(url):
                 continue
             citations.append(
@@ -184,12 +185,13 @@ def extract_citations(item: Any) -> List[Citation]:
 
     md_links = re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", body)
     for title, link in md_links:
-        if not is_allowed_citation_url(str(link).strip()):
+        normalized_link = normalize_url(str(link).strip())
+        if not is_allowed_citation_url(normalized_link):
             continue
         citations.append(
             Citation(
                 title=_compact_text(title, max_len=140),
-                url=str(link).strip(),
+                url=normalized_link,
                 snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
@@ -197,22 +199,24 @@ def extract_citations(item: Any) -> List[Citation]:
 
     plain_urls = re.findall(r"https?://[^\s)\]>]+", body)
     for link in plain_urls[:6]:
-        if not is_allowed_citation_url(str(link).strip()):
+        normalized_link = normalize_url(str(link).strip())
+        if not is_allowed_citation_url(normalized_link):
             continue
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
-                url=str(link).strip(),
+                url=normalized_link,
                 snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
         )
 
-    if raw.url and is_allowed_citation_url(str(raw.url).strip()):
+    normalized_raw_url = normalize_url(str(raw.url or "").strip())
+    if normalized_raw_url and is_allowed_citation_url(normalized_raw_url):
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
-                url=str(raw.url).strip(),
+                url=normalized_raw_url,
                 snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
@@ -351,7 +355,7 @@ def normalize(raw: Any) -> NormalizedItem:
         id=str(item.id).strip(),
         source=str(item.source).strip(),
         title=_compact_text(item.title, max_len=220) or "Untitled",
-        url=str(item.url or "").strip(),
+        url=normalize_url(str(item.url or "").strip()),
         author=str(item.author).strip() if item.author else None,
         published_at=published,
         body_md=clean_md or body_text,

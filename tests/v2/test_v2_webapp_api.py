@@ -31,12 +31,15 @@ def _connectors() -> dict:
             RawItem(
                 id="gh_1",
                 source="github",
-                title="org/repo-api",
+                title="org/mcp-agent-preview-runtime",
                 url="https://github.com/org/repo-api",
-                body="API test content with architecture notes.",
+                body=(
+                    "MCP preview runtime for AI agent workflows. Includes tool-calling orchestration, "
+                    "architecture notes, deployment guidance, and benchmark summaries."
+                ),
                 author="org",
                 tier="A",
-                metadata={"stars": 1000, "item_type": "repo"},
+                metadata={"stars": 1000, "item_type": "repo", "topics": ["ai agent", "mcp"]},
             )
         ]
 

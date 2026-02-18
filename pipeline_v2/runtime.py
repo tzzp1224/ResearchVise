@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 
 from core import Artifact, ArtifactType, RawItem, RenderStatus, RunMode, RunRequest
 from orchestrator import RunOrchestrator
@@ -23,11 +24,13 @@ from pipeline_v2.prompt_compiler import compile_storyboard
 from pipeline_v2.report_export import export_package, generate_onepager, generate_thumbnail
 from pipeline_v2.scoring import rank_items
 from pipeline_v2.script_generator import build_facts, generate_script
+from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
 from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
 from render import align_subtitles, mix_bgm, tts_generate
 from render.manager import RenderManager
 from sources import connectors
 
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -192,9 +195,14 @@ class RunPipelineRuntime:
             relevance_threshold=relevance_threshold,
         )
         top_count = self._top_n(request)
-        picks = ranked[:top_count]
+        relevance_eligible = (
+            [entry for entry in ranked if float(entry.relevance_score) >= float(relevance_threshold)]
+            if float(relevance_threshold) > 0.0
+            else list(ranked)
+        )
+        picks = relevance_eligible[:top_count]
         if not picks:
-            raise RuntimeError("no ranked items available")
+            raise RuntimeError("no relevant ranked items available")
 
         def _drop_reason(row: Any) -> str:
             reasons = " ".join(str(value) for value in list(getattr(row, "reasons", []) or []))
@@ -229,8 +237,12 @@ class RunPipelineRuntime:
                 chunks.append(f"HN {points}/{comments}")
             return " · ".join(chunks[:3])
 
+        picked_ids = {pick.item.id for pick in picks}
         run_context["ranking_stats"] = {
             "topic": str(request.topic or "").strip() or None,
+            "candidate_count": len(ranked),
+            "top_picks_count": len(picks),
+            "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
             "top_item_ids": [entry.item.id for entry in picks],
             "top_relevance_scores": [round(float(entry.relevance_score), 4) for entry in picks],
             "relevance_threshold": relevance_threshold,
@@ -243,7 +255,7 @@ class RunPipelineRuntime:
                     "title": entry.item.title,
                     "reason": _drop_reason(entry),
                 }
-                for entry in ranked[top_count : top_count + 3]
+                for entry in [row for row in ranked if row.item.id not in picked_ids][:3]
             ],
         }
         run_context_path = self._write_json(out_dir / "run_context.json", run_context)
@@ -282,6 +294,11 @@ class RunPipelineRuntime:
                 "max_shots": 8,
             },
         )
+
+        materials_manifest = self._build_materials_manifest(run_id=run_id, primary=primary, picks=picks, run_context=run_context)
+        materials_manifest = self._materialize_assets(out_dir=out_dir, manifest=materials_manifest)
+        board = self._attach_reference_assets(board=board, materials=materials_manifest)
+
         valid, errors = validate_storyboard(board)
         if not valid:
             board, fixes = auto_fix_storyboard(board)
@@ -300,7 +317,7 @@ class RunPipelineRuntime:
         )
         materials_path = self._write_json(
             out_dir / "materials.json",
-            self._build_materials_manifest(run_id=run_id, primary=primary, picks=picks, run_context=run_context),
+            materials_manifest,
         )
         self._record_artifact(
             run_id,
@@ -489,8 +506,8 @@ class RunPipelineRuntime:
         icon_keywords = set()
         source_urls = set()
         for idx, item in enumerate(top_items[:8], start=1):
-            item_url = str(item.url or "").strip()
-            if item_url:
+            item_url = normalize_url(str(item.url or "").strip())
+            if item_url and is_allowed_citation_url(item_url):
                 source_urls.add(item_url)
                 screenshot_plan.append(
                     {
@@ -508,8 +525,8 @@ class RunPipelineRuntime:
 
         citation_sources = []
         for citation in list(primary.citations or [])[:12]:
-            url = str(citation.url or "").strip()
-            if url:
+            url = normalize_url(str(citation.url or "").strip())
+            if url and is_allowed_citation_url(url):
                 source_urls.add(url)
             citation_sources.append(
                 {
@@ -537,6 +554,8 @@ class RunPipelineRuntime:
             "top_item_ids": [item.id for item in top_items],
             "source_urls": sorted(source_urls),
             "screenshot_plan": screenshot_plan,
+            "local_assets": [],
+            "reference_asset_map": {},
             "icon_keyword_suggestions": sorted(icon_keywords)[:16],
             "broll_categories": broll_categories,
             "citations": citation_sources,
@@ -548,6 +567,96 @@ class RunPipelineRuntime:
             },
             "facts": facts,
         }
+
+    @staticmethod
+    def _slug(value: str, *, max_len: int = 48) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "").strip().lower())
+        text = re.sub(r"-{2,}", "-", text).strip("-")
+        if not text:
+            text = "asset"
+        return text[:max_len].strip("-") or "asset"
+
+    def _write_asset_card(self, *, path: Path, title: str, subtitle: str, accent: str = "#0f766e") -> str:
+        svg = "\n".join(
+            [
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1080\" height=\"1920\" viewBox=\"0 0 1080 1920\">",
+                "  <rect width=\"1080\" height=\"1920\" fill=\"#0b1320\"/>",
+                f"  <rect x=\"56\" y=\"56\" width=\"968\" height=\"1808\" rx=\"36\" fill=\"{accent}\" fill-opacity=\"0.16\"/>",
+                f"  <text x=\"88\" y=\"220\" font-size=\"54\" font-family=\"Arial, sans-serif\" fill=\"#e2e8f0\">{self._slug(title, max_len=30)}</text>",
+                f"  <text x=\"88\" y=\"330\" font-size=\"38\" font-family=\"Arial, sans-serif\" fill=\"#cbd5e1\">{self._slug(subtitle, max_len=50)}</text>",
+                "  <text x=\"88\" y=\"1780\" font-size=\"26\" font-family=\"Arial, sans-serif\" fill=\"#94a3b8\">generated local asset</text>",
+                "</svg>",
+            ]
+        )
+        path.write_text(svg, encoding="utf-8")
+        return str(path)
+
+    def _materialize_assets(self, *, out_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        assets_dir = out_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        plan = list(manifest.get("screenshot_plan") or [])
+        local_assets: List[str] = []
+        url_to_asset: Dict[str, str] = {}
+        fetch_logs: List[Dict[str, Any]] = []
+
+        for idx, entry in enumerate(plan, start=1):
+            url = normalize_url(str((entry or {}).get("url") or ""))
+            title = str((entry or {}).get("title") or f"asset-{idx}")
+            shot_hint = str((entry or {}).get("shot_hint") or f"shot_{idx:02d}")
+            base = f"{shot_hint}_{self._slug(title, max_len=28)}"
+            target = assets_dir / f"{base}.svg"
+            error = None
+
+            if url and url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                img_target = assets_dir / f"{base}{Path(urlparse(url).path).suffix or '.png'}"
+                try:
+                    with httpx.Client(timeout=httpx.Timeout(6.0), follow_redirects=True) as client:
+                        resp = client.get(url)
+                        resp.raise_for_status()
+                        img_target.write_bytes(resp.content)
+                    target_path = str(img_target)
+                except Exception as exc:
+                    error = f"download_failed:{exc}"
+                    target_path = self._write_asset_card(path=target, title=title, subtitle=url or "local fallback")
+            else:
+                target_path = self._write_asset_card(path=target, title=title, subtitle=url or "local fallback")
+
+            local_assets.append(target_path)
+            if url:
+                url_to_asset[url] = target_path
+            fetch_logs.append(
+                {
+                    "idx": idx,
+                    "url": url,
+                    "local_path": target_path,
+                    "status": "ok" if not error else "fallback",
+                    "error": error,
+                }
+            )
+
+        manifest["local_assets"] = local_assets
+        manifest["reference_asset_map"] = url_to_asset
+        manifest["asset_fetch_results"] = fetch_logs
+        return manifest
+
+    @staticmethod
+    def _attach_reference_assets(*, board: Any, materials: Dict[str, Any]) -> Any:
+        ref_map = {normalize_url(str(key)): str(value) for key, value in dict(materials.get("reference_asset_map") or {}).items()}
+        local_assets = [str(path) for path in list(materials.get("local_assets") or []) if str(path).strip()]
+        for idx, shot in enumerate(list(board.shots or []), start=1):
+            refs: List[str] = []
+            for raw_ref in list(shot.reference_assets or []):
+                normalized = normalize_url(str(raw_ref or ""))
+                mapped = ref_map.get(normalized)
+                if mapped:
+                    refs.append(mapped)
+                elif normalized and is_allowed_citation_url(normalized):
+                    refs.append(normalized)
+            if not refs and local_assets:
+                refs = [local_assets[(idx - 1) % len(local_assets)]]
+            shot.reference_assets = refs
+        return board
 
     @staticmethod
     def _build_run_context(

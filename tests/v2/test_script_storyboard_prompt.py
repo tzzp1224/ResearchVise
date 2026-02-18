@@ -3,7 +3,7 @@ from __future__ import annotations
 from core import Citation, NormalizedItem, Shot, Storyboard
 from pipeline_v2.prompt_compiler import compile_shot_prompt, compile_storyboard, consistency_pack
 from pipeline_v2.script_generator import generate_script, generate_variants
-from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
+from pipeline_v2.storyboard_generator import auto_fix_storyboard, overlay_compact, script_to_storyboard, validate_storyboard
 
 
 def _sample_item() -> NormalizedItem:
@@ -63,6 +63,7 @@ def test_script_to_storyboard_validate_and_autofix() -> None:
     assert ok is True
     assert errors == []
     assert any(shot.reference_assets for shot in board.shots)
+    assert all(len(str(shot.overlay_text or "")) <= 42 for shot in board.shots)
 
     broken = Storyboard(
         run_id="run_1",
@@ -113,3 +114,10 @@ def test_prompt_compiler_builds_consistent_prompt_specs() -> None:
     prompts = compile_storyboard(board, style_profile={"style_id": "style_neo", "character_id": "host_01"})
     assert len(prompts) == 1
     assert prompts[0].seedance_params["style_id"] == "style_neo"
+
+
+def test_overlay_compact_keeps_readability_without_hard_cut() -> None:
+    text = "This is a very long sentence that should be compacted into a short overlay for 9:16 cards without ugly truncation artifacts."
+    compact = overlay_compact(text, max_chars=42)
+    assert len(compact) <= 42
+    assert not compact.endswith("...")

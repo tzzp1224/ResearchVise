@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from pipeline_v2.sanitize import contains_html_like_tokens, is_allowed_citation_url
+from pipeline_v2.sanitize import contains_html_like_tokens, is_allowed_citation_url, is_valid_http_url, normalize_url
 
 
 BLOCKLIST = {"placeholder", "dummy", "lorem", "todo", "testsrc", "colorbars"}
@@ -39,7 +39,19 @@ def _contains_blocklist(text: str) -> List[str]:
 
 
 def _extract_urls(text: str) -> List[str]:
-    return [str(url).strip().rstrip(".,;:") for url in re.findall(r"https?://[^\s)]+", str(text or ""))]
+    urls = []
+    for raw in re.findall(r"https?://[^\s)]+", str(text or "")):
+        value = normalize_url(str(raw))
+        if value:
+            urls.append(value)
+    deduped = []
+    seen = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
 
 
 def _compact_bullet_issues(onepager: str) -> List[str]:
@@ -191,6 +203,28 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         "details": {},
     }
 
+    run_context_path = run_dir / "run_context.json"
+    run_context = {}
+    if run_context_path.exists():
+        try:
+            run_context = _load_json(run_context_path)
+            report["checks"]["run_context_exists"] = True
+            report["details"]["data_mode"] = str(run_context.get("data_mode") or "")
+            report["details"]["connector_stats"] = run_context.get("connector_stats")
+            report["details"]["extraction_stats"] = run_context.get("extraction_stats")
+        except Exception as exc:
+            report["checks"]["run_context_exists"] = False
+            report["errors"].append(f"run_context_parse:{exc}")
+            run_context = {}
+    else:
+        report["checks"]["run_context_exists"] = False
+        report["errors"].append(f"missing:run_context:{run_context_path}")
+
+    data_mode = str(report["details"].get("data_mode") or "").strip().lower()
+    report["checks"]["data_mode_present"] = data_mode in {"live", "smoke"}
+    if not report["checks"]["data_mode_present"]:
+        report["errors"].append("data_mode_missing")
+
     required = {
         "script": run_dir / "script.json",
         "facts": run_dir / "facts.json",
@@ -246,21 +280,25 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         if script_bad_urls:
             report["errors"].append("script_citation_denylist:" + ",".join(sorted(set(script_bad_urls))[:6]))
 
+    onepager_urls: List[str] = []
     if onepager_path.exists():
         onepager = onepager_path.read_text(encoding="utf-8")
         urls = _extract_urls(onepager)
+        onepager_urls = urls
         top_pick_headings = re.findall(r"^###\s+\d+\.\s+", onepager, flags=re.MULTILINE)
         domain_rows = re.findall(r"^-\s*Source Domain:\s*`[^`]+`", onepager, flags=re.MULTILINE)
+        relevance_rows = [float(value) for value in re.findall(r"Topic Relevance:\s*`([0-9.]+)`", onepager)]
         block_hits = _contains_blocklist(onepager)
         bad_urls = [url for url in urls if not is_allowed_citation_url(url)]
         report["checks"]["onepager_url_count_ge_3"] = len(urls) >= 3
-        report["checks"]["onepager_top_picks_ge_3"] = len(top_pick_headings) >= 3
-        report["checks"]["onepager_domain_rows_ge_3"] = len(domain_rows) >= 3
+        report["checks"]["onepager_top_picks_ge_3"] = len(top_pick_headings) >= 3 if data_mode != "live" else len(top_pick_headings) >= 1
+        report["checks"]["onepager_domain_rows_ge_3"] = len(domain_rows) >= 3 if data_mode != "live" else len(domain_rows) >= 1
         report["checks"]["onepager_blocklist_ok"] = len(block_hits) == 0
         report["checks"]["onepager_no_html_tokens"] = not contains_html_like_tokens(onepager)
         report["checks"]["onepager_citation_denylist_ok"] = len(bad_urls) == 0
         report["details"]["onepager_url_count"] = len(urls)
         report["details"]["onepager_top_pick_count"] = len(top_pick_headings)
+        report["details"]["onepager_relevance_scores"] = relevance_rows
         if block_hits:
             report["errors"].append("onepager_blocklist:" + ",".join(block_hits))
         if bad_urls:
@@ -287,6 +325,16 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["storyboard_overlay_non_empty"] = all(
             str((shot or {}).get("overlay_text") or "").strip() != "" for shot in shots
         )
+        overlay_issues = []
+        for idx, shot in enumerate(shots, start=1):
+            overlay = str((shot or {}).get("overlay_text") or "")
+            if len(overlay) > 42:
+                overlay_issues.append(f"shot_{idx}:overlay_too_long:{len(overlay)}")
+            if overlay.endswith(("..", "...", "-", "--")):
+                overlay_issues.append(f"shot_{idx}:overlay_hard_cut")
+        report["checks"]["storyboard_overlay_safe"] = len(overlay_issues) == 0
+        if overlay_issues:
+            report["errors"].append("overlay_issues:" + ",".join(overlay_issues[:6]))
         report["checks"]["storyboard_no_html_tokens"] = not contains_html_like_tokens(json.dumps(storyboard, ensure_ascii=False))
         if not report["checks"]["storyboard_no_html_tokens"]:
             report["errors"].append("storyboard_html_tokens_present")
@@ -330,29 +378,9 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["render_status_seedance_flag_present"] = False
         report["errors"].append(f"missing:render_status:{render_status_path}")
 
-    run_context_path = run_dir / "run_context.json"
-    if run_context_path.exists():
-        try:
-            run_context = _load_json(run_context_path)
-            report["checks"]["run_context_exists"] = True
-            report["details"]["data_mode"] = str(run_context.get("data_mode") or report["details"].get("data_mode") or "")
-            report["details"]["connector_stats"] = run_context.get("connector_stats")
-            report["details"]["extraction_stats"] = run_context.get("extraction_stats")
-        except Exception as exc:
-            report["checks"]["run_context_exists"] = False
-            report["errors"].append(f"run_context_parse:{exc}")
-    else:
-        report["checks"]["run_context_exists"] = False
-        report["errors"].append(f"missing:run_context:{run_context_path}")
-
-    data_mode = str(report["details"].get("data_mode") or "").strip().lower()
-    report["checks"]["data_mode_present"] = data_mode in {"live", "smoke"}
-    if not report["checks"]["data_mode_present"]:
-        report["errors"].append("data_mode_missing")
-
     if data_mode == "live":
         texts = []
-        for path in [script_path, onepager_path, storyboard_path, run_dir / "materials.json"]:
+        for path in [script_path, onepager_path, storyboard_path, run_dir / "materials.json", run_dir / "facts.json"]:
             if path.exists():
                 texts.append(path.read_text(encoding="utf-8", errors="ignore"))
         merged = "\n".join(texts)
@@ -401,13 +429,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             ranking_stats = {}
 
     if topic_value and data_mode == "live":
+        threshold = float(ranking_stats.get("relevance_threshold", 0.55) or 0.55)
         scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
         if not scores and onepager_path.exists():
             onepager = onepager_path.read_text(encoding="utf-8")
             scores = [float(value) for value in re.findall(r"Topic Relevance:\\s*`([0-9.]+)`", onepager)]
-        report["checks"]["topic_relevance_ok"] = bool(scores and min(scores[:3]) >= 0.55)
+        report["checks"]["topic_relevance_ok"] = bool(scores and min(scores) >= threshold)
         report["details"]["topic"] = topic_value
-        report["details"]["topic_relevance_scores"] = scores[:3]
+        report["details"]["topic_relevance_scores"] = scores
+        report["details"]["topic_relevance_threshold"] = threshold
         if not report["checks"]["topic_relevance_ok"]:
             report["errors"].append("topic_relevance_below_threshold")
     else:
@@ -433,6 +463,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("ranked_items_missing_update_signal")
     else:
         report["checks"]["ranked_items_have_update_signal"] = True
+
+    all_urls = []
+    for path in [script_path, onepager_path, storyboard_path, prompt_bundle_path, run_dir / "materials.json", facts_path]:
+        if path.exists():
+            all_urls.extend(_extract_urls(path.read_text(encoding="utf-8", errors="ignore")))
+    invalid_urls = sorted({url for url in all_urls if not is_valid_http_url(url)})
+    report["checks"]["urls_valid"] = len(invalid_urls) == 0
+    if invalid_urls:
+        report["errors"].append("invalid_urls:" + ",".join(invalid_urls[:8]))
 
     report["ok"] = len(report["errors"]) == 0 and all(bool(v) for v in report["checks"].values())
     return report

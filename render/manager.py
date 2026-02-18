@@ -90,6 +90,11 @@ def _safe_fontfile(value: str) -> str:
     return text
 
 
+def _is_image_path(value: str) -> bool:
+    path = Path(str(value or ""))
+    return path.exists() and path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
+
+
 def _wrap_text(value: str, *, max_chars: int = 34, max_lines: int = 3) -> str:
     words = str(value or "").split()
     if not words:
@@ -781,6 +786,7 @@ class RenderManager:
                     "title": f"Shot {int(shot.idx)}",
                     "body": overlay,
                     "footer": _compact_text(f"{shot.scene} | {source_hint}", 90),
+                    "asset": source_hint if _is_image_path(source_hint) else "",
                 }
             )
 
@@ -799,15 +805,27 @@ class RenderManager:
         try:
             for idx, segment in enumerate(sequence):
                 segment_path = segment_dir / f"segment_{idx:03d}.mp4"
-                ok = self._render_text_card(
-                    out_path=segment_path,
-                    duration_sec=float(segment["duration"]),
-                    aspect=str(board.aspect or "9:16"),
-                    bg_color=_CARD_BG_COLORS[idx % len(_CARD_BG_COLORS)],
-                    title=str(segment["title"]),
-                    body=str(segment["body"]),
-                    footer=str(segment["footer"]),
-                )
+                ok = False
+                if str(segment.get("asset") or "").strip():
+                    ok = self._render_image_card(
+                        out_path=segment_path,
+                        duration_sec=float(segment["duration"]),
+                        aspect=str(board.aspect or "9:16"),
+                        image_path=str(segment.get("asset") or ""),
+                        title=str(segment["title"]),
+                        body=str(segment["body"]),
+                        footer=str(segment["footer"]),
+                    )
+                if not ok:
+                    ok = self._render_text_card(
+                        out_path=segment_path,
+                        duration_sec=float(segment["duration"]),
+                        aspect=str(board.aspect or "9:16"),
+                        bg_color=_CARD_BG_COLORS[idx % len(_CARD_BG_COLORS)],
+                        title=str(segment["title"]),
+                        body=str(segment["body"]),
+                        footer=str(segment["footer"]),
+                    )
                 if not ok:
                     return False
                 segment_paths.append(segment_path)
@@ -815,6 +833,93 @@ class RenderManager:
             return self._concat_videos(segment_paths, out_path=out_path)
         finally:
             shutil.rmtree(segment_dir, ignore_errors=True)
+
+    def _render_image_card(
+        self,
+        *,
+        out_path: Path,
+        duration_sec: float,
+        aspect: str,
+        image_path: str,
+        title: str,
+        body: str,
+        footer: str,
+    ) -> bool:
+        if not _FFMPEG_BIN:
+            return False
+        if not _is_image_path(image_path):
+            return False
+
+        width, height = self._resolution_from_aspect(aspect)
+        duration = max(0.8, float(duration_sec))
+        tmp_out = out_path.parent / f".{out_path.name}.{uuid4().hex}.tmp"
+
+        vf_parts = [
+            f"scale={width}:{height}:force_original_aspect_ratio=increase",
+            f"crop={width}:{height}",
+            "eq=brightness=-0.08:saturation=0.95",
+            "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.24:t=fill",
+            f"drawbox=x=0:y={int(height*0.74)}:w=iw:h={int(height*0.26)}:color=#0b1320@0.72:t=fill",
+        ]
+
+        if _HAS_DRAWTEXT:
+            fontfile = self._pick_fontfile()
+            fontfile_escaped = _safe_fontfile(fontfile) if fontfile else None
+            title_text = _safe_drawtext(_wrap_text(_compact_text(title, 72), max_chars=24, max_lines=2))
+            body_text = _safe_drawtext(_wrap_text(_compact_text(body, 150), max_chars=26, max_lines=3))
+            footer_text = _safe_drawtext(_compact_text(footer, 86))
+
+            title_filter = f"drawtext=text='{title_text}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=h*0.77:line_spacing=8"
+            body_filter = f"drawtext=text='{body_text}':fontcolor=#e2e8f0:fontsize=32:x=(w-text_w)/2:y=h*0.84:line_spacing=6"
+            footer_filter = f"drawtext=text='{footer_text}':fontcolor=#94a3b8:fontsize=22:x=(w-text_w)/2:y=h*0.94"
+            if fontfile_escaped:
+                title_filter += f":fontfile={fontfile_escaped}"
+                body_filter += f":fontfile={fontfile_escaped}"
+                footer_filter += f":fontfile={fontfile_escaped}"
+            vf_parts.extend([title_filter, body_filter, footer_filter])
+
+        vf = ",".join(vf_parts)
+        cmd = [
+            _FFMPEG_BIN,
+            "-y",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-t",
+            f"{duration:.2f}",
+            "-i",
+            str(Path(image_path).resolve()),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf",
+            vf,
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(tmp_out),
+        ]
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return False
+            if not tmp_out.exists() or tmp_out.stat().st_size <= 0:
+                return False
+            os.replace(tmp_out, out_path)
+            return True
+        finally:
+            if tmp_out.exists():
+                tmp_out.unlink()
 
     def _synthesize_video(self, *, out_path: Path, duration_sec: float, aspect: str) -> bool:
         if not _FFMPEG_BIN:
