@@ -42,7 +42,8 @@ def test_generate_onepager_thumbnail_and_export_package(tmp_path: Path) -> None:
     content = Path(onepager).read_text(encoding="utf-8")
     assert "Top Picks" in content
     assert "Source Domain" in content
-    assert "Citation:" in content
+    assert "#### Facts" in content
+    assert "#### Citations" in content
     assert "Quality Metrics" in content
 
     thumbnail = generate_thumbnail(item.title, ["mcp", "agent"], {"fg": "#000", "bg": "#fff"}, out_dir=tmp_path)

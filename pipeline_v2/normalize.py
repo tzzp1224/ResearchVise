@@ -175,13 +175,31 @@ def _infer_credibility(
     author: Optional[str],
     published_at: Optional[datetime],
     citations: List[Citation],
+    body_len: int,
+    link_count: int,
 ) -> str:
-    if tier == "A":
+    citation_count = len(list(citations or []))
+    source_base = 0.62 if tier == "A" else 0.36
+    if source in {"github", "huggingface"}:
+        source_base += 0.07
+    if source in {"hackernews"}:
+        source_base += 0.03
+    if source in {"rss", "web_article"}:
+        source_base -= 0.08
+
+    score = source_base
+    score += min(0.22, 0.05 * float(citation_count))
+    score += 0.05 if author else 0.0
+    score += 0.05 if published_at else 0.0
+    score += 0.05 if int(body_len) >= 500 else 0.0
+    score += 0.04 if int(link_count) >= 2 else 0.0
+
+    density = float(citation_count) / max(1.0, float(body_len) / 600.0)
+    score += 0.05 if density >= 1.2 else (0.02 if density >= 0.5 else -0.03)
+
+    if score >= 0.78:
         return "high"
-    # Tier B is strictly medium/low per PRD.
-    if author and published_at and len(citations) >= 2:
-        return "medium"
-    if source in {"rss", "web_article"} and len(citations) >= 2:
+    if score >= 0.55:
         return "medium"
     return "low"
 
@@ -206,6 +224,8 @@ def normalize(raw: Any) -> NormalizedItem:
         author=item.author,
         published_at=published,
         citations=citations,
+        body_len=body_len,
+        link_count=link_count,
     )
     metadata["source_channel"] = "tier_a" if tier == "A" else "tier_b"
     metadata["citation_count"] = len(citations)

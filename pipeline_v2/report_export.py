@@ -61,6 +61,13 @@ def _summary_paragraphs(body: str) -> List[str]:
     return [first] + ([second] if second else [])
 
 
+def _compact_text(value: str, max_len: int = 220) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
 def _domain(url: str) -> str:
     host = str(urlparse(str(url or "")).netloc or "").strip().lower()
     return host or "unknown"
@@ -74,6 +81,62 @@ def _quality_metrics(item: NormalizedItem) -> dict:
         "published_recency": metadata.get("published_recency"),
         "link_count": int(float(metadata.get("link_count", 0) or 0)),
     }
+
+
+def _fact_bullets(item: NormalizedItem) -> List[str]:
+    metrics = _quality_metrics(item)
+    metadata = dict(item.metadata or {})
+    bullets: List[str] = []
+
+    stars = int(float(metadata.get("stars", 0) or 0))
+    forks = int(float(metadata.get("forks", 0) or 0))
+    downloads = int(float(metadata.get("downloads", 0) or 0))
+    points = int(float(metadata.get("points", 0) or 0))
+    comments = int(float(metadata.get("comment_count", 0) or 0))
+    if stars > 0:
+        bullets.append(f"GitHub stars `{stars}`，forks `{forks}`，显示社区采用强度。")
+    if downloads > 0:
+        bullets.append(f"Hugging Face downloads `{downloads}`，表明近期使用热度。")
+    if points > 0 or comments > 0:
+        bullets.append(f"HN 讨论热度 `points={points}`、`comments={comments}`。")
+    if metrics["published_recency"] is not None:
+        bullets.append(f"发布时间距今约 `{metrics['published_recency']}` 天。")
+    if metrics["citation_count"] > 0:
+        bullets.append(f"引用密度：`citation_count={metrics['citation_count']}`，`body_len={metrics['body_len']}`。")
+
+    for paragraph in _summary_paragraphs(item.body_md):
+        line = _compact_text(paragraph, max_len=180)
+        if line and line not in bullets:
+            bullets.append(line)
+        if len(bullets) >= 4:
+            break
+
+    deduped: List[str] = []
+    seen = set()
+    for bullet in bullets:
+        key = bullet.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(bullet)
+    if len(deduped) < 2:
+        fallback = _compact_text(item.body_md, max_len=170) or _compact_text(item.title, max_len=170)
+        while len(deduped) < 2:
+            deduped.append(fallback)
+    return deduped[:4]
+
+
+def _citation_bullets(item: NormalizedItem) -> List[str]:
+    lines: List[str] = []
+    for citation in list(item.citations or [])[:2]:
+        snippet = _compact_text(citation.snippet or citation.title or "", max_len=160)
+        url = str(citation.url or "").strip()
+        if not snippet and not url:
+            continue
+        lines.append(f"{snippet or '引用片段缺失'} ({url or 'N/A'})")
+    if not lines:
+        return ["无引用"]
+    return lines
 
 
 def _rank_reasons(item: object) -> str:
@@ -125,12 +188,8 @@ def generate_onepager(
         payload = ranked_items[idx - 1]
         credibility = str((item.metadata or {}).get("credibility") or "unknown")
         metrics = _quality_metrics(item)
-        paragraphs = _summary_paragraphs(item.body_md)
-        citation = item.citations[0] if item.citations else None
-        citation_line = "无引用"
-        if citation:
-            citation_snippet = str(citation.snippet or citation.title or "").strip() or "无引用"
-            citation_line = f"{citation_snippet} ({citation.url})"
+        fact_bullets = _fact_bullets(item)
+        citation_bullets = _citation_bullets(item)
 
         lines.extend(
             [
@@ -147,18 +206,16 @@ def generate_onepager(
                 ),
                 f"- Ranking Reasons: `{_rank_reasons(payload)}`",
                 "",
+                "#### Facts",
             ]
         )
-        for paragraph in paragraphs[:2]:
-            lines.append(paragraph)
-            lines.append("")
-
-        lines.extend(
-            [
-                f"- Citation: {citation_line}",
-                "",
-            ]
-        )
+        for bullet in fact_bullets:
+            lines.append(f"- {bullet}")
+        lines.append("")
+        lines.append("#### Citations")
+        for bullet in citation_bullets:
+            lines.append(f"- {bullet}")
+        lines.append("")
 
     lines.extend(
         [

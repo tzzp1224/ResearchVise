@@ -20,6 +20,7 @@ def _item(
     title: str,
     metadata: dict,
 ) -> NormalizedItem:
+    body = ("architecture diagram benchmark rollout metrics evidence " * 12).strip()
     return NormalizedItem(
         id=item_id,
         source=source,
@@ -27,12 +28,12 @@ def _item(
         url=f"https://example.com/{item_id}",
         author="author",
         published_at=datetime.now(timezone.utc),
-        body_md="architecture diagram benchmark",
+        body_md=body,
         citations=[],
         tier=tier,
         lang="en",
         hash=f"hash_{item_id}",
-        metadata=metadata,
+        metadata={"body_len": len(body), **dict(metadata or {})},
     )
 
 
@@ -75,6 +76,26 @@ def test_rank_items_tier_b_not_in_top3_by_default() -> None:
     assert any(reason.startswith("quality.citation_count=") for reason in ranked[0].reasons)
     assert any(reason.startswith("quality.published_recency_days=") for reason in ranked[0].reasons)
     assert any(reason.startswith("quality.link_count=") for reason in ranked[0].reasons)
+
+
+def test_rank_items_defer_short_body_without_evidence() -> None:
+    short_body = _item(
+        "s1",
+        tier="A",
+        source="github",
+        title="tiny snippet",
+        metadata={"body_len": 80, "citation_count": 0, "credibility": "high"},
+    )
+    strong = _item(
+        "a1",
+        tier="A",
+        source="github",
+        title="long and detailed update",
+        metadata={"body_len": 760, "citation_count": 2, "credibility": "high"},
+    )
+    ranked = rank_items([short_body, strong], min_body_len_for_top_picks=300)
+    assert ranked[0].item.id == "a1"
+    assert any("quality.top_pick_gate=deferred" in reason for reason in ranked[1].reasons)
 
 
 def test_rank_items_allows_tier_b_top3_when_talkability_is_high() -> None:

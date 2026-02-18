@@ -37,6 +37,23 @@ def _quality_metrics(item: NormalizedItem) -> Tuple[int, int, Optional[float], i
     return body_len, citation_count, published_recency, link_count
 
 
+def _is_short_announcement(item: NormalizedItem) -> bool:
+    text = f"{item.title}\n{item.body_md}".lower()
+    markers = [
+        "release",
+        "changelog",
+        "security advisory",
+        "hotfix",
+        "patch",
+        "version",
+        "v0.",
+        "v1.",
+        "v2.",
+        "announce",
+    ]
+    return any(marker in text for marker in markers)
+
+
 def score_novelty(item: NormalizedItem) -> float:
     """Novelty favors recency and release-like artifacts."""
     published = item.published_at
@@ -125,10 +142,18 @@ def rank_items(
     items: Sequence[NormalizedItem],
     *,
     tier_b_top3_talkability_threshold: float = 0.88,
+    min_body_len_for_top_picks: int = 300,
 ) -> List[RankedItem]:
     """Rank items with explainable subscores and Tier B top3 gate."""
     staged = []
     for item in items:
+        body_len, citation_count, published_recency, link_count = _quality_metrics(item)
+        short_announcement = _is_short_announcement(item)
+        quality_eligible = bool(
+            body_len >= int(min_body_len_for_top_picks)
+            or (short_announcement and citation_count >= 1 and link_count >= 1)
+        )
+
         scores = {
             "novelty": score_novelty(item),
             "talkability": score_talkability(item),
@@ -136,30 +161,63 @@ def rank_items(
             "visual_assets": score_visual_assets(item),
         }
         total = _weighted_total(scores)
+
+        if citation_count <= 0:
+            total = _clamp01(total * 0.76)
+        if published_recency is None:
+            total = _clamp01(total * 0.82)
+        if not quality_eligible:
+            total = _clamp01(total * 0.72)
+
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             margin = (scores["talkability"] - float(tier_b_top3_talkability_threshold)) / max(
                 1e-6, 1.0 - float(tier_b_top3_talkability_threshold)
             )
             total = _clamp01(total + 0.08 + 0.12 * _clamp01(margin))
-        staged.append((item, scores, total))
+        staged.append(
+            (
+                item,
+                scores,
+                total,
+                body_len,
+                citation_count,
+                published_recency,
+                link_count,
+                quality_eligible,
+                short_announcement,
+            )
+        )
 
     staged.sort(key=lambda row: row[2], reverse=True)
 
-    # Tier B items should not enter top3 unless talkability is extremely high.
+    # Top picks must pass body/evidence gate unless short announcement with evidence.
     top: List[tuple] = []
     deferred_tier_b: List[tuple] = []
+    deferred_quality_gate: List[tuple] = []
     for row in staged:
-        item, scores, _total = row
+        item, scores, _total, _body_len, _citation_count, _published_recency, _link_count, quality_eligible, _short_announcement = row
+        if not quality_eligible:
+            deferred_quality_gate.append(row)
+            continue
         if len(top) < 3 and item.tier == "B" and scores["talkability"] < float(tier_b_top3_talkability_threshold):
             deferred_tier_b.append(row)
             continue
         top.append(row)
 
-    ordered = top + deferred_tier_b
+    ordered = top + deferred_tier_b + deferred_quality_gate
     ranked: List[RankedItem] = []
-    for idx, (item, scores, total) in enumerate(ordered, start=1):
-        body_len, citation_count, published_recency, link_count = _quality_metrics(item)
+    for idx, (
+        item,
+        scores,
+        total,
+        body_len,
+        citation_count,
+        published_recency,
+        link_count,
+        quality_eligible,
+        short_announcement,
+    ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
             f"talkability={scores['talkability']:.2f}",
@@ -170,7 +228,16 @@ def rank_items(
             f"quality.citation_count={citation_count}",
             f"quality.published_recency_days={published_recency if published_recency is not None else 'unknown'}",
             f"quality.link_count={link_count}",
+            f"quality.top_pick_gate={'pass' if quality_eligible else 'deferred'}",
         ]
+        if short_announcement:
+            reasons.append("quality.short_announcement=true")
+        if citation_count <= 0:
+            reasons.append("penalty.no_citations")
+        if published_recency is None:
+            reasons.append("penalty.missing_published_time")
+        if not quality_eligible:
+            reasons.append(f"penalty.body_len_lt_{int(min_body_len_for_top_picks)}")
         if item.tier == "B" and idx <= 3 and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             reasons.append("tier_b_top3_override=talkability")
 

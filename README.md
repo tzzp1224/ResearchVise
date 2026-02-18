@@ -1,6 +1,32 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Ranking Gates & Evidence-Rich Onepager (New)
+- 本次目标：
+  - 把 `ranking` 改成真实质量信号驱动，避免短空壳内容进入 Top picks。
+  - 让 onepager 每条 Top pick 输出事实 bullets + 原文引用 bullets。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - 新增 `body_len` 门槛（默认 `<300` 延后，不进 Top picks，除非短公告且有证据）。
+    - 新增 `citation_count==0` 与 `published_recency is None` 降权。
+    - reasons 增加 gate/penalty 解释字段。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - credibility 从常量规则升级为 source+tier+证据密度动态计算。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager 每条 Top pick 增加 `Facts`（2-4条）与 `Citations`（1-2条）。
+  - 修改测试：
+    - `tests/v2/test_scoring.py` 新增 `body_len gate` 用例。
+    - `tests/v2/test_report_export_notification.py` 断言 `Facts/Citations` 分块输出。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/scoring.py`, `pipeline_v2/normalize.py`, `pipeline_v2/report_export.py`, 对应测试文件。
+- 如何验证：
+  - `pytest -q tests/v2/test_scoring.py tests/v2/test_report_export_notification.py tests/v2/test_runtime_integration.py tests/v2/test_normalize.py`
+  - `pytest -q tests/v2`
+- 已知风险与回滚：
+  - 风险：在弱网络场景下可用内容不足时，更多候选会被 gate 延后，可能导致可选 Top picks 数量下降。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Live Connectors Enrichment (New)
 - 本次目标：
   - 让 `live` 模式抓取结果从“标题级摘要”升级为“可写文案的正文级内容”。
