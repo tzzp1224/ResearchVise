@@ -1,6 +1,27 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Minimum-Usable Audio & Subtitles (Commit 4)
+- 本次目标：
+  - 将 `audio/subtitles` 从占位实现升级为最低可用的可交付链路。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/audio_subtitles.py`：
+    - `tts_generate` 改为本地确定性可听音轨生成（非静默占位）。
+    - `align_subtitles` 新增单调时间轴修正，确保 SRT 时间递增。
+    - `mix_bgm` 改为“仅在提供且可读取 BGM 时混音”，否则保持主音轨并返回原路径。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_audio_subtitles.py`：
+    - 新增时间轴异常场景与 BGM 缺失场景测试。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`render/audio_subtitles.py`, `tests/v2/test_audio_subtitles.py`。
+- 如何验证：
+  - `pytest -q tests/v2/test_audio_subtitles.py tests/v2/test_runtime_integration.py tests/v2/test_e2e_smoke_command.py`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_c4 > /tmp/ara_v2_smoke_c4/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_smoke_c4/runs/<run_id> --render-dir /tmp/ara_v2_smoke_c4/render_jobs/<render_job_id>`
+- 已知风险与回滚：
+  - 风险：当前本地音轨仍是规则合成音，音色自然度有限；外部 TTS 接入作为后续增强。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Motion Graphics Fallback Renderer (Commit 3)
 - 本次目标：
   - 将 `fallback_render/stitch_shots` 从占位合成升级为可发布预览的工程化视频输出。
