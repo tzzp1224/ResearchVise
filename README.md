@@ -1,6 +1,36 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Acceptance Gates & Placeholder Cleanup (Commit 6)
+- 本次目标：
+  - 完成自动化验收门禁（artifact 质量、视频有效性、占位逻辑清理）。
+  - 保证 smoke 数据可覆盖 `Top picks >= 3` 验收项。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增门禁：`script_structure_ok`、`onepager_top_picks_ge_3`、`onepager_domain_rows_ge_3`。
+    - 新增 MP4 门禁：`duration>=10s`、三帧差异校验（避免静态/彩条类输出）。
+    - 新增 `render_status_seedance_flag_present` 校验（读取 `render_status.json`）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/manager.py`：
+    - 渲染目录持久化 `render_status.json`。
+    - 在无 `drawtext` 环境下启用位图文本卡片渲染路径，避免退化为静态占位合成。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/e2e_smoke_v2.py`：
+    - smoke connectors 扩展到 >=3 条候选，确保 onepager 门禁可验证。
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/check_no_placeholders_v2.py`：
+    - 扫描旧占位标记（legacy filler/testsrc/placeholder mp4 marker）并以 0/1 退出码返回。
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_validate_artifacts_v2.py`：
+    - 覆盖 smoke + validator 一体化验收。
+- 新增/删除文件：
+  - 新增：`scripts/check_no_placeholders_v2.py`, `tests/v2/test_validate_artifacts_v2.py`
+  - 修改：`scripts/validate_artifacts_v2.py`, `scripts/e2e_smoke_v2.py`, `render/manager.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_accept > /tmp/ara_v2_accept/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_accept/runs/<run_id> --render-dir /tmp/ara_v2_accept/render_jobs/<render_job_id>`
+  - `python scripts/check_no_placeholders_v2.py --root /Users/dexter/Documents/Dexter_Work/AcademicResearchAgent`
+- 已知风险与回滚：
+  - 风险：位图文本卡片是无 `drawtext` 环境的兼容路径，视觉可读性优先于高级动效。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Seedance Optional Real HTTP Adapter (Commit 5)
 - 本次目标：
   - 将 Seedance 从“仅注入回调”升级为“可选真实 HTTP 接入（默认关闭）”。
@@ -330,6 +360,10 @@ subprocess.run([
   '--render-dir', render_dir
 ], check=False)
 PY
+```
+
+```bash
+python scripts/check_no_placeholders_v2.py --root /Users/dexter/Documents/Dexter_Work/AcademicResearchAgent
 ```
 
 ## 9) 已知限制与下一步

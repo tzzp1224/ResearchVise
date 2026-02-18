@@ -53,11 +53,33 @@ def _connector_overrides() -> dict:
 
     async def _hf_trending(max_results: int = 12):
         _ = max_results
-        return []
+        return [
+            RawItem(
+                id="hf_1",
+                source="huggingface",
+                title="org/mcp-encoder-smoke",
+                url="https://huggingface.co/org/mcp-encoder-smoke",
+                body="Model card highlights retrieval accuracy and deployment tips.",
+                author="org",
+                tier="A",
+                metadata={"downloads": 8800, "likes": 140, "item_type": "model"},
+            )
+        ]
 
     async def _hn_top(max_results: int = 12):
         _ = max_results
-        return []
+        return [
+            RawItem(
+                id="hn_1",
+                source="hackernews",
+                title="Show HN: MCP smoke deployment notes",
+                url="https://news.ycombinator.com/item?id=1000001",
+                body="Community thread on rollout strategy and observability wins.",
+                author="hn_user",
+                tier="A",
+                metadata={"points": 120, "comment_count": 48, "item_type": "story"},
+            )
+        ]
 
     async def _rss(feed_url: str, max_results: int = 6):
         _ = feed_url, max_results

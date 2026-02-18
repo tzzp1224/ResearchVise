@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -17,13 +18,18 @@ from core import PromptSpec, RenderStatus, Shot, StatusTimestamps, Storyboard
 
 from .adapters import BaseRendererAdapter, SeedanceAdapter, ShotRenderResult
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency in runtime environments
+    np = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger(__name__)
 _FFMPEG_BIN = shutil.which("ffmpeg")
 _FFPROBE_BIN = shutil.which("ffprobe")
 _FONT_CANDIDATES = [
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/Library/Fonts/Arial.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -36,6 +42,19 @@ _CARD_BG_COLORS = [
     "#162d3b",
     "#20263a",
 ]
+
+
+def _ffmpeg_supports_filter(name: str) -> bool:
+    if not _FFMPEG_BIN:
+        return False
+    proc = subprocess.run([_FFMPEG_BIN, "-hide_banner", "-filters"], check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return False
+    pattern = re.compile(rf"\b{name}\b")
+    return bool(pattern.search(proc.stdout or ""))
+
+
+_HAS_DRAWTEXT = _ffmpeg_supports_filter("drawtext")
 
 
 def _utcnow() -> datetime:
@@ -63,6 +82,14 @@ def _safe_drawtext(value: str) -> str:
     return text
 
 
+def _safe_fontfile(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", r"\:")
+    text = text.replace(" ", r"\ ")
+    return text
+
+
 def _wrap_text(value: str, *, max_chars: int = 34, max_lines: int = 3) -> str:
     words = str(value or "").split()
     if not words:
@@ -81,6 +108,57 @@ def _wrap_text(value: str, *, max_chars: int = 34, max_lines: int = 3) -> str:
     if len(lines) < max_lines and current:
         lines.append(" ".join(current))
     return "\n".join(lines[:max_lines])
+
+
+_FONT_5X7 = {
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "J": ["00001", "00001", "00001", "00001", "10001", "10001", "01110"],
+    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+    "Q": ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "V": ["10001", "10001", "10001", "10001", "01010", "01010", "00100"],
+    "W": ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
+    "X": ["10001", "01010", "00100", "00100", "00100", "01010", "10001"],
+    "Y": ["10001", "01010", "00100", "00100", "00100", "00100", "00100"],
+    "Z": ["11111", "00010", "00100", "00100", "01000", "10000", "11111"],
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "10000", "11110", "00001", "00001", "11110"],
+    "6": ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+    ".": ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
+    ":": ["00000", "00110", "00110", "00000", "00110", "00110", "00000"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    "/": ["00001", "00010", "00100", "00100", "01000", "10000", "00000"],
+    "?": ["01110", "10001", "00001", "00010", "00100", "00000", "00100"],
+    "!": ["00100", "00100", "00100", "00100", "00100", "00000", "00100"],
+    "|": ["00100", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "'": ["00100", "00100", "00000", "00000", "00000", "00000", "00000"],
+    "(": ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+    ")": ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
 
 
 @dataclass
@@ -145,6 +223,7 @@ class RenderManager:
         )
         self._jobs[render_job_id] = job
         self._queue.append(render_job_id)
+        self._persist_render_status(job)
         logger.info("enqueue_render run_id=%s render_job_id=%s shots=%s", run_id, render_job_id, len(job.prompt_specs))
         return render_job_id
 
@@ -168,6 +247,7 @@ class RenderManager:
         if not approved:
             self._set_canceled(job, reason="preview rejected by user")
             self._remove_from_queue(render_job_id)
+            self._persist_render_status(job)
             return RenderStatus(**job.status.model_dump())
 
         if not job.preview_completed:
@@ -182,6 +262,7 @@ class RenderManager:
         job.status.timestamps.updated_at = _utcnow()
         if render_job_id not in self._queue:
             self._queue.append(render_job_id)
+        self._persist_render_status(job)
         return RenderStatus(**job.status.model_dump())
 
     def cancel_render(self, render_job_id: str) -> bool:
@@ -196,6 +277,7 @@ class RenderManager:
         elif job.status.state == "running":
             job.status.state = "cancel_requested"
             job.status.timestamps.updated_at = _utcnow()
+        self._persist_render_status(job)
         return True
 
     def process_next(self) -> Optional[RenderStatus]:
@@ -209,6 +291,7 @@ class RenderManager:
 
         if job.status.cancellation_requested:
             self._set_canceled(job, reason="cancellation requested")
+            self._persist_render_status(job)
             return RenderStatus(**job.status.model_dump())
 
         confirm_required = bool(job.budget.get("confirm_required", False))
@@ -236,11 +319,13 @@ class RenderManager:
             job.status.state = "awaiting_confirmation"
             job.status.progress = max(job.status.progress, 0.6)
             job.status.timestamps.updated_at = _utcnow()
+            self._persist_render_status(job)
             return RenderStatus(**job.status.model_dump())
 
         if confirm_required and not job.confirmed:
             job.status.state = "awaiting_confirmation"
             job.status.timestamps.updated_at = _utcnow()
+            self._persist_render_status(job)
             return RenderStatus(**job.status.model_dump())
 
         job.shot_outputs.clear()
@@ -271,6 +356,7 @@ class RenderManager:
         if self._seedance_enabled() and job.seedance_success_count <= 0:
             job.status.seedance_used = False
         self._set_completed(job)
+        self._persist_render_status(job)
         return RenderStatus(**job.status.model_dump())
 
     def retry_failed_shots(
@@ -431,9 +517,20 @@ class RenderManager:
     ) -> bool:
         if not _FFMPEG_BIN:
             return False
+        if not _HAS_DRAWTEXT:
+            return self._render_text_card_bitmap(
+                out_path=out_path,
+                duration_sec=duration_sec,
+                aspect=aspect,
+                bg_color=bg_color,
+                title=title,
+                body=body,
+                footer=footer,
+            )
         width, height = self._resolution_from_aspect(aspect)
         duration = max(0.8, float(duration_sec))
         fontfile = self._pick_fontfile()
+        fontfile_escaped = _safe_fontfile(fontfile) if fontfile else None
         title_text = _safe_drawtext(_wrap_text(_compact_text(title, 96), max_chars=24, max_lines=2))
         body_text = _safe_drawtext(_wrap_text(_compact_text(body, 180), max_chars=30, max_lines=4))
         footer_text = _safe_drawtext(_compact_text(footer, 96))
@@ -444,19 +541,19 @@ class RenderManager:
                 f"drawtext=text='{title_text}':fontcolor=white:fontsize=54:"
                 "x=(w-text_w)/2:y=h*0.14:line_spacing=10"
             )
-            text_filters.append(title_filter if not fontfile else title_filter + f":fontfile={fontfile}")
+            text_filters.append(title_filter if not fontfile_escaped else title_filter + f":fontfile={fontfile_escaped}")
         if body_text:
             body_filter = (
                 f"drawtext=text='{body_text}':fontcolor=white:fontsize=36:"
                 "x=(w-text_w)/2:y=h*0.38:line_spacing=8"
             )
-            text_filters.append(body_filter if not fontfile else body_filter + f":fontfile={fontfile}")
+            text_filters.append(body_filter if not fontfile_escaped else body_filter + f":fontfile={fontfile_escaped}")
         if footer_text:
             footer_filter = (
                 f"drawtext=text='{footer_text}':fontcolor=#cbd5e1:fontsize=24:"
                 "x=(w-text_w)/2:y=h*0.88"
             )
-            text_filters.append(footer_filter if not fontfile else footer_filter + f":fontfile={fontfile}")
+            text_filters.append(footer_filter if not fontfile_escaped else footer_filter + f":fontfile={fontfile_escaped}")
 
         if not text_filters:
             text_filters = ["null"]
@@ -508,6 +605,157 @@ class RenderManager:
             os.replace(tmp_out, out_path)
             return True
         finally:
+            if tmp_out.exists():
+                tmp_out.unlink()
+
+    @staticmethod
+    def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+        text = str(value or "#0f172a").strip().lstrip("#")
+        if len(text) != 6:
+            return (15, 23, 42)
+        try:
+            return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+        except Exception:
+            return (15, 23, 42)
+
+    @staticmethod
+    def _draw_bitmap_text(
+        frame: "np.ndarray",  # type: ignore[name-defined]
+        text: str,
+        *,
+        x: int,
+        y: int,
+        scale: int,
+        color: tuple[int, int, int],
+        max_width: int,
+    ) -> None:
+        if np is None:
+            return
+        cursor_x = int(x)
+        cursor_y = int(y)
+        line_height = int(7 * scale + scale)
+        width_limit = max(0, int(max_width))
+        for raw_char in str(text or "").upper():
+            ch = raw_char if raw_char in _FONT_5X7 else "?"
+            if ch == "\n":
+                cursor_y += line_height
+                cursor_x = int(x)
+                continue
+            glyph = _FONT_5X7.get(ch, _FONT_5X7["?"])
+            glyph_width = int(5 * scale + scale)
+            if cursor_x + glyph_width > width_limit:
+                cursor_y += line_height
+                cursor_x = int(x)
+            for row_idx, row_bits in enumerate(glyph):
+                for col_idx, bit in enumerate(row_bits):
+                    if bit != "1":
+                        continue
+                    x0 = cursor_x + col_idx * scale
+                    y0 = cursor_y + row_idx * scale
+                    x1 = min(frame.shape[1], x0 + scale)
+                    y1 = min(frame.shape[0], y0 + scale)
+                    if x0 < 0 or y0 < 0 or x0 >= frame.shape[1] or y0 >= frame.shape[0]:
+                        continue
+                    frame[y0:y1, x0:x1, 0] = color[0]
+                    frame[y0:y1, x0:x1, 1] = color[1]
+                    frame[y0:y1, x0:x1, 2] = color[2]
+            cursor_x += glyph_width
+
+    def _render_text_card_bitmap(
+        self,
+        *,
+        out_path: Path,
+        duration_sec: float,
+        aspect: str,
+        bg_color: str,
+        title: str,
+        body: str,
+        footer: str,
+    ) -> bool:
+        if np is None or not _FFMPEG_BIN:
+            return False
+        width, height = self._resolution_from_aspect(aspect)
+        duration = max(0.8, float(duration_sec))
+        bg = self._hex_to_rgb(bg_color)
+
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        frame[:, :, 0] = bg[0]
+        frame[:, :, 1] = bg[1]
+        frame[:, :, 2] = bg[2]
+        frame[int(height * 0.8) : int(height * 0.8) + 14, :, :] = (30, 199, 220)
+        frame[int(height * 0.12) : int(height * 0.13), :, :] = (14, 165, 233)
+
+        self._draw_bitmap_text(
+            frame,
+            _wrap_text(_compact_text(title, 72), max_chars=20, max_lines=2),
+            x=int(width * 0.08),
+            y=int(height * 0.14),
+            scale=6,
+            color=(245, 248, 255),
+            max_width=int(width * 0.92),
+        )
+        self._draw_bitmap_text(
+            frame,
+            _wrap_text(_compact_text(body, 160), max_chars=26, max_lines=5),
+            x=int(width * 0.08),
+            y=int(height * 0.38),
+            scale=4,
+            color=(240, 245, 250),
+            max_width=int(width * 0.92),
+        )
+        self._draw_bitmap_text(
+            frame,
+            _wrap_text(_compact_text(footer, 96), max_chars=40, max_lines=2),
+            x=int(width * 0.08),
+            y=int(height * 0.88),
+            scale=3,
+            color=(203, 213, 225),
+            max_width=int(width * 0.92),
+        )
+
+        image_path = out_path.parent / f".{out_path.stem}.{uuid4().hex}.ppm"
+        image_path.write_bytes(b"P6\n" + f"{width} {height}\n255\n".encode("ascii") + frame.tobytes())
+
+        tmp_out = out_path.parent / f".{out_path.name}.{uuid4().hex}.tmp"
+        cmd = [
+            _FFMPEG_BIN,
+            "-y",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-t",
+            f"{duration:.2f}",
+            "-i",
+            str(image_path),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(tmp_out),
+        ]
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return False
+            if not tmp_out.exists() or tmp_out.stat().st_size <= 0:
+                return False
+            os.replace(tmp_out, out_path)
+            return True
+        finally:
+            if image_path.exists():
+                image_path.unlink()
             if tmp_out.exists():
                 tmp_out.unlink()
 
@@ -710,6 +958,13 @@ class RenderManager:
         job.status.timestamps.updated_at = now
         if reason:
             job.status.errors.append(reason)
+
+    def _persist_render_status(self, job: RenderJob) -> None:
+        payload = job.status.model_dump(mode="json")
+        path = job.output_dir / "render_status.json"
+        tmp = job.output_dir / f".{path.name}.{uuid4().hex}.tmp"
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def _render_all_shots(self, job: RenderJob, *, mode: str) -> None:
         total = max(1, len(job.prompt_specs))
