@@ -194,3 +194,4 @@ class RenderStatus(BaseModel):
     retry_count: int = 0
     max_retries: int = 1
     failed_shot_indices: List[int] = Field(default_factory=list)
+    output_path: Optional[str] = None
