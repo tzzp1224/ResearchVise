@@ -45,6 +45,27 @@ def test_extract_citations_filters_badge_and_image_urls() -> None:
     assert "https://example.com/logo.svg" not in urls
 
 
+def test_extract_citations_excludes_tooling_links_and_canonicalizes_noise() -> None:
+    raw = RawItem(
+        id="raw_tool",
+        source="github",
+        title="agent repo",
+        url='https://github.com/acme/agent"]}',
+        body=(
+            "API endpoint https://api.openai.com/v1/chat/completions should not be citation.\n"
+            "Install notes https://bun.sh/docs/runtime should be tooling.\n"
+            "Primary source [release](https://github.com/acme/agent/releases/tag/v1.2.0?utm_source=x).\n"
+        ),
+        metadata={},
+    )
+    citations = extract_citations(raw)
+    urls = {item.url for item in citations}
+    assert "https://api.openai.com/v1/chat/completions" not in urls
+    assert "https://bun.sh/docs/runtime" not in urls
+    assert "https://github.com/acme/agent/releases/tag/v1.2.0" in urls
+    assert "https://github.com/acme/agent" in urls
+
+
 def test_normalize_assigns_tier_b_credibility_and_hash() -> None:
     raw = RawItem(
         id="raw_2",

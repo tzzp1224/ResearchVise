@@ -80,6 +80,35 @@ def _compact_bullet_issues(onepager: str) -> List[str]:
     return issues
 
 
+def _evidence_dedup_issues(onepager: str) -> List[str]:
+    issues: List[str] = []
+    text = str(onepager or "")
+    match = re.search(r"^## Evidence\s*(.*)$", text, flags=re.MULTILINE | re.DOTALL)
+    if not match:
+        return ["missing_evidence_section"]
+
+    evidence_block = match.group(1)
+    sections = re.split(r"^###\s+Evidence for\s+([^\n:]+):[^\n]*$", evidence_block, flags=re.MULTILINE)
+    if len(sections) <= 1:
+        return ["missing_item_evidence_groups"]
+
+    global_counts: Dict[str, int] = {}
+    for idx in range(1, len(sections), 2):
+        item_id = str(sections[idx] or "").strip()
+        section_text = str(sections[idx + 1] or "")
+        urls = _extract_urls(section_text)
+        if len(urls) > 5:
+            issues.append(f"item_{item_id}:too_many_evidence:{len(urls)}")
+        if len(urls) != len(set(urls)):
+            issues.append(f"item_{item_id}:duplicate_evidence_urls")
+        for url in urls:
+            global_counts[url] = int(global_counts.get(url, 0)) + 1
+    repeated = sorted([url for url, count in global_counts.items() if count > 2])
+    if repeated:
+        issues.append("global_repeats:" + ",".join(repeated[:6]))
+    return issues
+
+
 def _ffprobe_info(path: Path) -> Tuple[bool, Dict, str]:
     probe_bin = shutil.which("ffprobe")
     if not probe_bin:
@@ -309,6 +338,11 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         if mode_match:
             report["details"]["data_mode"] = str(mode_match.group(1)).lower()
         report["details"]["onepager_compact_issues"] = _compact_bullet_issues(onepager)
+        evidence_issues = _evidence_dedup_issues(onepager)
+        report["checks"]["evidence_dedup_ok"] = len(evidence_issues) == 0
+        report["details"]["onepager_evidence_issues"] = evidence_issues
+        if evidence_issues:
+            report["errors"].append("evidence_dedup:" + ",".join(evidence_issues[:6]))
 
     if facts_path.exists():
         facts_payload = _load_json(facts_path)
@@ -430,6 +464,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 
     if topic_value and data_mode == "live":
         threshold = float(ranking_stats.get("relevance_threshold", 0.55) or 0.55)
+        threshold = float(ranking_stats.get("topic_relevance_threshold_used", threshold) or threshold)
         scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
         if not scores and onepager_path.exists():
             onepager = onepager_path.read_text(encoding="utf-8")

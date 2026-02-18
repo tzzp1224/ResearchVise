@@ -30,6 +30,7 @@ def test_compile_shot_prompt_has_required_fields() -> None:
     assert prompt.shot_idx == 2
     assert prompt.prompt_text
     assert prompt.negative_prompt
-    assert prompt.references == ["asset://diagram_2"]
+    assert prompt.references == []
+    assert prompt.seedance_params["render_assets"] == ["asset://diagram_2"]
     assert prompt.seedance_params["character_id"] == "host_02"
     assert prompt.seedance_params["style_id"] == "style_blueprint"

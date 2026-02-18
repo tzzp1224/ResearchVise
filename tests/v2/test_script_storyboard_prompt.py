@@ -121,3 +121,24 @@ def test_overlay_compact_keeps_readability_without_hard_cut() -> None:
     compact = overlay_compact(text, max_chars=42)
     assert len(compact) <= 42
     assert not compact.endswith("...")
+
+
+def test_script_and_prompt_references_exclude_tooling_links() -> None:
+    item = _sample_item()
+    item.citations.append(
+        Citation(
+            title="Tooling endpoint",
+            url="https://api.openai.com/v1/chat/completions",
+            snippet="endpoint",
+            source="docs",
+        )
+    )
+    script = generate_script(item, duration_sec=35, platform="shorts", tone="technical")
+    for line in list(script.get("lines") or []):
+        refs = [str(ref) for ref in list(line.get("references") or [])]
+        assert all("api.openai.com" not in ref for ref in refs)
+
+    board = script_to_storyboard(script, constraints={"run_id": "run_1", "item_id": "item_1", "aspect": "9:16", "min_shots": 5, "max_shots": 8})
+    prompts = compile_storyboard(board, style_profile={"style_id": "style_neo", "character_id": "host_01"})
+    all_refs = [str(ref) for prompt in prompts for ref in list(prompt.references or [])]
+    assert all("api.openai.com" not in ref for ref in all_refs)

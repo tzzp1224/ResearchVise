@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from core import NormalizedItem
-from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
+from pipeline_v2.sanitize import canonicalize_url, classify_link, is_allowed_citation_url
 
 _FORBIDDEN_TOKENS = re.compile(r"\b(placeholder|dummy|lorem|todo|testsrc|colorbars)\b", re.IGNORECASE)
 _HTML_TAGS = re.compile(r"<[^>]+>")
@@ -105,14 +105,19 @@ def _body_text(item: NormalizedItem) -> str:
 
 def _links(item: NormalizedItem) -> List[str]:
     urls: List[str] = []
+    metadata = dict(item.metadata or {})
+    for raw in list(metadata.get("evidence_links") or []):
+        token = canonicalize_url(str(raw or "").strip())
+        if classify_link(token) == "evidence" and token not in urls:
+            urls.append(token)
     for citation in list(item.citations or []):
-        url = normalize_url(str(citation.url or "").strip())
+        url = canonicalize_url(str(citation.url or "").strip())
         if is_allowed_citation_url(url) and url not in urls:
             urls.append(url)
-    item_url = normalize_url(str(item.url or "").strip())
+    item_url = canonicalize_url(str(item.url or "").strip())
     if is_allowed_citation_url(item_url) and item_url not in urls:
         urls.append(item_url)
-    return urls[:4]
+    return urls[:6]
 
 
 def _engagement_line(item: NormalizedItem) -> str:
@@ -133,18 +138,26 @@ def _engagement_line(item: NormalizedItem) -> str:
 def _why_now(item: NormalizedItem) -> str:
     metadata = dict(item.metadata or {})
     quality_signals = dict(metadata.get("quality_signals") or {})
+    item_type = str(metadata.get("item_type") or "").strip().lower()
+    if item_type == "release":
+        version = str(metadata.get("version") or "").strip()
+        if version:
+            return f"Release {version} just landed, giving teams a concrete upgrade window."
     recency = quality_signals.get("update_recency_days") or metadata.get("published_recency")
     if recency not in (None, "", "unknown"):
         try:
             days = float(recency)
-            return f"The update is recent (about {days:.1f} days old), so teams can apply these changes immediately."
+            return f"Updated {days:.1f} days ago, so this is still inside the decision window."
         except Exception:
             pass
     points = int(float(metadata.get("points", 0) or 0))
     comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
     if points > 0 or comments > 0:
-        return f"Discussion is active with roughly {points} points and {comments} comments, which makes this actionable now."
-    return "signals insufficient for a strong timing claim; track another 24h for confirmation."
+        return f"HN is active at {points} points/{comments} comments, so the operator interest is real."
+    stars = int(float(metadata.get("stars", 0) or 0))
+    if stars > 0:
+        return f"GitHub traction already crossed {stars}, suggesting immediate replication value."
+    return "Signals are emerging; verify primary sources before treating this as a strong trend."
 
 
 def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
@@ -163,7 +176,7 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
     what_it_is = ""
     for sentence in sentences:
         if len(sentence) >= 28 and not _is_fact_noise(sentence):
-            what_it_is = sentence
+            what_it_is = re.sub(r"\b(?:stars?|forks?|lastpush|last push)\s*[:=]\s*\S+", "", sentence, flags=re.IGNORECASE)
             break
     if not what_it_is:
         what_it_is = f"{item.title} is a practical update that targets production engineering workflows."
@@ -187,10 +200,32 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         how_it_works.append(_clean_fact_point(fallback, max_len=80))
 
     links = _links(item)
+    metadata = dict(item.metadata or {})
+    quality_signals = dict(metadata.get("quality_signals") or {})
+
+    metrics = {
+        "stars": int(float(metadata.get("stars", 0) or 0)),
+        "forks": int(float(metadata.get("forks", 0) or 0)),
+        "downloads": int(float(metadata.get("downloads", 0) or 0)),
+        "hn_points": int(float(metadata.get("points", 0) or 0)),
+        "hn_comments": int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0)),
+        "publish_or_update_time": str(quality_signals.get("publish_or_update_time") or metadata.get("publish_or_update_time") or ""),
+    }
+
     proof: List[str] = []
     proof_links: List[str] = []
+    if metrics["stars"] > 0:
+        proof.append(f"GitHub stars reached {metrics['stars']} with sustained maintainer activity.")
+        proof_links.append(links[0] if links else "")
+    if metrics["hn_points"] > 0 or metrics["hn_comments"] > 0:
+        proof.append(f"HN thread signal: {metrics['hn_points']} points and {metrics['hn_comments']} comments.")
+        proof_links.append(next((url for url in links if "news.ycombinator.com/item" in url), links[0] if links else ""))
+    if metrics["publish_or_update_time"]:
+        proof.append(f"Latest publish/update time: {metrics['publish_or_update_time']}.")
+        proof_links.append(links[0] if links else "")
+
     for citation in list(item.citations or []):
-        citation_url = normalize_url(str(citation.url or "").strip())
+        citation_url = canonicalize_url(str(citation.url or "").strip())
         if not is_allowed_citation_url(citation_url):
             continue
         snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
@@ -223,7 +258,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         "why_now": _clean_sentence(_why_now(item), max_len=190),
         "how_it_works": [_clean_fact_point(point, max_len=80) for point in how_it_works[:3]],
         "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],
-        "proof_links": [normalize_url(link) for link in proof_links[:2]],
+        "proof_links": [canonicalize_url(link) for link in proof_links[:2]],
+        "metrics": metrics,
         "links": links,
         "cta": _clean_sentence(cta, max_len=170),
     }
@@ -264,7 +300,7 @@ def generate_script(
     key_points = key_points[:3]
     cta_text = _clean_sentence(str(facts_payload.get("cta") or ""), max_len=170)
 
-    links = [str(url).strip() for url in list(facts_payload.get("links") or []) if is_allowed_citation_url(str(url).strip())]
+    links = [canonicalize_url(str(url).strip()) for url in list(facts_payload.get("links") or []) if is_allowed_citation_url(str(url).strip())]
     if not links:
         links = _links(item)
 
@@ -304,7 +340,7 @@ def generate_script(
         lines[-1]["duration_sec"] = round(float(target) - float(lines[-1]["start_sec"]), 2)
 
     evidence: List[Dict[str, str]] = []
-    proof_links = [normalize_url(str(url or "").strip()) for url in list(facts_payload.get("proof_links") or [])]
+    proof_links = [canonicalize_url(str(url or "").strip()) for url in list(facts_payload.get("proof_links") or [])]
     for idx, proof in enumerate(list(facts_payload.get("proof") or [])[:3], start=1):
         text = _clean_sentence(str(proof), max_len=180)
         if not text:
@@ -319,13 +355,16 @@ def generate_script(
         )
 
     for citation in item.citations[:5]:
+        citation_url = canonicalize_url(str(citation.url or "").strip())
+        if not is_allowed_citation_url(citation_url):
+            continue
         snippet = _clean_sentence(citation.snippet or citation.title, max_len=200)
         if not snippet:
             continue
         evidence.append(
             {
                 "title": _clean_sentence(citation.title, max_len=140),
-                "url": citation.url,
+                "url": citation_url,
                 "snippet": snippet,
             }
         )

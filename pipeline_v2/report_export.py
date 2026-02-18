@@ -11,11 +11,13 @@ from urllib.parse import urlparse
 import zipfile
 
 from core import Artifact, ArtifactType, Citation, NormalizedItem, RankedItem
-from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
+from pipeline_v2.sanitize import canonicalize_url, classify_link, is_allowed_citation_url
 
 
 _MAX_BULLETS_PER_PICK = 6
 _MAX_BULLET_BYTES = 90
+_MAX_EVIDENCE_PER_ITEM = 4
+_MAX_EVIDENCE_GLOBAL = 20
 
 
 def _safe_slug(value: str, *, max_len: int = 72) -> str:
@@ -40,7 +42,9 @@ def _extract_citations(items: Sequence[object], citations: Sequence[Citation] | 
     for item in items:
         normalized = _extract_item(item)
         for citation in normalized.citations:
-            url = normalize_url(str(citation.url or "").strip())
+            url = canonicalize_url(str(citation.url or "").strip())
+            if url and classify_link(url) != "evidence":
+                continue
             key = url or f"{citation.title}|{citation.snippet}"
             if not key or key in seen:
                 continue
@@ -54,7 +58,9 @@ def _extract_citations(items: Sequence[object], citations: Sequence[Citation] | 
                 )
             merged.append(citation)
     for citation in list(citations or []):
-        url = normalize_url(str(citation.url or "").strip())
+        url = canonicalize_url(str(citation.url or "").strip())
+        if url and classify_link(url) != "evidence":
+            continue
         key = url or f"{citation.title}|{citation.snippet}"
         if not key or key in seen:
             continue
@@ -165,17 +171,66 @@ def _fact_bullets(item: NormalizedItem) -> List[str]:
 
 def _citation_bullets(item: NormalizedItem) -> List[str]:
     lines: List[str] = []
-    for citation in list(item.citations or [])[:2]:
+    for citation in list(item.citations or [])[:6]:
         snippet = _compact_text(citation.snippet or citation.title or "", max_len=160)
-        url = normalize_url(str(citation.url or "").strip())
+        url = canonicalize_url(str(citation.url or "").strip())
         if url and not is_allowed_citation_url(url):
             continue
         if not snippet and not url:
             continue
         lines.append(f"{snippet or '引用片段缺失'} ({url or 'N/A'})")
+        if len(lines) >= 2:
+            break
     if not lines:
         return ["无引用"]
     return lines
+
+
+def _evidence_rank(url: str) -> int:
+    parsed = urlparse(str(url or ""))
+    host = str(parsed.netloc or "").lower()
+    path = str(parsed.path or "").lower()
+    if "news.ycombinator.com" in host and "item" in parsed.query:
+        return 95
+    if "arxiv.org" in host or "openreview.net" in host:
+        return 90
+    if "huggingface.co" in host:
+        return 88
+    if "github.com" in host and "/releases/" in path:
+        return 86
+    if "github.com" in host:
+        return 84
+    if "docs" in host or "/docs" in path:
+        return 80
+    if "demo" in host or "demo" in path:
+        return 78
+    return 60
+
+
+def _item_evidence_urls(item: NormalizedItem) -> List[str]:
+    metadata = dict(item.metadata or {})
+    candidates: List[str] = []
+    for raw in list(metadata.get("evidence_links") or []):
+        token = canonicalize_url(str(raw or ""))
+        if token:
+            candidates.append(token)
+    for citation in list(item.citations or []):
+        token = canonicalize_url(str(citation.url or ""))
+        if token:
+            candidates.append(token)
+    item_url = canonicalize_url(str(item.url or ""))
+    if item_url:
+        candidates.append(item_url)
+
+    ranked = []
+    seen = set()
+    for url in candidates:
+        if url in seen or classify_link(url) != "evidence":
+            continue
+        seen.add(url)
+        ranked.append((url, _evidence_rank(url)))
+    ranked.sort(key=lambda pair: pair[1], reverse=True)
+    return [url for url, _score in ranked[:_MAX_EVIDENCE_PER_ITEM]]
 
 
 def _relevance(item: object) -> float | None:
@@ -227,6 +282,9 @@ def generate_onepager(
     ranking_stats = dict(context.get("ranking_stats") or {})
     candidate_count = int(ranking_stats.get("candidate_count", len(normalized_items)) or len(normalized_items))
     filtered_by_relevance = int(ranking_stats.get("filtered_by_relevance", 0) or 0)
+    threshold_used = float(ranking_stats.get("topic_relevance_threshold_used", ranking_stats.get("relevance_threshold", 0.55)) or 0.55)
+    relaxation_steps = int(ranking_stats.get("relaxation_steps", 0) or 0)
+    requested_top_k = int(ranking_stats.get("requested_top_k", len(normalized_items)) or len(normalized_items))
     top_picks_count = len(normalized_items)
     connector_stats_line = json.dumps(connector_stats, ensure_ascii=False, sort_keys=True)
     extraction_stats_line = json.dumps(extraction_stats, ensure_ascii=False, sort_keys=True)
@@ -241,11 +299,20 @@ def generate_onepager(
         f"- CandidateCount: `{candidate_count}`",
         f"- TopPicksCount: `{top_picks_count}`",
         f"- FilteredByRelevance: `{filtered_by_relevance}`",
+        f"- TopicRelevanceThresholdUsed: `{threshold_used:.2f}`",
+        f"- RelevanceRelaxationSteps: `{relaxation_steps}`",
         f"- CitationCount: `{len(citation_list)}`",
         "",
         "## Top Picks",
         "",
     ]
+    if top_picks_count < requested_top_k:
+        lines.extend(
+            [
+                f"> 候选不足：目标 `{requested_top_k}`，实际 `{top_picks_count}`，阈值已放宽到 `{threshold_used:.2f}`。",
+                "",
+            ]
+        )
 
     for idx, item in enumerate(normalized_items, start=1):
         payload = ranked_items[idx - 1]
@@ -282,22 +349,27 @@ def generate_onepager(
             lines.append(f"- {bullet}")
         lines.append("")
 
-    lines.extend(
-        [
-            "## Evidence",
-            "",
-        ]
-    )
-
-    for idx, citation in enumerate(citation_list, start=1):
-        lines.extend(
-            [
-                f"{idx}. {citation.title or 'Untitled'}",
-                f"   - source: `{citation.source or 'unknown'}`",
-                f"   - url: {citation.url or 'N/A'}",
-                f"   - snippet: {citation.snippet or 'N/A'}",
-            ]
-        )
+    lines.extend(["## Evidence", ""])
+    global_evidence = 0
+    for idx, item in enumerate(normalized_items, start=1):
+        urls = _item_evidence_urls(item)
+        if not urls:
+            continue
+        lines.append(f"### Evidence for {item.id}: {item.title}")
+        repeats = 0
+        for url in urls:
+            if global_evidence >= _MAX_EVIDENCE_GLOBAL:
+                break
+            lines.append(f"- {url} (`{_domain(url)}`)")
+            global_evidence += 1
+            repeats += 1
+            if repeats >= _MAX_EVIDENCE_PER_ITEM:
+                break
+        lines.append("")
+        if global_evidence >= _MAX_EVIDENCE_GLOBAL:
+            lines.append(f"> Evidence capped at {_MAX_EVIDENCE_GLOBAL} links for readability.")
+            lines.append("")
+            break
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)

@@ -66,6 +66,7 @@ def test_generate_onepager_thumbnail_and_export_package(tmp_path: Path) -> None:
     assert "WHY NOW｜" in content
     assert "HOW｜" in content
     assert "PROOF｜" in content
+    assert "### Evidence for n_1:" in content
 
     compact_bullets = [line[2:] for line in content.splitlines() if line.startswith("- WHAT｜") or line.startswith("- WHY NOW｜") or line.startswith("- HOW｜") or line.startswith("- PROOF｜") or line.startswith("- CTA｜")]
     assert len(compact_bullets) <= 6

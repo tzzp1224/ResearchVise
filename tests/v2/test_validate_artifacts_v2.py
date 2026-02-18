@@ -42,6 +42,7 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["ranked_items_have_update_signal"] is True
     assert report["checks"]["storyboard_overlay_safe"] is True
     assert report["checks"]["urls_valid"] is True
+    assert report["checks"]["evidence_dedup_ok"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:

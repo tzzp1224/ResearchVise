@@ -1,6 +1,42 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Canonical URLs + Evidence Dedup + Adaptive Relevance + Better Facts (New)
+- 本次目标：
+  - 解决 live 产物中 URL 尾部噪声、tooling 链接误入 citations、Evidence 重复刷屏，以及 Top picks 在高阈值下过少的问题。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py`：
+    - 新增 `canonicalize_url` 与 `classify_link`（`evidence/tooling/asset/blocked/invalid`）。
+    - URL 统一去尾噪声、scheme 归一为 `https`、query 白名单保留；`bun.sh/api.*` 等 tooling 链接默认不可用于 citation/reference。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - `extract_citations` 全链路改为 canonical URL + evidence-only 过滤。
+    - metadata 新增 `evidence_links/tooling_links/asset_links`，为 facts 与 onepager 提供可解释证据输入。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - relevance gate 支持自适应放宽：`0.55 -> ... -> 0.35`（每步 `0.05`），并落盘 `topic_relevance_threshold_used/relaxation_steps/requested_top_k/diversity_sources`。
+    - Top picks 采用 source 多样性软约束选取，避免同源挤占。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager header 新增 `TopicRelevanceThresholdUsed/RelevanceRelaxationSteps`。
+    - Evidence 改为按 item 聚合去重（每 item 上限 4，全局上限 20），并输出“候选不足”提示。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - facts 增加 `metrics`，`what_it_is` 去指标拼接，`why_now` 优先 recency/热度信号，`proof` 至少 2 条可验证事实。
+    - script evidence 与 line references 全部 evidence-only，禁止 tooling 链接回流。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/prompt_compiler.py` 与 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/manager.py`：
+    - prompt `references` 仅保留 evidence URL；本地/asset 素材转入 `seedance_params.render_assets`，渲染侧继续可用。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增 `evidence_dedup_ok`（按 item evidence 分组去重 + 全局重复上限）。
+    - `topic_relevance_ok` 改为读取 `topic_relevance_threshold_used`。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/{sanitize.py,normalize.py,runtime.py,script_generator.py,report_export.py,prompt_compiler.py}`, `render/manager.py`, `scripts/validate_artifacts_v2.py`, `tests/v2/{test_sanitize.py,test_normalize.py,test_prompt_compile.py,test_script_storyboard_prompt.py,test_runtime_integration.py,test_report_export_notification.py,test_validate_artifacts_v2.py}`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知风险与回滚：
+  - 风险：外网不可达时，live 抓取会直接失败（不会回退为 smoke）。
+  - 风险：自适应阈值会改变边界样本排序，可能导致 Top picks 组成变化。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Relevance Hard Gate + URL Validity + Local Asset References (New)
 - 本次目标：
   - 强制 topic relevance 硬门禁，不再把低相关候选补齐进 Top picks。

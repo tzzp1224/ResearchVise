@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 import re
 from typing import Dict, List
 
 from core import PromptSpec, Shot, Storyboard
+from pipeline_v2.sanitize import canonicalize_url, classify_link
 
 
 def consistency_pack(character_id: str, style_id: str) -> Dict[str, str]:
@@ -46,6 +48,29 @@ def compile_shot_prompt(shot: Shot, style_profile: Dict[str, str]) -> PromptSpec
     )
 
     pack = consistency_pack(character_id=char_id, style_id=style_id)
+    render_assets: List[str] = []
+    references: List[str] = []
+    for raw_ref in list(shot.reference_assets or []):
+        token = str(raw_ref or "").strip()
+        if not token:
+            continue
+        if token.startswith(("http://", "https://")):
+            normalized = canonicalize_url(token)
+            category = classify_link(normalized)
+            if category == "evidence" and normalized not in references:
+                references.append(normalized)
+            elif category == "asset" and normalized not in render_assets:
+                render_assets.append(normalized)
+            continue
+        if token.startswith("asset://"):
+            if token not in render_assets:
+                render_assets.append(token)
+            continue
+        # local materialized assets (run_dir/assets/*)
+        if Path(token).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".webm"}:
+            if token not in render_assets:
+                render_assets.append(token)
+
     params = {
         "duration_sec": shot.duration,
         "aspect": str(profile.get("aspect", "9:16")),
@@ -53,9 +78,8 @@ def compile_shot_prompt(shot: Shot, style_profile: Dict[str, str]) -> PromptSpec
         "seed": int(pack["consistency_seed"]),
         "style_id": style_id,
         "character_id": char_id,
+        "render_assets": render_assets[:4],
     }
-
-    references = list(shot.reference_assets or [])
 
     return PromptSpec(
         shot_idx=shot.idx,

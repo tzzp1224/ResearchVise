@@ -188,25 +188,53 @@ class RunPipelineRuntime:
         embeddings = embed(unique_items)
         grouped = cluster(unique_items, embeddings)
         merged = [merge_cluster(group) for group in grouped]
-        relevance_threshold = 0.55 if data_mode == "live" else 0.0
-        ranked = rank_items(
-            merged,
-            topic=request.topic,
-            relevance_threshold=relevance_threshold,
-        )
         top_count = self._top_n(request)
-        relevance_eligible = (
-            [entry for entry in ranked if float(entry.relevance_score) >= float(relevance_threshold)]
-            if float(relevance_threshold) > 0.0
-            else list(ranked)
-        )
-        picks = relevance_eligible[:top_count]
+        base_relevance_threshold = 0.55 if data_mode == "live" else 0.0
+        min_relevance_threshold = 0.35 if float(base_relevance_threshold) > 0.0 else 0.0
+        relevance_threshold = float(base_relevance_threshold)
+        relaxation_steps = 0
+        ranked = []
+        relevance_eligible = []
+        picks = []
+
+        while True:
+            ranked = rank_items(
+                merged,
+                topic=request.topic,
+                relevance_threshold=relevance_threshold,
+            )
+            relevance_eligible = (
+                [entry for entry in ranked if float(entry.relevance_score) >= float(relevance_threshold)]
+                if float(relevance_threshold) > 0.0
+                else list(ranked)
+            )
+            picks = self._select_diverse_top(relevance_eligible, top_count=top_count)
+            if len(picks) >= top_count:
+                break
+            if relevance_threshold <= min_relevance_threshold + 1e-9:
+                break
+            next_threshold = max(min_relevance_threshold, round(relevance_threshold - 0.05, 2))
+            if next_threshold >= relevance_threshold:
+                break
+            relevance_threshold = float(next_threshold)
+            relaxation_steps += 1
+
+        if float(relevance_threshold) < float(base_relevance_threshold):
+            for pick in picks:
+                if float(pick.relevance_score) < float(base_relevance_threshold):
+                    reasons = list(pick.reasons or [])
+                    if "relevance.relaxed_pick" not in reasons:
+                        reasons.append("relevance.relaxed_pick")
+                    pick.reasons = reasons
+
         if not picks:
             raise RuntimeError("no relevant ranked items available")
 
         def _drop_reason(row: Any) -> str:
             reasons = " ".join(str(value) for value in list(getattr(row, "reasons", []) or []))
             lowered = reasons.lower()
+            if "relevance.relaxed_pick" in lowered:
+                return "relaxed_fill"
             if "penalty.relevance" in lowered:
                 return "low_relevance"
             if "penalty.body_len" in lowered or "quality.signal.density=0." in lowered:
@@ -235,6 +263,8 @@ class RunPipelineRuntime:
             comments = int(float((item.metadata or {}).get("comment_count", 0) or 0))
             if points > 0 or comments > 0:
                 chunks.append(f"HN {points}/{comments}")
+            if any(str(reason).strip().lower() == "relevance.relaxed_pick" for reason in list(getattr(row, "reasons", []) or [])):
+                chunks.append("阈值放宽补位")
             return " · ".join(chunks[:3])
 
         picked_ids = {pick.item.id for pick in picks}
@@ -243,9 +273,15 @@ class RunPipelineRuntime:
             "candidate_count": len(ranked),
             "top_picks_count": len(picks),
             "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
+            "requested_top_k": top_count,
             "top_item_ids": [entry.item.id for entry in picks],
             "top_relevance_scores": [round(float(entry.relevance_score), 4) for entry in picks],
             "relevance_threshold": relevance_threshold,
+            "relevance_threshold_base": base_relevance_threshold,
+            "topic_relevance_threshold_used": relevance_threshold,
+            "relaxation_steps": relaxation_steps,
+            "candidate_shortage": len(picks) < top_count,
+            "diversity_sources": sorted({str(entry.item.source or "").strip().lower() for entry in picks if str(entry.item.source or "").strip()}),
             "min_body_len_for_top_picks": 300,
             "top_why_ranked": [_why_ranked(entry) for entry in picks],
             "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
@@ -261,7 +297,17 @@ class RunPipelineRuntime:
         run_context_path = self._write_json(out_dir / "run_context.json", run_context)
 
         self._orchestrator.mark_run_progress(run_id, 0.42)
-        self._orchestrator.append_event(run_id, "ranking_done", f"picked={len(picks)}")
+        self._orchestrator.append_event(
+            run_id,
+            "ranking_done",
+            f"picked={len(picks)} threshold_used={relevance_threshold:.2f} relaxation_steps={relaxation_steps}",
+        )
+        if len(picks) < top_count:
+            self._orchestrator.append_event(
+                run_id,
+                "ranking_shortage",
+                f"requested={top_count} actual={len(picks)} threshold_used={relevance_threshold:.2f}",
+            )
 
         primary = picks[0].item
         duration = self._duration_sec(request)
@@ -710,6 +756,36 @@ class RunPipelineRuntime:
         status = self._orchestrator.get_run_status(run_id)
         if status and status.cancellation_requested:
             raise RunCancelledError("cancellation requested")
+
+    @staticmethod
+    def _select_diverse_top(rows: Sequence[Any], *, top_count: int) -> List[Any]:
+        if top_count <= 0:
+            return []
+        selected: List[Any] = []
+        selected_ids = set()
+        used_sources = set()
+        for row in list(rows or []):
+            source = str((getattr(row, "item", None).source if getattr(row, "item", None) else "") or "").strip().lower()
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+            if not item_id or item_id in selected_ids:
+                continue
+            if source and source in used_sources:
+                continue
+            selected.append(row)
+            selected_ids.add(item_id)
+            if source:
+                used_sources.add(source)
+            if len(selected) >= top_count:
+                return selected
+        for row in list(rows or []):
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+            if not item_id or item_id in selected_ids:
+                continue
+            selected.append(row)
+            selected_ids.add(item_id)
+            if len(selected) >= top_count:
+                break
+        return selected
 
     @staticmethod
     def _top_n(request: RunRequest) -> int:

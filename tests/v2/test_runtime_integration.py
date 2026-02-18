@@ -123,6 +123,75 @@ def _connectors() -> dict:
     }
 
 
+def _relaxed_connectors() -> dict:
+    github_body = ("copilot agent control-plane runtime with mcp sessions, rollback playbook, and deployment metrics. " * 28).strip()
+    hf_body = ("agent workflow toolkit for dataset grounding, eval reports, and model card usage examples. " * 28).strip()
+    hn_body = ("operator postmortem on agent orchestration failures, fixes, and production incident lessons. " * 28).strip()
+
+    async def _github_trending(max_results: int = 12):
+        _ = max_results
+        return [
+            RawItem(
+                id="rel_github",
+                source="github",
+                title="Copilot agent control plane runtime",
+                url="https://github.com/org/agent-control-plane",
+                body=github_body,
+                tier="A",
+                metadata={"stars": 900, "item_type": "repo"},
+            )
+        ]
+
+    async def _github_releases(repo_full_names, max_results_per_repo: int = 1):
+        _ = repo_full_names, max_results_per_repo
+        return []
+
+    async def _hf_trending(max_results: int = 12):
+        _ = max_results
+        return [
+            RawItem(
+                id="rel_hf",
+                source="huggingface",
+                title="Agent workflow toolkit",
+                url="https://huggingface.co/org/agent-toolkit",
+                body=hf_body,
+                tier="A",
+                metadata={"downloads": 5000, "item_type": "model"},
+            )
+        ]
+
+    async def _hn_top(max_results: int = 12):
+        _ = max_results
+        return [
+            RawItem(
+                id="rel_hn",
+                source="hackernews",
+                title="Agent orchestration lessons",
+                url="https://news.ycombinator.com/item?id=42",
+                body=hn_body,
+                tier="A",
+                metadata={"points": 180, "comment_count": 44, "item_type": "story"},
+            )
+        ]
+
+    async def _rss(feed_url: str, max_results: int = 6):
+        _ = feed_url, max_results
+        return []
+
+    async def _web(url: str):
+        _ = url
+        return []
+
+    return {
+        "fetch_github_trending": _github_trending,
+        "fetch_github_releases": _github_releases,
+        "fetch_huggingface_trending": _hf_trending,
+        "fetch_hackernews_top": _hn_top,
+        "fetch_rss_feed": _rss,
+        "fetch_web_article": _web,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -219,3 +288,42 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert bundle_after_render["render_status"]["state"] == "completed"
     mp4_artifact = next(item for item in bundle_after_render["artifacts"] if item["type"] == "mp4")
     assert mp4_artifact["metadata"]["valid_mp4"] is True
+
+
+def test_runtime_adaptive_relevance_relaxation_and_diversity(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_relaxed_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_relaxed",
+            mode=RunMode.ONDEMAND,
+            topic="copilot agent",
+            time_window="24h",
+            tz="UTC",
+            budget={"top_k": 3},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_relaxed:copilot-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+
+    assert int(ranking.get("top_picks_count", 0)) >= 2
+    assert float(ranking.get("topic_relevance_threshold_used", 0.55)) <= 0.55
+    assert int(ranking.get("relaxation_steps", 0)) >= 1
+    assert len(list(ranking.get("diversity_sources") or [])) >= 2
+    assert int(ranking.get("requested_top_k", 0)) == 3
+
+    onepager = (run_dir / "onepager.md").read_text(encoding="utf-8")
+    assert "TopicRelevanceThresholdUsed" in onepager
+    assert "RelevanceRelaxationSteps" in onepager

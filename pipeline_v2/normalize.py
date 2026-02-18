@@ -10,7 +10,13 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from core import Citation, NormalizedItem, RawItem
-from pipeline_v2.sanitize import is_allowed_citation_url, is_valid_http_url, normalize_url, sanitize_markdown
+from pipeline_v2.sanitize import (
+    canonicalize_url,
+    classify_link,
+    is_allowed_citation_url,
+    is_valid_http_url,
+    sanitize_markdown,
+)
 
 
 _TIER_A_SOURCES = {
@@ -55,10 +61,10 @@ def _compact_text(value: Any, max_len: int = 300) -> str:
 def _count_links(body: str, url: str) -> int:
     links = set()
     for link in re.findall(r"https?://[^\s)\]>]+", str(body or "")):
-        token = normalize_url(link)
+        token = canonicalize_url(link)
         if token and is_valid_http_url(token):
             links.add(token)
-    normalized_url = normalize_url(str(url or "").strip())
+    normalized_url = canonicalize_url(str(url or "").strip())
     if normalized_url and is_valid_http_url(normalized_url):
         links.add(normalized_url)
     return len(links)
@@ -110,8 +116,10 @@ def _count_non_badge_images(raw_text: str) -> int:
 
 
 def _is_high_quality_link(url: str) -> bool:
-    value = normalize_url(str(url or "")).lower()
+    value = canonicalize_url(str(url or "")).lower()
     if not is_valid_http_url(value):
+        return False
+    if classify_link(value) != "evidence":
         return False
     host = str(urlparse(value).netloc or "").strip().lower()
     path = str(urlparse(value).path or "").strip().lower()
@@ -128,6 +136,43 @@ def _is_high_quality_link(url: str) -> bool:
     if "docs" in host or "/docs" in path or "paper" in path or "demo" in path:
         return True
     return False
+
+
+def _collect_link_inventory(raw: RawItem) -> Dict[str, List[str]]:
+    urls: List[str] = []
+    body = str(raw.body or "")
+    urls.extend(re.findall(r"https?://[^\s)\]>]+", body))
+    urls.extend(re.findall(r"\((https?://[^)]+)\)", body))
+    if raw.url:
+        urls.append(str(raw.url))
+    for entry in list(dict(raw.metadata or {}).get("citations") or []):
+        if isinstance(entry, dict) and entry.get("url"):
+            urls.append(str(entry.get("url")))
+        elif isinstance(entry, str):
+            urls.append(entry)
+
+    evidence: List[str] = []
+    tooling: List[str] = []
+    assets: List[str] = []
+    seen = set()
+    for raw_url in urls:
+        token = canonicalize_url(raw_url)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        category = classify_link(token)
+        if category == "evidence":
+            evidence.append(token)
+        elif category == "tooling":
+            tooling.append(token)
+        elif category == "asset":
+            assets.append(token)
+
+    return {
+        "evidence": evidence,
+        "tooling": tooling,
+        "assets": assets,
+    }
 
 
 def _to_raw_item(raw: Any) -> RawItem:
@@ -159,7 +204,7 @@ def extract_citations(item: Any) -> List[Citation]:
 
     for entry in list(metadata.get("citations") or []):
         if isinstance(entry, dict):
-            url = normalize_url(str(entry.get("url") or "").strip())
+            url = canonicalize_url(str(entry.get("url") or "").strip())
             if url and not is_allowed_citation_url(url):
                 continue
             citations.append(
@@ -171,7 +216,7 @@ def extract_citations(item: Any) -> List[Citation]:
                 )
             )
         elif isinstance(entry, str) and entry.strip().startswith("http"):
-            url = normalize_url(entry.strip())
+            url = canonicalize_url(entry.strip())
             if not is_allowed_citation_url(url):
                 continue
             citations.append(
@@ -185,7 +230,7 @@ def extract_citations(item: Any) -> List[Citation]:
 
     md_links = re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", body)
     for title, link in md_links:
-        normalized_link = normalize_url(str(link).strip())
+        normalized_link = canonicalize_url(str(link).strip())
         if not is_allowed_citation_url(normalized_link):
             continue
         citations.append(
@@ -199,7 +244,7 @@ def extract_citations(item: Any) -> List[Citation]:
 
     plain_urls = re.findall(r"https?://[^\s)\]>]+", body)
     for link in plain_urls[:6]:
-        normalized_link = normalize_url(str(link).strip())
+        normalized_link = canonicalize_url(str(link).strip())
         if not is_allowed_citation_url(normalized_link):
             continue
         citations.append(
@@ -211,7 +256,7 @@ def extract_citations(item: Any) -> List[Citation]:
             )
         )
 
-    normalized_raw_url = normalize_url(str(raw.url or "").strip())
+    normalized_raw_url = canonicalize_url(str(raw.url or "").strip())
     if normalized_raw_url and is_allowed_citation_url(normalized_raw_url):
         citations.append(
             Citation(
@@ -293,6 +338,7 @@ def normalize(raw: Any) -> NormalizedItem:
     digest = content_hash(item)
     published = _parse_datetime(item.published_at)
     clean_md, clean_text, sanitize_stats = sanitize_markdown(str(item.body or ""))
+    link_inventory = _collect_link_inventory(item)
 
     metadata: Dict[str, Any] = dict(item.metadata or {})
     body_text = str(clean_text or "").strip()
@@ -310,11 +356,13 @@ def normalize(raw: Any) -> NormalizedItem:
     non_badge_images = _count_non_badge_images(str(item.body or ""))
     evidence_quality_links = len(
         {
-            str(citation.url or "").strip()
+            canonicalize_url(str(citation.url or "").strip())
             for citation in list(citations or [])
             if _is_high_quality_link(str(citation.url or "").strip())
         }
     )
+    if link_inventory["evidence"]:
+        evidence_quality_links = max(evidence_quality_links, len([url for url in link_inventory["evidence"] if _is_high_quality_link(url)]))
 
     metadata["credibility"] = _infer_credibility(
         tier=tier,
@@ -348,6 +396,9 @@ def normalize(raw: Any) -> NormalizedItem:
         "update_recency_days": update_recency,
         "evidence_links_quality": int(evidence_quality_links),
     }
+    metadata["evidence_links"] = link_inventory["evidence"][:24]
+    metadata["tooling_links"] = link_inventory["tooling"][:24]
+    metadata["asset_links"] = link_inventory["assets"][:24]
     metadata["clean_text"] = clean_text
     metadata["sanitize"] = sanitize_stats
 
@@ -355,7 +406,7 @@ def normalize(raw: Any) -> NormalizedItem:
         id=str(item.id).strip(),
         source=str(item.source).strip(),
         title=_compact_text(item.title, max_len=220) or "Untitled",
-        url=normalize_url(str(item.url or "").strip()),
+        url=canonicalize_url(str(item.url or "").strip()),
         author=str(item.author).strip() if item.author else None,
         published_at=published,
         body_md=clean_md or body_text,

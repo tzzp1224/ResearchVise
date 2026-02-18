@@ -1123,6 +1123,7 @@ class RenderManager:
             duration = float(spec.seedance_params.get("duration_sec", 4.0) or 4.0)
             scene = str(spec.seedance_params.get("scene", "analysis scene") or "analysis scene")
             overlay = _compact_text(spec.prompt_text, max_len=160) or f"Shot {idx}"
+            render_assets = [str(value).strip() for value in list(spec.seedance_params.get("render_assets") or []) if str(value).strip()]
             shots.append(
                 Shot(
                     idx=idx,
@@ -1132,7 +1133,7 @@ class RenderManager:
                     subject_id=str(spec.seedance_params.get("character_id", "host_01")),
                     action=spec.prompt_text,
                     overlay_text=overlay,
-                    reference_assets=list(spec.references or []),
+                    reference_assets=render_assets or list(spec.references or []),
                 )
             )
 

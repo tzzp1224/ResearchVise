@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pipeline_v2.sanitize import is_allowed_citation_url, is_valid_http_url, normalize_url, sanitize_markdown
+from pipeline_v2.sanitize import canonicalize_url, classify_link, is_allowed_citation_url, is_valid_http_url, normalize_url, sanitize_markdown
 
 
 def test_sanitize_markdown_removes_html_badges_and_promotions() -> None:
@@ -35,5 +35,15 @@ def test_is_allowed_citation_url_applies_denylist() -> None:
 def test_normalize_url_strips_trailing_quotes_and_validates() -> None:
     raw = 'https://example.com/path?x=1"'
     normalized = normalize_url(raw)
-    assert normalized == "https://example.com/path?x=1"
+    assert normalized == "https://example.com/path"
     assert is_valid_http_url(normalized) is True
+
+
+def test_canonicalize_url_removes_json_tail_and_normalizes_scheme() -> None:
+    raw = "http://example.com/a/b?utm_source=x&id=123\"]}"
+    assert canonicalize_url(raw) == "https://example.com/a/b?id=123"
+
+
+def test_classify_link_distinguishes_tooling_and_evidence() -> None:
+    assert classify_link("https://bun.sh/docs/runtime") == "tooling"
+    assert classify_link("https://github.com/org/repo/releases/tag/v1.0.0") == "evidence"
