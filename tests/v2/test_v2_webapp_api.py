@@ -113,6 +113,8 @@ def test_v2_ondemand_run_and_workers(tmp_path: Path) -> None:
     assert render.status_code == 200
     assert render.json()["processed"] is True
     assert render.json()["run_id"] == run_id
+    assert render.json()["valid_mp4"] is True
+    assert render.json()["probe_error"] is None
 
     status_after = client.get(f"/api/v2/runs/{run_id}")
     types = {item["type"] for item in status_after.json()["artifacts"]}
@@ -164,3 +166,4 @@ def test_v2_preview_confirm_final_render_flow(tmp_path: Path) -> None:
     assert final.status_code == 200
     assert final.json()["state"] == "completed"
     assert final.json()["run_id"] == run_id
+    assert final.json()["valid_mp4"] is True

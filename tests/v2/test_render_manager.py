@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 
 from core import PromptSpec, Shot, Storyboard
 from render.adapters import BaseRendererAdapter, ShotRenderResult
@@ -39,6 +41,33 @@ def _prompts() -> list[PromptSpec]:
     ]
 
 
+def _looks_like_mp4(path: Path) -> bool:
+    if not path.exists():
+        return False
+    head = path.read_bytes()[:64]
+    return b"ftyp" in head
+
+
+def _ffprobe_ok(path: Path) -> bool:
+    if not shutil.which("ffprobe"):
+        return _looks_like_mp4(path)
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-show_format",
+            "-show_streams",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0 and "codec_type=video" in proc.stdout
+
+
 def test_render_manager_retries_failed_shot_then_completes(tmp_path: Path) -> None:
     manager = RenderManager(renderer_adapter=FlakyAdapter(fail_once_indices={2}), work_dir=tmp_path)
 
@@ -58,7 +87,11 @@ def test_render_manager_retries_failed_shot_then_completes(tmp_path: Path) -> No
     assert completed.retry_count == 1
     assert completed.failed_shot_indices == []
     assert completed.output_path and completed.output_path.endswith(".mp4")
-    assert Path(completed.output_path).exists()
+    final_path = Path(completed.output_path)
+    assert final_path.exists()
+    assert completed.valid_mp4 is True
+    assert completed.probe_error is None
+    assert _ffprobe_ok(final_path)
 
 
 def test_render_manager_fallback_when_adapter_unavailable(tmp_path: Path) -> None:
@@ -75,7 +108,11 @@ def test_render_manager_fallback_when_adapter_unavailable(tmp_path: Path) -> Non
     assert status.state == "completed"
     assert status.output_path is not None
     assert status.output_path.endswith("fallback_render.mp4")
-    assert Path(status.output_path).exists()
+    fallback_path = Path(status.output_path)
+    assert fallback_path.exists()
+    assert status.valid_mp4 is True
+    assert status.probe_error is None
+    assert _ffprobe_ok(fallback_path)
     assert "seedance_failed_using_fallback" in status.errors
 
     polled = manager.poll_render(render_job_id)
@@ -106,7 +143,9 @@ def test_fallback_render_and_stitch_shots_helpers(tmp_path: Path) -> None:
 
     fallback = manager.fallback_render(board, out_dir=tmp_path)
     assert fallback.endswith(".mp4")
-    assert Path(fallback).exists()
+    fallback_path = Path(fallback)
+    assert fallback_path.exists()
+    assert _ffprobe_ok(fallback_path)
 
     part1 = tmp_path / "part1.mp4"
     part2 = tmp_path / "part2.mp4"
@@ -115,7 +154,9 @@ def test_fallback_render_and_stitch_shots_helpers(tmp_path: Path) -> None:
 
     stitched = manager.stitch_shots([str(part1), str(part2)], out_dir=tmp_path)
     assert stitched.endswith(".mp4")
-    assert Path(stitched).exists()
+    stitched_path = Path(stitched)
+    assert stitched_path.exists()
+    assert _ffprobe_ok(stitched_path)
 
 
 def test_preview_confirm_final_flow(tmp_path: Path) -> None:
@@ -130,6 +171,8 @@ def test_preview_confirm_final_flow(tmp_path: Path) -> None:
     assert preview is not None
     assert preview.state == "awaiting_confirmation"
     assert preview.output_path and preview.output_path.endswith(".mp4")
+    assert preview.valid_mp4 is True
+    assert preview.probe_error is None
 
     approved = manager.confirm_render(render_job_id, approved=True)
     assert approved is not None
@@ -139,6 +182,31 @@ def test_preview_confirm_final_flow(tmp_path: Path) -> None:
     assert final is not None
     assert final.state == "completed"
     assert final.output_path and final.output_path.endswith(".mp4")
+    assert final.valid_mp4 is True
+    assert final.probe_error is None
+    assert _ffprobe_ok(Path(final.output_path))
+
+
+def test_mock_renderer_stitch_ffprobe_passes(tmp_path: Path) -> None:
+    manager = RenderManager(renderer_adapter=FlakyAdapter(), work_dir=tmp_path)
+    rid = manager.enqueue_render(
+        run_id="run_probe",
+        prompt_specs=_prompts(),
+        budget={"max_retries": 1, "max_total_cost": 20.0},
+    )
+    status = manager.process_next()
+    assert status is not None
+    assert status.state == "completed"
+    assert status.output_path
+    out = Path(status.output_path)
+    assert out.exists()
+    assert status.valid_mp4 is True
+    assert status.probe_error is None
+    assert _ffprobe_ok(out)
+
+    polled = manager.poll_render(rid)
+    assert polled is not None
+    assert polled.valid_mp4 is True
 
 
 def test_cancel_render_before_start(tmp_path: Path) -> None:

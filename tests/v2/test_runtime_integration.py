@@ -176,8 +176,12 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert render_status is not None
     assert render_status.state == "completed"
     assert render_status.output_path and Path(render_status.output_path).exists()
+    assert render_status.valid_mp4 is True
+    assert render_status.probe_error is None
 
     bundle_after_render = runtime.get_run_bundle(run_id)
     artifact_types_after = {item["type"] for item in bundle_after_render["artifacts"]}
     assert "mp4" in artifact_types_after
     assert bundle_after_render["render_status"]["state"] == "completed"
+    mp4_artifact = next(item for item in bundle_after_render["artifacts"] if item["type"] == "mp4")
+    assert mp4_artifact["metadata"]["valid_mp4"] is True
