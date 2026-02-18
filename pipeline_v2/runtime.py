@@ -185,18 +185,66 @@ class RunPipelineRuntime:
         embeddings = embed(unique_items)
         grouped = cluster(unique_items, embeddings)
         merged = [merge_cluster(group) for group in grouped]
-        ranked = rank_items(merged, topic=request.topic)
+        relevance_threshold = 0.55 if data_mode == "live" else 0.0
+        ranked = rank_items(
+            merged,
+            topic=request.topic,
+            relevance_threshold=relevance_threshold,
+        )
         top_count = self._top_n(request)
         picks = ranked[:top_count]
         if not picks:
             raise RuntimeError("no ranked items available")
 
+        def _drop_reason(row: Any) -> str:
+            reasons = " ".join(str(value) for value in list(getattr(row, "reasons", []) or []))
+            lowered = reasons.lower()
+            if "penalty.relevance" in lowered:
+                return "low_relevance"
+            if "penalty.body_len" in lowered or "quality.signal.density=0." in lowered:
+                return "low_density"
+            if "penalty.no_evidence_links" in lowered:
+                return "no_evidence_links"
+            if "penalty.too_old" in lowered:
+                return "too_old"
+            if "denylist" in lowered:
+                return "denylisted"
+            return "deprioritized"
+
+        def _why_ranked(row: Any) -> str:
+            item = row.item
+            signals = dict((item.metadata or {}).get("quality_signals") or {})
+            chunks = [f"rel={float(getattr(row, 'relevance_score', 0.0)):.2f}"]
+            recency = signals.get("update_recency_days")
+            if recency not in (None, "", "unknown"):
+                chunks.append(f"更新{float(recency):.1f}d")
+            evidence_links = int(float(signals.get("evidence_links_quality", 0) or 0))
+            if evidence_links > 0:
+                chunks.append(f"证据链{evidence_links}")
+            if bool(signals.get("has_quickstart")):
+                chunks.append("含Quickstart")
+            points = int(float((item.metadata or {}).get("points", 0) or 0))
+            comments = int(float((item.metadata or {}).get("comment_count", 0) or 0))
+            if points > 0 or comments > 0:
+                chunks.append(f"HN {points}/{comments}")
+            return " · ".join(chunks[:3])
+
         run_context["ranking_stats"] = {
             "topic": str(request.topic or "").strip() or None,
             "top_item_ids": [entry.item.id for entry in picks],
             "top_relevance_scores": [round(float(entry.relevance_score), 4) for entry in picks],
-            "relevance_threshold": 0.55,
+            "relevance_threshold": relevance_threshold,
             "min_body_len_for_top_picks": 300,
+            "top_why_ranked": [_why_ranked(entry) for entry in picks],
+            "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
+            "drop_reason_samples": [
+                {
+                    "item_id": entry.item.id,
+                    "title": entry.item.title,
+                    "reason": _drop_reason(entry),
+                }
+                for entry in ranked[top_count : top_count + 3]
+            ],
         }
         run_context_path = self._write_json(out_dir / "run_context.json", run_context)
 

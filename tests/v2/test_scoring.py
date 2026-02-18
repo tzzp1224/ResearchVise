@@ -138,3 +138,40 @@ def test_rank_items_topic_relevance_gate_filters_offtopic_items() -> None:
     ranked = rank_items([unrelated, related], topic="AI agent", relevance_threshold=0.55)
     assert ranked[0].item.id == "a_rel"
     assert any("penalty.relevance_lt_0.55" in reason for reason in ranked[1].reasons)
+
+
+def test_ranking_keeps_relevance_hard_gate_even_with_recency_and_engagement() -> None:
+    related_1 = _item(
+        "rel_1",
+        tier="A",
+        source="github",
+        title="AI agent orchestration runtime",
+        metadata={"stars": 120, "citation_count": 2, "credibility": "high"},
+    )
+    related_2 = _item(
+        "rel_2",
+        tier="A",
+        source="hackernews",
+        title="Agent tools and MCP workflow",
+        metadata={"points": 80, "comment_count": 20, "citation_count": 2, "credibility": "high"},
+    )
+    off_topic_hot = _item(
+        "off_hot",
+        tier="A",
+        source="github",
+        title="VSCode dark islands theme",
+        metadata={
+            "stars": 50000,
+            "points": 9000,
+            "comment_count": 3000,
+            "citation_count": 3,
+            "published_recency": 1.0,
+            "credibility": "high",
+        },
+    )
+
+    ranked = rank_items([off_topic_hot, related_1, related_2], topic="AI agent", relevance_threshold=0.55)
+    top_ids = [row.item.id for row in ranked[:2]]
+    assert "off_hot" not in top_ids
+    off = next(row for row in ranked if row.item.id == "off_hot")
+    assert any(reason.startswith("penalty.relevance_lt_0.55") for reason in off.reasons)

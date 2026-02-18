@@ -80,3 +80,31 @@ def test_content_hash_is_stable() -> None:
     h1 = content_hash(raw)
     h2 = content_hash(raw)
     assert h1 == h2
+
+
+def test_quality_signals_extracted_github_like_item() -> None:
+    raw = RawItem(
+        id="gh_quality",
+        source="github",
+        title="acme/agent-runner",
+        url="https://github.com/acme/agent-runner",
+        body=(
+            "# Agent Runner\n"
+            "Quickstart: install via pip and run `agent-run --demo`.\n"
+            "## Results\n"
+            "Benchmark shows 28% lower latency with multi-agent routing.\n"
+            "![demo](https://raw.githubusercontent.com/acme/agent-runner/main/assets/demo.png)\n"
+        ),
+        author="acme",
+        published_at="2026-02-16T10:00:00Z",
+        metadata={"last_push": "2026-02-17T11:30:00Z"},
+    )
+
+    item = normalize(raw)
+    signals = dict(item.metadata.get("quality_signals") or {})
+    assert float(signals.get("content_density", 0.0)) > 0.05
+    assert bool(signals.get("has_quickstart")) is True
+    assert bool(signals.get("has_results_or_bench")) is True
+    assert bool(signals.get("has_images_non_badge")) is True
+    assert str(signals.get("publish_or_update_time") or "").startswith("2026-02-17")
+    assert signals.get("update_recency_days") is not None

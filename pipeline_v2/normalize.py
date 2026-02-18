@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import hashlib
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from core import Citation, NormalizedItem, RawItem
 from pipeline_v2.sanitize import is_allowed_citation_url, sanitize_markdown
@@ -20,6 +22,10 @@ _TIER_A_SOURCES = {
     "openreview",
     "arxiv_rss",
 }
+_SG_TZ = ZoneInfo("Asia/Singapore")
+_QUICKSTART_MARKERS = ("quickstart", "getting started", "install", "installation", "usage", "run ")
+_BENCH_MARKERS = ("benchmark", "result", "eval", "evaluation", "metric", "latency", "throughput", "accuracy")
+_IMAGE_URL_RE = re.compile(r"(https?://[^\s)\"'>]+?\.(?:png|jpg|jpeg|gif|webp|svg))", re.IGNORECASE)
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -63,6 +69,64 @@ def _published_recency_days(published: Optional[datetime]) -> Optional[float]:
     dt = published if published.tzinfo else published.replace(tzinfo=timezone.utc)
     age_days = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
     return round(age_days, 2)
+
+
+def _publish_or_update_time(item: RawItem, metadata: Dict[str, Any]) -> Optional[datetime]:
+    candidates = [
+        metadata.get("publish_or_update_time"),
+        metadata.get("last_push"),
+        metadata.get("updated_at"),
+        metadata.get("pushed_at"),
+        metadata.get("last_modified"),
+        metadata.get("release_published_at"),
+        metadata.get("published_at"),
+        item.published_at,
+    ]
+    for candidate in candidates:
+        parsed = _parse_datetime(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _update_recency_days(dt: Optional[datetime]) -> Optional[float]:
+    if dt is None:
+        return None
+    target = dt.astimezone(_SG_TZ) if dt.tzinfo else dt.replace(tzinfo=timezone.utc).astimezone(_SG_TZ)
+    now = datetime.now(_SG_TZ)
+    delta = max(0.0, (now - target).total_seconds() / 86400.0)
+    return round(delta, 2)
+
+
+def _count_non_badge_images(raw_text: str) -> int:
+    count = 0
+    for url in _IMAGE_URL_RE.findall(str(raw_text or "")):
+        lowered = str(url).lower()
+        if "img.shields.io" in lowered or "badge" in lowered:
+            continue
+        count += 1
+    return count
+
+
+def _is_high_quality_link(url: str) -> bool:
+    value = str(url or "").strip().lower()
+    if not value.startswith("http"):
+        return False
+    host = str(urlparse(value).netloc or "").strip().lower()
+    path = str(urlparse(value).path or "").strip().lower()
+    if not host:
+        return False
+    if host in {"img.shields.io", "buymeacoffee.com", "github.com"} and "/sponsors" in value:
+        return False
+    if host in {"github.com", "www.github.com"}:
+        return "/issues/" in path or "/releases/" in path or path.count("/") >= 2
+    if host.endswith("huggingface.co") or host.endswith("arxiv.org") or host.endswith("openreview.net"):
+        return True
+    if host in {"news.ycombinator.com"} and "item?id=" in value:
+        return True
+    if "docs" in host or "/docs" in path or "paper" in path or "demo" in path:
+        return True
+    return False
 
 
 def _to_raw_item(raw: Any) -> RawItem:
@@ -231,6 +295,22 @@ def normalize(raw: Any) -> NormalizedItem:
     body_len = len(re.sub(r"\s+", " ", body_text))
     link_count = max(_count_links(body_text, str(item.url or "")), len(citations))
     published_recency = _published_recency_days(published)
+    publish_or_update = _publish_or_update_time(item, metadata)
+    update_recency = _update_recency_days(publish_or_update)
+    raw_len = int(float((sanitize_stats or {}).get("raw_len", 0) or 0))
+    clean_len = int(float((sanitize_stats or {}).get("clean_len", len(body_text)) or 0))
+    content_density = round(float(clean_len) / float(max(1, raw_len)), 4)
+    lowered_body = body_text.lower()
+    quickstart = any(marker in lowered_body for marker in _QUICKSTART_MARKERS)
+    has_bench = any(marker in lowered_body for marker in _BENCH_MARKERS)
+    non_badge_images = _count_non_badge_images(str(item.body or ""))
+    evidence_quality_links = len(
+        {
+            str(citation.url or "").strip()
+            for citation in list(citations or [])
+            if _is_high_quality_link(str(citation.url or "").strip())
+        }
+    )
 
     metadata["credibility"] = _infer_credibility(
         tier=tier,
@@ -251,6 +331,18 @@ def normalize(raw: Any) -> NormalizedItem:
         "citation_count": len(citations),
         "published_recency": published_recency,
         "link_count": link_count,
+    }
+    metadata["publish_or_update_time"] = publish_or_update.isoformat() if publish_or_update else None
+    metadata["update_recency_days"] = update_recency
+    metadata["quality_signals"] = {
+        "content_density": content_density,
+        "has_quickstart": bool(quickstart),
+        "has_results_or_bench": bool(has_bench),
+        "has_images_non_badge": bool(non_badge_images > 0),
+        "images_non_badge_count": int(non_badge_images),
+        "publish_or_update_time": metadata["publish_or_update_time"],
+        "update_recency_days": update_recency,
+        "evidence_links_quality": int(evidence_quality_links),
     }
     metadata["clean_text"] = clean_text
     metadata["sanitize"] = sanitize_stats

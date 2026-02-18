@@ -37,6 +37,66 @@ def _quality_metrics(item: NormalizedItem) -> Tuple[int, int, Optional[float], i
     return body_len, citation_count, published_recency, link_count
 
 
+def _quality_signals(item: NormalizedItem) -> Dict[str, object]:
+    metadata = dict(item.metadata or {})
+    payload = dict(metadata.get("quality_signals") or {})
+    return {
+        "content_density": _to_float(payload.get("content_density"), 0.0),
+        "has_quickstart": bool(payload.get("has_quickstart")),
+        "has_results_or_bench": bool(payload.get("has_results_or_bench")),
+        "has_images_non_badge": bool(payload.get("has_images_non_badge")),
+        "evidence_links_quality": int(_to_float(payload.get("evidence_links_quality"), 0)),
+        "update_recency_days": (
+            None
+            if payload.get("update_recency_days") in (None, "", "unknown")
+            else _to_float(payload.get("update_recency_days"))
+        ),
+        "publish_or_update_time": payload.get("publish_or_update_time"),
+    }
+
+
+def _quality_signal_boost(item: NormalizedItem) -> float:
+    signals = _quality_signals(item)
+    boost = 0.0
+
+    density = float(signals["content_density"])
+    if density >= 0.2:
+        boost += 0.05
+    elif density >= 0.12:
+        boost += 0.02
+    else:
+        boost -= 0.03
+
+    if bool(signals["has_quickstart"]):
+        boost += 0.03
+    if bool(signals["has_results_or_bench"]):
+        boost += 0.03
+    if bool(signals["has_images_non_badge"]):
+        boost += 0.02
+
+    evidence_links = int(signals["evidence_links_quality"])
+    if evidence_links >= 3:
+        boost += 0.06
+    elif evidence_links >= 1:
+        boost += 0.03
+    else:
+        boost -= 0.04
+
+    recency = signals["update_recency_days"]
+    if recency is None:
+        boost -= 0.02
+    else:
+        recency_value = float(recency)
+        if recency_value <= 7:
+            boost += 0.06
+        elif recency_value <= 30:
+            boost += 0.03
+        elif recency_value >= 120:
+            boost -= 0.05
+
+    return max(-0.15, min(0.2, boost))
+
+
 _TOPIC_STOP_WORDS = {
     "the",
     "a",
@@ -227,7 +287,8 @@ def rank_items(
             or (short_announcement and citation_count >= 1 and link_count >= 1)
         )
         relevance_score = score_relevance(item, topic)
-        relevance_eligible = bool(relevance_score >= float(relevance_threshold))
+        gate_on_relevance = bool(topic and float(relevance_threshold) > 0.0)
+        relevance_eligible = bool(relevance_score >= float(relevance_threshold)) if gate_on_relevance else True
 
         scores = {
             "novelty": score_novelty(item),
@@ -237,6 +298,7 @@ def rank_items(
         }
         total = _weighted_total(scores)
         total = _clamp01(total * (0.5 + 0.5 * relevance_score))
+        quality_boost = _quality_signal_boost(item)
 
         if citation_count <= 0:
             total = _clamp01(total * 0.76)
@@ -244,8 +306,10 @@ def rank_items(
             total = _clamp01(total * 0.82)
         if not quality_eligible:
             total = _clamp01(total * 0.72)
-        if topic and not relevance_eligible:
+        if gate_on_relevance and not relevance_eligible:
             total = _clamp01(total * 0.45)
+        else:
+            total = _clamp01(total + quality_boost)
 
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
@@ -266,6 +330,7 @@ def rank_items(
                 short_announcement,
                 relevance_score,
                 relevance_eligible,
+                quality_boost,
             )
         )
 
@@ -289,8 +354,9 @@ def rank_items(
             _short_announcement,
             relevance_score,
             relevance_eligible,
+            _quality_boost,
         ) = row
-        if topic and not relevance_eligible:
+        if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
             continue
         if not quality_eligible:
@@ -315,6 +381,7 @@ def rank_items(
         short_announcement,
         relevance_score,
         relevance_eligible,
+        quality_boost,
     ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -329,7 +396,21 @@ def rank_items(
             f"quality.link_count={link_count}",
             f"quality.top_pick_gate={'pass' if quality_eligible else 'deferred'}",
             f"quality.relevance_gate={'pass' if relevance_eligible else 'deferred'}",
+            f"quality.boost={quality_boost:.2f}",
         ]
+        signals = _quality_signals(item)
+        reasons.extend(
+            [
+                f"quality.signal.density={float(signals['content_density']):.3f}",
+                f"quality.signal.quickstart={bool(signals['has_quickstart'])}",
+                f"quality.signal.results={bool(signals['has_results_or_bench'])}",
+                f"quality.signal.evidence_links={int(signals['evidence_links_quality'])}",
+                (
+                    "quality.signal.update_recency_days="
+                    f"{signals['update_recency_days'] if signals['update_recency_days'] is not None else 'unknown'}"
+                ),
+            ]
+        )
         if short_announcement:
             reasons.append("quality.short_announcement=true")
         if citation_count <= 0:
@@ -338,8 +419,12 @@ def rank_items(
             reasons.append("penalty.missing_published_time")
         if not quality_eligible:
             reasons.append(f"penalty.body_len_lt_{int(min_body_len_for_top_picks)}")
-        if topic and not relevance_eligible:
+        if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             reasons.append(f"penalty.relevance_lt_{float(relevance_threshold):.2f}")
+        if int(signals["evidence_links_quality"]) <= 0:
+            reasons.append("penalty.no_evidence_links")
+        if signals["update_recency_days"] is not None and float(signals["update_recency_days"]) >= 120:
+            reasons.append("penalty.too_old")
         if item.tier == "B" and idx <= 3 and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             reasons.append("tier_b_top3_override=talkability")
 

@@ -1,6 +1,34 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Deep Extraction Signals & Ranking Stability (New)
+- 本次目标：
+  - 把 live 候选的“正文密度/更新时间/证据质量”做成结构化信号。
+  - 在 relevance 硬门禁后引入可解释 quality boost，减少跑题与空壳内容。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - 新增 `quality_signals`：`content_density/has_quickstart/has_results_or_bench/has_images_non_badge/publish_or_update_time/update_recency_days/evidence_links_quality`。
+    - 更新时间统一产出 `publish_or_update_time`（ISO）并按 `Asia/Singapore` 计算 `update_recency_days`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - relevance 继续硬门禁（live 默认阈值 0.55）。
+    - relevance 通过后引入 `quality_signal_boost`（density/quickstart/results/evidence/recency）。
+    - reasons 增加 quality signals 与 `penalty.no_evidence_links/penalty.too_old`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - `run_context.ranking_stats` 新增：`top_quality_signals/top_why_ranked/drop_reason_samples`。
+  - 修改测试：
+    - `tests/v2/test_normalize.py` 新增 github-like 质量信号抽取断言。
+    - `tests/v2/test_scoring.py` 新增“高热度但低相关不得进 Top picks”硬门禁回归。
+    - `tests/v2/test_runtime_integration.py` 断言 `drop_reason_samples/top_quality_signals` 已落盘。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/normalize.py`, `pipeline_v2/scoring.py`, `pipeline_v2/runtime.py`, `tests/v2/test_normalize.py`, `tests/v2/test_scoring.py`, `tests/v2/test_runtime_integration.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_quality_signals > /tmp/ara_v2_quality_signals/result.json`
+- 已知风险与回滚：
+  - 风险：quality boost 可能在边界样本上改变排序顺序（预期行为，已保留 relevance 硬门禁）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Sanitize + Relevance Gate + Facts-Driven Script (New)
 - 本次目标：
   - 消除 live 产物中的 README HTML/badge/赞助链接污染。
