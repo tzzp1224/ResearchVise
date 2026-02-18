@@ -29,3 +29,4 @@ def test_is_allowed_citation_url_applies_denylist() -> None:
     assert is_allowed_citation_url("https://github.com/sponsors/foo") is False
     assert is_allowed_citation_url("https://buymeacoffee.com/foo") is False
     assert is_allowed_citation_url("https://example.com/chart.svg") is False
+    assert is_allowed_citation_url("https://[invalid") is False

@@ -43,7 +43,10 @@ def _normalize_url(url: str) -> str:
 
 
 def _hostname(url: str) -> str:
-    parsed = urlparse(_normalize_url(url))
+    try:
+        parsed = urlparse(_normalize_url(url))
+    except ValueError:
+        return ""
     host = str(parsed.netloc or "").strip().lower()
     if host.startswith("www."):
         host = host[4:]

@@ -1,6 +1,24 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: URL Parse Guard for Validator Crash (Hotfix)
+- 本次目标：
+  - 修复 `run-once` 内置 validator 因畸形 URL 崩溃的问题（`Invalid IPv6 URL`）。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py`：
+    - `_hostname()` 对 `urlparse` 的 `ValueError` 做容错，解析失败返回空 host 并判定为不合规 URL。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_sanitize.py`：
+    - 新增 `https://[invalid` 回归用例，确保不抛异常且返回 `False`。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/sanitize.py`, `tests/v2/test_sanitize.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2/test_sanitize.py tests/v2/test_validate_artifacts_v2.py`
+  - `python main.py run-once --mode smoke --topic \"AI agent\" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3`
+- 已知风险与回滚：
+  - 风险：畸形 URL 会被静默过滤，不再进入 citations（预期行为）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Compact Onepager Compiler & Live Quality Gates (New)
 - 本次目标：
   - 将 onepager 从“报告式长句”压缩为“可发布短句”（短、狠、可口播）。
