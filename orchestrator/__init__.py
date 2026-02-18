@@ -5,7 +5,9 @@ from .service import (
     cancel_run,
     enqueue_run,
     get_default_orchestrator,
+    get_render_job,
     get_run_status,
+    list_artifacts,
     schedule_daily_digest,
 )
 
@@ -14,6 +16,8 @@ __all__ = [
     "cancel_run",
     "enqueue_run",
     "get_default_orchestrator",
+    "get_render_job",
     "get_run_status",
+    "list_artifacts",
     "schedule_daily_digest",
 ]

@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from core import RunRequest, RunStatus
+from core import Artifact, RunRequest, RunStatus
 from .queue import InMemoryRunQueue
 from .store import InMemoryRunStore
 
@@ -90,6 +90,9 @@ class RunOrchestrator:
     def mark_run_failed(self, run_id: str, error: str) -> Optional[RunStatus]:
         return self._store.update_failed(run_id, error)
 
+    def mark_run_canceled(self, run_id: str, error: Optional[str] = None) -> Optional[RunStatus]:
+        return self._store.update_canceled(run_id, error=error)
+
     def retry_run(self, run_id: str) -> bool:
         """Requeue failed run if retry budget allows."""
         status = self._store.mark_retrying(run_id)
@@ -98,6 +101,24 @@ class RunOrchestrator:
         if status.retry_count > status.max_retries:
             return False
         return self._queue.enqueue(run_id)
+
+    def add_artifact(self, run_id: str, artifact: Artifact) -> bool:
+        return self._store.add_artifact(run_id, artifact)
+
+    def list_artifacts(self, run_id: str) -> List[Artifact]:
+        return self._store.list_artifacts(run_id)
+
+    def set_render_job(self, run_id: str, render_job_id: str) -> bool:
+        return self._store.set_render_job(run_id, render_job_id)
+
+    def get_render_job(self, run_id: str) -> Optional[str]:
+        return self._store.get_render_job(run_id)
+
+    def append_event(self, run_id: str, event: str, message: str) -> bool:
+        return self._store.append_event(run_id, event, message)
+
+    def list_events(self, run_id: str) -> List[Dict[str, str]]:
+        return self._store.list_events(run_id)
 
 
 _DEFAULT_ORCHESTRATOR = RunOrchestrator()
@@ -125,3 +146,11 @@ def get_run_status(run_id: str) -> Optional[RunStatus]:
 def cancel_run(run_id: str) -> bool:
     """Top-level API required by PRD module A."""
     return _DEFAULT_ORCHESTRATOR.cancel_run(run_id)
+
+
+def list_artifacts(run_id: str) -> List[Artifact]:
+    return _DEFAULT_ORCHESTRATOR.list_artifacts(run_id)
+
+
+def get_render_job(run_id: str) -> Optional[str]:
+    return _DEFAULT_ORCHESTRATOR.get_render_job(run_id)

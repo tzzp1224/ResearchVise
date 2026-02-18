@@ -1,0 +1,448 @@
+"""End-to-end v2 pipeline runtime from RunRequest to artifacts."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import inspect
+import json
+import logging
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
+
+from core import Artifact, ArtifactType, RawItem, RenderStatus, RunMode, RunRequest
+from orchestrator import RunOrchestrator
+from pipeline_v2.dedup_cluster import cluster, dedup_exact, embed, merge_cluster
+from pipeline_v2.normalize import normalize
+from pipeline_v2.notification import notify_user, post_to_web, send_email
+from pipeline_v2.prompt_compiler import compile_storyboard
+from pipeline_v2.report_export import export_package, generate_onepager, generate_thumbnail
+from pipeline_v2.scoring import rank_items
+from pipeline_v2.script_generator import generate_script
+from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
+from render import align_subtitles, mix_bgm, tts_generate
+from render.manager import RenderManager
+from sources import connectors
+
+
+logger = logging.getLogger(__name__)
+
+ConnectorFunc = Callable[..., Any]
+
+
+class RunCancelledError(RuntimeError):
+    """Raised when cancellation has been requested for an active run."""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _to_jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")  # type: ignore[no-any-return]
+    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+@dataclass
+class RunExecutionResult:
+    run_id: str
+    output_dir: str
+    top_item_ids: List[str]
+    render_job_id: Optional[str]
+
+
+class RunPipelineRuntime:
+    """Worker runtime that executes queued runs and dispatches render jobs."""
+
+    def __init__(
+        self,
+        *,
+        orchestrator: RunOrchestrator,
+        render_manager: Optional[RenderManager] = None,
+        output_root: str | Path = "data/outputs/v2_runs",
+        connector_overrides: Optional[Mapping[str, ConnectorFunc]] = None,
+    ) -> None:
+        self._orchestrator = orchestrator
+        self._render_manager = render_manager or RenderManager()
+        self._output_root = Path(output_root)
+        self._output_root.mkdir(parents=True, exist_ok=True)
+        self._connector_overrides = dict(connector_overrides or {})
+
+    def run_next(self) -> Optional[RunExecutionResult]:
+        """Process one queued run request end-to-end (excluding render worker)."""
+        picked = self._orchestrator.dequeue_next_run()
+        if not picked:
+            return None
+        run_id, request = picked
+        logger.info("run_start run_id=%s mode=%s", run_id, request.mode.value)
+
+        try:
+            result = asyncio.run(self._execute_run(run_id, request))
+            self._orchestrator.mark_run_completed(run_id)
+            self._orchestrator.append_event(run_id, "run_completed", "Run completed successfully")
+            logger.info("run_completed run_id=%s", run_id)
+            return result
+        except RunCancelledError as exc:
+            self._orchestrator.mark_run_canceled(run_id, str(exc))
+            self._orchestrator.append_event(run_id, "run_canceled", str(exc))
+            logger.info("run_canceled run_id=%s reason=%s", run_id, exc)
+            return None
+        except Exception as exc:
+            self._orchestrator.mark_run_failed(run_id, str(exc))
+            self._orchestrator.append_event(run_id, "run_failed", str(exc))
+            logger.exception("run_failed run_id=%s error=%s", run_id, exc)
+            return None
+
+    def process_next_render(self) -> Optional[RenderStatus]:
+        """Process one queued render job and attach MP4 artifact to its run."""
+        status = self._render_manager.process_next()
+        if not status:
+            return None
+        if status.output_path:
+            self._record_artifact(
+                status.run_id,
+                Artifact(
+                    type=ArtifactType.MP4,
+                    path=status.output_path,
+                    metadata={
+                        "render_job_id": status.render_job_id,
+                        "retry_count": status.retry_count,
+                        "failed_shot_indices": list(status.failed_shot_indices or []),
+                    },
+                ),
+            )
+        self._orchestrator.append_event(
+            status.run_id,
+            "render_completed",
+            f"render_job_id={status.render_job_id} output={status.output_path or ''}",
+        )
+        return status
+
+    def get_run_bundle(self, run_id: str) -> Dict[str, Any]:
+        """Get status + artifacts + render state bundle for API responses."""
+        status = self._orchestrator.get_run_status(run_id)
+        artifacts = self._orchestrator.list_artifacts(run_id)
+        events = self._orchestrator.list_events(run_id)
+        render_job_id = self._orchestrator.get_render_job(run_id)
+        render_status = self._render_manager.poll_render(render_job_id) if render_job_id else None
+        return {
+            "run_id": run_id,
+            "status": status.model_dump(mode="json") if status else None,
+            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+            "events": events,
+            "render_job_id": render_job_id,
+            "render_status": render_status.model_dump(mode="json") if render_status else None,
+        }
+
+    async def _execute_run(self, run_id: str, request: RunRequest) -> RunExecutionResult:
+        self._ensure_not_canceled(run_id)
+        out_dir = self._output_root / run_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._orchestrator.append_event(run_id, "run_started", f"output_dir={out_dir}")
+
+        raw_items = await self._collect_raw_items(request)
+        self._orchestrator.mark_run_progress(run_id, 0.18)
+        self._orchestrator.append_event(run_id, "ingest_done", f"raw_items={len(raw_items)}")
+        self._ensure_not_canceled(run_id)
+
+        normalized = [normalize(item) for item in raw_items]
+        unique_items = dedup_exact(normalized)
+        embeddings = embed(unique_items)
+        grouped = cluster(unique_items, embeddings)
+        merged = [merge_cluster(group) for group in grouped]
+        ranked = rank_items(merged)
+        top_count = self._top_n(request)
+        picks = ranked[:top_count]
+        if not picks:
+            raise RuntimeError("no ranked items available")
+
+        self._orchestrator.mark_run_progress(run_id, 0.42)
+        self._orchestrator.append_event(run_id, "ranking_done", f"picked={len(picks)}")
+
+        primary = picks[0].item
+        duration = self._duration_sec(request)
+        script = generate_script(
+            primary,
+            duration_sec=duration,
+            platform=self._platform(request),
+            tone=self._tone(request),
+        )
+        script_path = self._write_json(out_dir / "script.json", script)
+        self._record_artifact(run_id, Artifact(type=ArtifactType.SCRIPT, path=script_path, metadata={"item_id": primary.id}))
+        self._ensure_not_canceled(run_id)
+
+        board = script_to_storyboard(
+            script,
+            {
+                "run_id": run_id,
+                "item_id": primary.id,
+                "aspect": "9:16",
+                "min_shots": 5,
+                "max_shots": 8,
+            },
+        )
+        valid, errors = validate_storyboard(board)
+        if not valid:
+            board, fixes = auto_fix_storyboard(board)
+            valid2, errors2 = validate_storyboard(board)
+            if not valid2:
+                raise RuntimeError(f"storyboard validation failed: {errors2}")
+            self._orchestrator.append_event(run_id, "storyboard_autofix", ",".join(fixes))
+            if errors:
+                self._orchestrator.append_event(run_id, "storyboard_errors", " | ".join(errors))
+
+        board_path = self._write_json(out_dir / "storyboard.json", board.model_dump(mode="json"))
+        prompt_specs = compile_storyboard(board, style_profile=self._style_profile(request))
+        prompt_bundle_path = self._write_json(
+            out_dir / "prompt_bundle.json",
+            [spec.model_dump(mode="json") for spec in prompt_specs],
+        )
+        materials_path = self._write_json(
+            out_dir / "materials.json",
+            {
+                "run_id": run_id,
+                "item_id": primary.id,
+                "sources": [
+                    {
+                        "title": citation.title,
+                        "url": citation.url,
+                        "source": citation.source,
+                    }
+                    for citation in primary.citations
+                ],
+                "top_item_ids": [entry.item.id for entry in picks],
+            },
+        )
+        self._record_artifact(
+            run_id,
+            Artifact(
+                type=ArtifactType.STORYBOARD,
+                path=board_path,
+                metadata={
+                    "prompt_bundle_path": prompt_bundle_path,
+                    "materials_path": materials_path,
+                    "shots": len(board.shots),
+                },
+            ),
+        )
+        self._orchestrator.mark_run_progress(run_id, 0.63)
+        self._orchestrator.append_event(run_id, "script_stage_done", f"duration={duration}s shots={len(board.shots)}")
+        self._ensure_not_canceled(run_id)
+
+        onepager_path = generate_onepager(picks, primary.citations, out_dir=out_dir)
+        thumbnail_path = generate_thumbnail(
+            primary.title,
+            [entry.item.title for entry in picks[1:4]],
+            {"fg": "#0b1320", "bg": "#e6eef8", "accent": "#0f766e"},
+            out_dir=out_dir,
+        )
+        self._record_artifact(
+            run_id,
+            Artifact(
+                type=ArtifactType.ONEPAGER,
+                path=onepager_path,
+                metadata={"top_count": len(picks), "prompt_bundle_path": prompt_bundle_path, "materials_path": materials_path},
+            ),
+        )
+        self._record_artifact(run_id, Artifact(type=ArtifactType.THUMBNAIL, path=thumbnail_path, metadata={}))
+
+        audio_path = tts_generate(script, {"voice": self._voice(request), "out_dir": str(out_dir)})
+        srt_path = align_subtitles({**script, "output_dir": str(out_dir)}, audio_path)
+        mixed_audio = mix_bgm(audio_path, {"out_dir": str(out_dir)})
+        self._record_artifact(run_id, Artifact(type=ArtifactType.AUDIO, path=mixed_audio, metadata={"raw_audio_path": audio_path}))
+        self._record_artifact(run_id, Artifact(type=ArtifactType.SRT, path=srt_path, metadata={}))
+
+        self._orchestrator.mark_run_progress(run_id, 0.82)
+        self._orchestrator.append_event(run_id, "postprocess_done", "audio + subtitles generated")
+        self._ensure_not_canceled(run_id)
+
+        render_job_id: Optional[str] = None
+        if self._should_render(request):
+            render_job_id = self._render_manager.enqueue_render(
+                run_id,
+                prompt_specs,
+                budget=self._render_budget(request),
+            )
+            self._orchestrator.set_render_job(run_id, render_job_id)
+            self._orchestrator.append_event(run_id, "render_enqueued", f"render_job_id={render_job_id}")
+        else:
+            self._orchestrator.append_event(run_id, "render_skipped", "render disabled by request")
+
+        artifacts = self._orchestrator.list_artifacts(run_id)
+        package_path = export_package(out_dir, artifacts, package_name=f"{run_id}_package")
+        self._record_artifact(
+            run_id,
+            Artifact(type=ArtifactType.ZIP, path=package_path, metadata={"artifact_count": len(artifacts)}),
+        )
+
+        payload = {
+            "run_id": run_id,
+            "status": "completed",
+            "top_item": primary.title,
+            "render_job_id": render_job_id,
+        }
+        notify_user(request.user_id, f"Run {run_id} completed", out_dir=out_dir)
+        if "web" in [str(item).lower() for item in list(request.output_targets or [])]:
+            post_to_web(run_id, payload, out_dir=out_dir)
+        email_to = str((request.budget or {}).get("email") or "").strip()
+        if email_to:
+            send_email(email_to, f"Run {run_id} completed", json.dumps(payload, ensure_ascii=False), out_dir=out_dir)
+
+        self._orchestrator.mark_run_progress(run_id, 0.99)
+        return RunExecutionResult(
+            run_id=run_id,
+            output_dir=str(out_dir),
+            top_item_ids=[entry.item.id for entry in picks],
+            render_job_id=render_job_id,
+        )
+
+    async def _collect_raw_items(self, request: RunRequest) -> List[RawItem]:
+        tasks: List[Awaitable[List[RawItem]]] = [
+            self._invoke_connector("fetch_github_trending", max_results=12),
+            self._invoke_connector("fetch_huggingface_trending", max_results=12),
+            self._invoke_connector("fetch_hackernews_top", max_results=12),
+        ]
+        tier_a_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        raw_items: List[RawItem] = []
+        for result in tier_a_results:
+            if isinstance(result, Exception):
+                continue
+            raw_items.extend(list(result or []))
+
+        repo_names = [
+            str(item.title).strip()
+            for item in raw_items
+            if item.source == "github" and "/" in str(item.title)
+        ][:3]
+        if repo_names:
+            try:
+                releases = await self._invoke_connector(
+                    "fetch_github_releases",
+                    repo_full_names=repo_names,
+                    max_results_per_repo=1,
+                )
+                raw_items.extend(releases)
+            except Exception:
+                pass
+
+        include_tier_b = bool((request.budget or {}).get("include_tier_b", True))
+        if include_tier_b:
+            feed_urls = list((request.budget or {}).get("rss_feeds") or [])
+            for feed_url in feed_urls[:2]:
+                try:
+                    raw_items.extend(await self._invoke_connector("fetch_rss_feed", feed_url=feed_url, max_results=6))
+                except Exception:
+                    continue
+
+            seed_url = str((request.budget or {}).get("seed_url") or "").strip()
+            if seed_url:
+                try:
+                    raw_items.extend(await self._invoke_connector("fetch_web_article", url=seed_url))
+                except Exception:
+                    pass
+
+        if not raw_items:
+            raw_items.append(self._synthetic_item(request))
+        return raw_items
+
+    async def _invoke_connector(self, name: str, /, **kwargs: Any) -> List[RawItem]:
+        fn = self._connector_overrides.get(name) or getattr(connectors, name)
+        value = fn(**kwargs)
+        if inspect.isawaitable(value):
+            value = await value
+        return [item if isinstance(item, RawItem) else RawItem(**item) for item in list(value or [])]
+
+    def _synthetic_item(self, request: RunRequest) -> RawItem:
+        topic = str(request.topic or "research update").strip()
+        seed = hashlib.sha1(topic.encode("utf-8")).hexdigest()[:12]
+        return RawItem(
+            id=f"synthetic_{seed}",
+            source="web_article",
+            title=f"{topic} synthetic fallback",
+            url="https://example.local/synthetic",
+            body=f"Synthetic content for {topic}. Includes architecture, benchmark, and deployment notes.",
+            author="system",
+            published_at=_utcnow(),
+            tier="B",
+            metadata={"item_type": "synthetic_fallback", "credibility": "low"},
+        )
+
+    @staticmethod
+    def _write_json(path: Path, payload: Any) -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
+
+    def _record_artifact(self, run_id: str, artifact: Artifact) -> None:
+        self._orchestrator.add_artifact(run_id, artifact)
+
+    def _ensure_not_canceled(self, run_id: str) -> None:
+        status = self._orchestrator.get_run_status(run_id)
+        if status and status.cancellation_requested:
+            raise RunCancelledError("cancellation requested")
+
+    @staticmethod
+    def _top_n(request: RunRequest) -> int:
+        budget = dict(request.budget or {})
+        override = int(budget.get("top_k") or 0)
+        if override > 0:
+            return max(1, min(10, override))
+        return 3 if request.mode == RunMode.DAILY else 5
+
+    @staticmethod
+    def _duration_sec(request: RunRequest) -> int:
+        value = int((request.budget or {}).get("duration_sec") or 35)
+        return max(30, min(45, value))
+
+    @staticmethod
+    def _platform(request: RunRequest) -> str:
+        value = str((request.budget or {}).get("platform") or "tiktok").strip().lower()
+        return value or "tiktok"
+
+    @staticmethod
+    def _tone(request: RunRequest) -> str:
+        value = str((request.budget or {}).get("tone") or "professional").strip()
+        return value or "professional"
+
+    @staticmethod
+    def _voice(request: RunRequest) -> str:
+        value = str((request.budget or {}).get("voice") or "neutral").strip()
+        return value or "neutral"
+
+    @staticmethod
+    def _style_profile(request: RunRequest) -> Dict[str, str]:
+        profile = dict((request.budget or {}).get("style_profile") or {})
+        profile.setdefault("aspect", "9:16")
+        profile.setdefault("style", "cinematic technical explainer")
+        profile.setdefault("mood", "clear and concise engineering narrative")
+        profile.setdefault("character_id", "host_01")
+        profile.setdefault("style_id", "tech_brief_v1")
+        return {str(key): str(value) for key, value in profile.items()}
+
+    @staticmethod
+    def _should_render(request: RunRequest) -> bool:
+        budget = dict(request.budget or {})
+        if "render_enabled" in budget:
+            return bool(budget.get("render_enabled"))
+        targets = [str(item).strip().lower() for item in list(request.output_targets or []) if str(item).strip()]
+        if not targets:
+            return True
+        return "mp4" in targets
+
+    @staticmethod
+    def _render_budget(request: RunRequest) -> Dict[str, Any]:
+        budget = dict(request.budget or {})
+        max_retries = int(budget.get("max_retries", 1) or 1)
+        return {
+            "preview": bool(budget.get("preview", True)),
+            "confirm_required": bool(budget.get("confirm_required", False)),
+            "max_total_cost": float(budget.get("max_total_cost", 100.0) or 100.0),
+            "max_retries": max(0, min(2, max_retries)),
+            "quality": str(budget.get("quality") or "preview"),
+        }
