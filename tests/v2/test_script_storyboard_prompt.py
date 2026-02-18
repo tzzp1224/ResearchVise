@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+from core import NormalizedItem, Shot, Storyboard
+from pipeline_v2.prompt_compiler import compile_shot_prompt, compile_storyboard, consistency_pack
+from pipeline_v2.script_generator import generate_script, generate_variants
+from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
+
+
+def _sample_item() -> NormalizedItem:
+    return NormalizedItem(
+        id="item_1",
+        source="github",
+        title="MCP Router Upgrade",
+        url="https://example.com/item_1",
+        body_md=(
+            "Architecture update improves context routing latency by 23%. "
+            "Deployment guide includes rollback strategy and canary metrics. "
+            "Benchmark chart compares baseline and optimized path."
+        ),
+        citations=[],
+        tier="A",
+        lang="en",
+        hash="hash_item_1",
+        metadata={"credibility": "high"},
+    )
+
+
+def test_generate_script_and_variants() -> None:
+    script = generate_script(_sample_item(), duration_sec=36, platform="reels", tone="professional")
+
+    assert script["duration_sec"] == 36
+    assert len(list(script["lines"])) >= 4
+    assert float(script["lines"][0]["start_sec"]) == 0.0
+
+    variants = generate_variants(script, ["reels", "youtube"])
+    assert "reels" in variants
+    assert "youtube" in variants
+    assert variants["reels"]["platform"] == "reels"
+
+
+def test_script_to_storyboard_validate_and_autofix() -> None:
+    script = generate_script(_sample_item(), duration_sec=40, platform="shorts", tone="technical")
+    board = script_to_storyboard(
+        script,
+        constraints={"run_id": "run_1", "item_id": "item_1", "aspect": "9:16", "min_shots": 5, "max_shots": 8},
+    )
+
+    ok, errors = validate_storyboard(board)
+    assert ok is True
+    assert errors == []
+
+    broken = Storyboard(
+        run_id="run_1",
+        item_id="item_1",
+        duration_sec=0,
+        aspect="wrong",
+        shots=[Shot(idx=0, duration=-1, camera="", scene="", action="", reference_assets=[])],
+    )
+    fixed, changes = auto_fix_storyboard(broken)
+
+    ok_fixed, fixed_errors = validate_storyboard(fixed)
+    assert ok_fixed is True
+    assert fixed_errors == []
+    assert changes
+
+
+def test_prompt_compiler_builds_consistent_prompt_specs() -> None:
+    board = Storyboard(
+        run_id="run_1",
+        item_id="item_1",
+        duration_sec=30,
+        aspect="9:16",
+        shots=[
+            Shot(
+                idx=1,
+                duration=4.0,
+                camera="close-up",
+                scene="metrics dashboard",
+                subject_id="host_01",
+                action="show latency benchmark",
+                overlay_text="-23% latency",
+                reference_assets=["asset://bench_1"],
+            )
+        ],
+    )
+
+    pack = consistency_pack("host_01", "style_neo")
+    assert pack["character_id"] == "host_01"
+    assert pack["style_id"] == "style_neo"
+
+    shot_prompt = compile_shot_prompt(
+        board.shots[0],
+        {"style": "cinematic", "mood": "confident", "character_id": "host_01", "style_id": "style_neo", "aspect": "9:16"},
+    )
+    assert shot_prompt.shot_idx == 1
+    assert "camera=close-up" in shot_prompt.prompt_text
+
+    prompts = compile_storyboard(board, style_profile={"style_id": "style_neo", "character_id": "host_01"})
+    assert len(prompts) == 1
+    assert prompts[0].seedance_params["style_id"] == "style_neo"
