@@ -1,6 +1,27 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Run-Once Live Workflow & Live-Smoke Validator Guard (New)
+- 本次目标：
+  - 把“最小可运行链路”统一到单命令 `run-once --mode live`，降低操作复杂度。
+  - 补齐 live 模式下 smoke 污染回归测试，防止 fixture 内容误判为真实数据。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/README.md`：
+    - `6) 最小可运行命令` 改为优先展示 `run-once --mode live ...`。
+    - `8) 自检命令` 改为读取 `run-once` 输出的 `run_dir/render_dir` 并执行 validator。
+    - `5.3 抽取质量现状` 补充 extraction 元数据说明。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_validate_artifacts_v2.py`：
+    - 新增 live 模式拒绝 smoke token 的回归用例（强制 FAIL）。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`README.md`, `tests/v2/test_validate_artifacts_v2.py`
+- 如何验证：
+  - `pytest -q tests/v2/test_validate_artifacts_v2.py tests/v2/test_runtime_integration.py`
+  - `pytest -q tests/v2`
+- 已知风险与回滚：
+  - 风险：若本机网络不可达，`run-once --mode live` 可能因抓取失败导致 validator 不通过。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Ranking Gates & Evidence-Rich Onepager (New)
 - 本次目标：
   - 把 `ranking` 改成真实质量信号驱动，避免短空壳内容进入 Top picks。
@@ -360,7 +381,8 @@ CLI/API
 
 ### 5.3 抽取质量现状
 - 正文抽取：
-  - `fetch_web_article` 使用正则 + 去 HTML 标签，鲁棒性中等（复杂网页可能退化）。
+  - `fetch_web_article` 与 `fetch_rss_feed` 使用 `trafilatura -> readability -> newspaper3k -> fallback` 级联抽取。
+  - 每条记录写入：`extraction_method/extraction_error/extraction_failed`。
 - 引用抽取：
   - `normalize.extract_citations` 会从 metadata、markdown link、正文 URL 提取并去重。
 - 去重/聚类：
@@ -368,25 +390,22 @@ CLI/API
 
 ## 6) 最小可运行命令
 
-### 6.1 点播跑一次（CLI）
+### 6.1 一条命令跑今日 live 热点（推荐）
 ```bash
-python main.py ondemand --user-id u1 --topic "MCP deployment" --time-window 24h --tz America/Los_Angeles --targets web,mp4
+python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3
+```
+
+预期输出：
+- JSON 包含 `run_id/render_job_id/run_dir/render_dir/validator_ok`
+- `validator_ok=true` 时代表本地验收通过
+- `onepager.md` 顶部包含 `DataMode: live`
+
+### 6.2 分进程 worker 方式（兼容保留）
+```bash
+python main.py ondemand --mode live --user-id u1 --topic "AI agent" --time-window today --tz Asia/Singapore --targets web,mp4
 python main.py worker-run-next
 python main.py worker-render-next
 python main.py status --run-id <run_id>
-```
-
-注意：当前 `main.py` 的状态存储为进程内内存，多条独立 `python main.py ...` 命令不会共享队列状态。
-要稳定复现整条链路，优先使用：
-- 同进程脚本（`scripts/e2e_smoke_v2.py`）
-- 或启动一个常驻 API 进程后通过 HTTP 顺序调用 enqueue/worker 接口
-
-### 6.2 daily 模拟跑一次（CLI）
-```bash
-python main.py daily-subscribe --user-id u1 --run-at 08:00 --tz America/Los_Angeles --top-k 3
-python main.py daily-tick --now-utc 2026-02-18T16:10:00+00:00
-python main.py worker-run-next
-python main.py worker-render-next
 ```
 
 ## 7) 产物类型与路径示例
@@ -409,29 +428,28 @@ python main.py worker-render-next
 ## 8) 自检命令（含 MP4 校验）
 
 ```bash
-python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke > /tmp/ara_v2_smoke/result.json
+python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > /tmp/ara_v2_live_run.json
 ```
 
 ```bash
 python - <<'PY'
 import json, pathlib, subprocess
-p = pathlib.Path('/tmp/ara_v2_smoke/result.json')
+p = pathlib.Path('/tmp/ara_v2_live_run.json')
 d = json.loads(p.read_text())
-mp4 = next(a['path'] for a in d['artifacts'] if a['type']=='mp4')
-print('run_id=', d['run_id'])
-print('mp4=', mp4)
-print('valid_mp4=', d['render_status'].get('valid_mp4'))
-subprocess.run(['ffprobe','-hide_banner','-v','error','-show_format','-show_streams',mp4], check=False)
+print('run_id=', d.get('run_id'))
+print('validator_ok=', d.get('validator_ok'))
+print('run_dir=', d.get('run_dir'))
+print('render_dir=', d.get('render_dir'))
 PY
 ```
 
 ```bash
 python - <<'PY'
 import json, pathlib, subprocess
-p = pathlib.Path('/tmp/ara_v2_smoke/result.json')
+p = pathlib.Path('/tmp/ara_v2_live_run.json')
 d = json.loads(p.read_text())
-run_dir = next(e['message'].split('output_dir=',1)[1] for e in d['events'] if e['event']=='run_started')
-render_dir = str(pathlib.Path(d['render_status']['output_path']).parent)
+run_dir = d['run_dir']
+render_dir = d['render_dir']
 subprocess.run([
   'python', 'scripts/validate_artifacts_v2.py',
   '--run-dir', run_dir,
