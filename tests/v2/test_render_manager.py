@@ -116,3 +116,41 @@ def test_fallback_render_and_stitch_shots_helpers(tmp_path: Path) -> None:
     stitched = manager.stitch_shots([str(part1), str(part2)], out_dir=tmp_path)
     assert stitched.endswith(".mp4")
     assert Path(stitched).exists()
+
+
+def test_preview_confirm_final_flow(tmp_path: Path) -> None:
+    manager = RenderManager(renderer_adapter=FlakyAdapter(), work_dir=tmp_path)
+    render_job_id = manager.enqueue_render(
+        run_id="run_preview",
+        prompt_specs=_prompts(),
+        budget={"max_retries": 1, "max_total_cost": 20.0, "preview": True, "confirm_required": True},
+    )
+
+    preview = manager.process_next()
+    assert preview is not None
+    assert preview.state == "awaiting_confirmation"
+    assert preview.output_path and preview.output_path.endswith(".mp4")
+
+    approved = manager.confirm_render(render_job_id, approved=True)
+    assert approved is not None
+    assert approved.state == "queued"
+
+    final = manager.process_next()
+    assert final is not None
+    assert final.state == "completed"
+    assert final.output_path and final.output_path.endswith(".mp4")
+
+
+def test_cancel_render_before_start(tmp_path: Path) -> None:
+    manager = RenderManager(renderer_adapter=FlakyAdapter(), work_dir=tmp_path)
+    render_job_id = manager.enqueue_render(run_id="run_cancel", prompt_specs=_prompts(), budget={"max_retries": 1})
+
+    canceled = manager.cancel_render(render_job_id)
+    assert canceled is True
+
+    status = manager.poll_render(render_job_id)
+    assert status is not None
+    assert status.state == "canceled"
+
+    next_status = manager.process_next()
+    assert next_status is None

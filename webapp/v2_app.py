@@ -143,3 +143,33 @@ def render_worker_next() -> Dict[str, Any]:
         "retry_count": status.retry_count,
         "errors": list(status.errors or []),
     }
+
+
+@app.post("/api/v2/renders/{render_job_id}/confirm")
+def confirm_render(render_job_id: str, approved: bool = True) -> Dict[str, Any]:
+    runtime = get_runtime()
+    status = runtime.confirm_render(render_job_id, approved=approved)
+    if not status:
+        raise HTTPException(status_code=404, detail="render job not found")
+    return {
+        "render_job_id": status.render_job_id,
+        "run_id": status.run_id,
+        "state": status.state,
+        "progress": status.progress,
+        "output_path": status.output_path,
+        "errors": list(status.errors or []),
+    }
+
+
+@app.post("/api/v2/renders/{render_job_id}/cancel")
+def cancel_render(render_job_id: str) -> Dict[str, Any]:
+    runtime = get_runtime()
+    canceled = runtime.cancel_render(render_job_id)
+    if not canceled:
+        raise HTTPException(status_code=404, detail="render job not found")
+    status = runtime.get_render_status(render_job_id)
+    return {
+        "render_job_id": render_job_id,
+        "canceled": True,
+        "state": status.state if status else "canceled",
+    }

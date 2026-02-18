@@ -37,6 +37,9 @@ class RenderJob:
     shot_outputs: Dict[int, str] = field(default_factory=dict)
     failed: Dict[int, str] = field(default_factory=dict)
     total_cost: float = 0.0
+    preview_completed: bool = False
+    confirmed: bool = False
+    preview_output_path: Optional[str] = None
 
 
 class RenderManager:
@@ -93,6 +96,49 @@ class RenderManager:
             return None
         return RenderStatus(**job.status.model_dump())
 
+    def confirm_render(self, render_job_id: str, *, approved: bool = True) -> Optional[RenderStatus]:
+        """Confirm preview and queue final render, or cancel when rejected."""
+        job = self._jobs.get(render_job_id)
+        if not job:
+            return None
+
+        confirm_required = bool(job.budget.get("confirm_required", False))
+        if not confirm_required:
+            return RenderStatus(**job.status.model_dump())
+
+        if not approved:
+            self._set_canceled(job, reason="preview rejected by user")
+            self._remove_from_queue(render_job_id)
+            return RenderStatus(**job.status.model_dump())
+
+        if not job.preview_completed:
+            return RenderStatus(**job.status.model_dump())
+
+        job.confirmed = True
+        job.shot_outputs.clear()
+        job.failed.clear()
+        job.status.output_path = None
+        job.status.state = "queued"
+        job.status.progress = max(job.status.progress, 0.65)
+        job.status.timestamps.updated_at = _utcnow()
+        if render_job_id not in self._queue:
+            self._queue.append(render_job_id)
+        return RenderStatus(**job.status.model_dump())
+
+    def cancel_render(self, render_job_id: str) -> bool:
+        """Best-effort render cancellation for queued/preview/running jobs."""
+        job = self._jobs.get(render_job_id)
+        if not job:
+            return False
+        job.status.cancellation_requested = True
+        self._remove_from_queue(render_job_id)
+        if job.status.state in {"queued", "retrying", "awaiting_confirmation"}:
+            self._set_canceled(job, reason="cancellation requested")
+        elif job.status.state == "running":
+            job.status.state = "cancel_requested"
+            job.status.timestamps.updated_at = _utcnow()
+        return True
+
     def process_next(self) -> Optional[RenderStatus]:
         """Process next queued render job synchronously (worker-style)."""
         if not self._queue:
@@ -102,11 +148,44 @@ class RenderManager:
         if job is None:
             return None
 
-        self._set_running(job)
-        self._render_all_shots(job)
+        if job.status.cancellation_requested:
+            self._set_canceled(job, reason="cancellation requested")
+            return RenderStatus(**job.status.model_dump())
+
+        confirm_required = bool(job.budget.get("confirm_required", False))
+        if confirm_required and not job.preview_completed:
+            self._set_running(job, phase="preview")
+            self._render_all_shots(job, mode="preview")
+            if job.failed:
+                self.retry_failed_shots(render_job_id, mode="preview")
+
+            if job.failed:
+                fallback_board = self._board_from_prompts(job)
+                preview_path = self.fallback_render(fallback_board, out_dir=job.output_dir)
+                job.status.errors.append("seedance_failed_using_fallback")
+            else:
+                preview_path = self.stitch_shots(list(job.shot_outputs.values()), out_dir=job.output_dir)
+
+            job.preview_completed = True
+            job.preview_output_path = preview_path
+            job.status.output_path = preview_path
+            job.status.state = "awaiting_confirmation"
+            job.status.progress = max(job.status.progress, 0.6)
+            job.status.timestamps.updated_at = _utcnow()
+            return RenderStatus(**job.status.model_dump())
+
+        if confirm_required and not job.confirmed:
+            job.status.state = "awaiting_confirmation"
+            job.status.timestamps.updated_at = _utcnow()
+            return RenderStatus(**job.status.model_dump())
+
+        job.shot_outputs.clear()
+        job.failed.clear()
+        self._set_running(job, phase="final")
+        self._render_all_shots(job, mode="final")
 
         if job.failed:
-            self.retry_failed_shots(render_job_id)
+            self.retry_failed_shots(render_job_id, mode="final")
 
         if job.failed:
             fallback_board = self._board_from_prompts(job)
@@ -121,7 +200,13 @@ class RenderManager:
         self._set_completed(job)
         return RenderStatus(**job.status.model_dump())
 
-    def retry_failed_shots(self, render_job_id: str, max_retries: Optional[int] = None) -> Optional[RenderStatus]:
+    def retry_failed_shots(
+        self,
+        render_job_id: str,
+        max_retries: Optional[int] = None,
+        *,
+        mode: str = "final",
+    ) -> Optional[RenderStatus]:
         """Retry failed shots for a render job within retry budget."""
         job = self._jobs.get(render_job_id)
         if not job:
@@ -145,7 +230,7 @@ class RenderManager:
             spec = self._prompt_by_idx(job.prompt_specs, idx)
             if spec is None:
                 continue
-            result = self._render_one_shot(job, spec)
+            result = self._render_one_shot(job, spec, mode=mode)
             if result.success and result.output_path:
                 job.shot_outputs[idx] = result.output_path
             else:
@@ -188,12 +273,16 @@ class RenderManager:
 
         return str(out_path)
 
-    def _set_running(self, job: RenderJob) -> None:
+    def _remove_from_queue(self, render_job_id: str) -> None:
+        while render_job_id in self._queue:
+            self._queue.remove(render_job_id)
+
+    def _set_running(self, job: RenderJob, *, phase: str) -> None:
         now = _utcnow()
         job.status.state = "running"
         job.status.timestamps.started_at = job.status.timestamps.started_at or now
         job.status.timestamps.updated_at = now
-        logger.info("render_start run_id=%s render_job_id=%s", job.run_id, job.render_job_id)
+        logger.info("render_start run_id=%s render_job_id=%s phase=%s", job.run_id, job.render_job_id, phase)
 
     def _set_completed(self, job: RenderJob) -> None:
         now = _utcnow()
@@ -210,10 +299,20 @@ class RenderManager:
             job.status.retry_count,
         )
 
-    def _render_all_shots(self, job: RenderJob) -> None:
+    def _set_canceled(self, job: RenderJob, *, reason: str) -> None:
+        now = _utcnow()
+        job.status.state = "canceled"
+        job.status.cancellation_requested = True
+        job.status.timestamps.cancelled_at = job.status.timestamps.cancelled_at or now
+        job.status.timestamps.completed_at = job.status.timestamps.completed_at or now
+        job.status.timestamps.updated_at = now
+        if reason:
+            job.status.errors.append(reason)
+
+    def _render_all_shots(self, job: RenderJob, *, mode: str) -> None:
         total = max(1, len(job.prompt_specs))
         for idx, spec in enumerate(job.prompt_specs, start=1):
-            result = self._render_one_shot(job, spec)
+            result = self._render_one_shot(job, spec, mode=mode)
             if result.success and result.output_path:
                 job.shot_outputs[spec.shot_idx] = result.output_path
             else:
@@ -222,7 +321,7 @@ class RenderManager:
             job.status.timestamps.updated_at = _utcnow()
             job.status.failed_shot_indices = sorted(list(job.failed.keys()))
 
-    def _render_one_shot(self, job: RenderJob, spec: PromptSpec) -> ShotRenderResult:
+    def _render_one_shot(self, job: RenderJob, spec: PromptSpec, *, mode: str) -> ShotRenderResult:
         budget_limit = float(job.budget.get("max_total_cost", 1e18) or 1e18)
         if job.total_cost > budget_limit:
             return ShotRenderResult(
@@ -231,8 +330,6 @@ class RenderManager:
                 error="budget exceeded",
                 cost=0.0,
             )
-
-        mode = "preview" if bool(job.budget.get("preview", False)) else "final"
         result = self._adapter.render_shot(
             prompt_spec=spec,
             output_dir=job.output_dir,

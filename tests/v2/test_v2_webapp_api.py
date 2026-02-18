@@ -131,3 +131,36 @@ def test_v2_daily_schedule_tick(tmp_path: Path) -> None:
     tick = client.post("/api/v2/runs/daily/tick", params={"now_utc_iso": "2026-02-18T16:10:00+00:00"})
     assert tick.status_code == 200
     assert tick.json()["count"] == 1
+
+
+def test_v2_preview_confirm_final_render_flow(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    create = client.post(
+        "/api/v2/runs/ondemand",
+        json={
+            "user_id": "u3",
+            "topic": "mcp preview",
+            "time_window": "24h",
+            "tz": "UTC",
+            "budget": {"duration_sec": 35, "max_total_cost": 5.0, "confirm_required": True},
+            "output_targets": ["mp4"],
+        },
+    )
+    run_id = create.json()["run_id"]
+
+    worker = client.post("/api/v2/workers/runs/next")
+    assert worker.json()["processed"] is True
+    render_job_id = worker.json()["render_job_id"]
+
+    preview = client.post("/api/v2/workers/render/next")
+    assert preview.status_code == 200
+    assert preview.json()["state"] == "awaiting_confirmation"
+
+    confirm = client.post(f"/api/v2/renders/{render_job_id}/confirm", params={"approved": "true"})
+    assert confirm.status_code == 200
+    assert confirm.json()["state"] == "queued"
+
+    final = client.post("/api/v2/workers/render/next")
+    assert final.status_code == 200
+    assert final.json()["state"] == "completed"
+    assert final.json()["run_id"] == run_id

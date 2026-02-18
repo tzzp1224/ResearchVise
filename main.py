@@ -41,6 +41,13 @@ def main() -> None:
     sub.add_parser("worker-run-next")
     sub.add_parser("worker-render-next")
 
+    render_confirm = sub.add_parser("render-confirm")
+    render_confirm.add_argument("--render-job-id", required=True)
+    render_confirm.add_argument("--approved", choices=["true", "false"], default="true")
+
+    render_cancel = sub.add_parser("render-cancel")
+    render_cancel.add_argument("--render-job-id", required=True)
+
     status = sub.add_parser("status")
     status.add_argument("--run-id", required=True)
 
@@ -117,6 +124,36 @@ def main() -> None:
                     "render_job_id": status.render_job_id,
                     "state": status.state,
                     "output_path": status.output_path,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    if args.command == "render-confirm":
+        approved = str(args.approved).lower() == "true"
+        status = runtime.confirm_render(args.render_job_id, approved=approved)
+        print(
+            json.dumps(
+                {
+                    "render_job_id": args.render_job_id,
+                    "approved": approved,
+                    "status": status.model_dump(mode="json") if status else None,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    if args.command == "render-cancel":
+        canceled = runtime.cancel_render(args.render_job_id)
+        status = runtime.get_render_status(args.render_job_id)
+        print(
+            json.dumps(
+                {
+                    "render_job_id": args.render_job_id,
+                    "canceled": canceled,
+                    "status": status.model_dump(mode="json") if status else None,
                 },
                 ensure_ascii=False,
             )

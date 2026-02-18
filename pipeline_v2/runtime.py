@@ -123,6 +123,15 @@ class RunPipelineRuntime:
         )
         return status
 
+    def confirm_render(self, render_job_id: str, *, approved: bool = True) -> Optional[RenderStatus]:
+        return self._render_manager.confirm_render(render_job_id, approved=approved)
+
+    def cancel_render(self, render_job_id: str) -> bool:
+        return self._render_manager.cancel_render(render_job_id)
+
+    def get_render_status(self, render_job_id: str) -> Optional[RenderStatus]:
+        return self._render_manager.poll_render(render_job_id)
+
     def get_run_bundle(self, run_id: str) -> Dict[str, Any]:
         """Get status + artifacts + render state bundle for API responses."""
         status = self._orchestrator.get_run_status(run_id)
