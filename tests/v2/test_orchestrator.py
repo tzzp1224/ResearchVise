@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from core import RunMode, RunRequest
 from orchestrator.queue import InMemoryRunQueue
 from orchestrator.service import RunOrchestrator
@@ -78,3 +80,23 @@ def test_retry_failed_run_requeues_when_budget_available() -> None:
     picked = svc.dequeue_next_run()
     assert picked is not None
     assert picked[0] == run_id
+
+
+def test_daily_digest_triggers_once_per_local_day() -> None:
+    svc = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    sub_id = svc.schedule_daily_digest(user_id="u_daily", run_at="08:00", tz="America/Los_Angeles", top_k=5)
+    assert sub_id.startswith("sub_")
+
+    due_time = datetime(2026, 2, 18, 16, 5, tzinfo=timezone.utc)  # 08:05 PST
+    created_first = svc.trigger_due_daily_runs(now_utc=due_time)
+    assert len(created_first) == 1
+
+    created_second = svc.trigger_due_daily_runs(now_utc=due_time)
+    assert created_second == []
+
+    picked = svc.dequeue_next_run()
+    assert picked is not None
+    run_id, run_request = picked
+    assert run_id == created_first[0]
+    assert run_request.mode == RunMode.DAILY
+    assert int((run_request.budget or {}).get("top_k") or 0) == 5

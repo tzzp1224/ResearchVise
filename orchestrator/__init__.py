@@ -9,6 +9,7 @@ from .service import (
     get_run_status,
     list_artifacts,
     schedule_daily_digest,
+    trigger_due_daily_runs,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "get_run_status",
     "list_artifacts",
     "schedule_daily_digest",
+    "trigger_due_daily_runs",
 ]

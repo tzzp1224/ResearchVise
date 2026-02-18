@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
-from core import Artifact, RunRequest, RunStatus
+from core import Artifact, RunMode, RunRequest, RunStatus
 from .queue import InMemoryRunQueue
 from .store import InMemoryRunStore
 
@@ -25,7 +26,9 @@ class DailyDigestSubscription:
     user_id: str
     run_at: str
     tz: str
+    top_k: int = 3
     created_at: str = field(default_factory=_utc_iso)
+    last_triggered_on: Optional[str] = None
 
 
 class RunOrchestrator:
@@ -42,7 +45,7 @@ class RunOrchestrator:
         self._subs: Dict[str, DailyDigestSubscription] = {}
         self._lock = Lock()
 
-    def schedule_daily_digest(self, user_id: str, run_at: str = "08:00", tz: str = "UTC") -> str:
+    def schedule_daily_digest(self, user_id: str, run_at: str = "08:00", tz: str = "UTC", top_k: int = 3) -> str:
         """Register daily digest schedule at user-local time."""
         sub_id = f"sub_{uuid4().hex[:10]}"
         with self._lock:
@@ -51,8 +54,57 @@ class RunOrchestrator:
                 user_id=str(user_id).strip(),
                 run_at=str(run_at).strip() or "08:00",
                 tz=str(tz).strip() or "UTC",
+                top_k=max(1, min(5, int(top_k or 3))),
             )
         return sub_id
+
+    def list_subscriptions(self) -> List[DailyDigestSubscription]:
+        with self._lock:
+            return [DailyDigestSubscription(**item.__dict__) for item in self._subs.values()]
+
+    def trigger_due_daily_runs(self, *, now_utc: Optional[datetime] = None) -> List[str]:
+        """Enqueue due daily runs for subscriptions whose local time passed run_at."""
+        now = now_utc or datetime.now(timezone.utc)
+        created: List[str] = []
+
+        with self._lock:
+            subs = [DailyDigestSubscription(**item.__dict__) for item in self._subs.values()]
+
+        for sub in subs:
+            try:
+                tz = ZoneInfo(sub.tz)
+            except Exception:
+                tz = ZoneInfo("UTC")
+            local_now = now.astimezone(tz)
+            run_hour, run_minute = _parse_run_at(sub.run_at)
+            target_minute = run_hour * 60 + run_minute
+            current_minute = local_now.hour * 60 + local_now.minute
+            local_date = local_now.date().isoformat()
+
+            if current_minute < target_minute:
+                continue
+            if sub.last_triggered_on == local_date:
+                continue
+
+            run_request = RunRequest(
+                user_id=sub.user_id,
+                mode=RunMode.DAILY,
+                topic=None,
+                time_window="24h",
+                tz=sub.tz,
+                budget={"top_k": sub.top_k},
+                output_targets=["script", "storyboard", "onepager", "mp4", "zip"],
+            )
+            idempotency_key = f"daily:{sub.user_id}:{local_date}:{sub.run_at}"
+            run_id = self.enqueue_run(run_request, idempotency_key=idempotency_key)
+            created.append(run_id)
+
+            with self._lock:
+                current = self._subs.get(sub.subscription_id)
+                if current:
+                    current.last_triggered_on = local_date
+
+        return created
 
     def enqueue_run(self, run_request: RunRequest, *, idempotency_key: Optional[str] = None) -> str:
         """Create and enqueue a run request. Returns stable run_id for same idempotency key."""
@@ -128,9 +180,9 @@ def get_default_orchestrator() -> RunOrchestrator:
     return _DEFAULT_ORCHESTRATOR
 
 
-def schedule_daily_digest(user_id: str, run_at: str = "08:00", tz: str = "UTC") -> str:
+def schedule_daily_digest(user_id: str, run_at: str = "08:00", tz: str = "UTC", top_k: int = 3) -> str:
     """Top-level API required by PRD module A."""
-    return _DEFAULT_ORCHESTRATOR.schedule_daily_digest(user_id=user_id, run_at=run_at, tz=tz)
+    return _DEFAULT_ORCHESTRATOR.schedule_daily_digest(user_id=user_id, run_at=run_at, tz=tz, top_k=top_k)
 
 
 def enqueue_run(run_request: RunRequest, *, idempotency_key: Optional[str] = None) -> str:
@@ -154,3 +206,20 @@ def list_artifacts(run_id: str) -> List[Artifact]:
 
 def get_render_job(run_id: str) -> Optional[str]:
     return _DEFAULT_ORCHESTRATOR.get_render_job(run_id)
+
+
+def trigger_due_daily_runs(*, now_utc: Optional[datetime] = None) -> List[str]:
+    return _DEFAULT_ORCHESTRATOR.trigger_due_daily_runs(now_utc=now_utc)
+
+
+def _parse_run_at(run_at: str) -> Tuple[int, int]:
+    text = str(run_at or "").strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        return 8, 0
+    try:
+        hour = max(0, min(23, int(parts[0])))
+        minute = max(0, min(59, int(parts[1])))
+        return hour, minute
+    except Exception:
+        return 8, 0
