@@ -18,9 +18,24 @@ async def test_fetch_rss_feed_parses_items(monkeypatch) -> None:
     </channel></rss>
     """.strip()
 
+    article_html = """
+    <html>
+      <head><title>AI Infra Weekly Deep Dive</title></head>
+      <body>
+        <article>
+          <p>Latency tuning moved p95 from 210ms to 130ms in staging.</p>
+          <p>Canary rollout covered 5% traffic before full release.</p>
+        </article>
+      </body>
+    </html>
+    """.strip()
+
     async def _fake_get_text(url: str, *, headers=None) -> str:
-        assert url == "https://example.com/feed.xml"
-        return rss_xml
+        if url == "https://example.com/feed.xml":
+            return rss_xml
+        if url == "https://example.com/post-1":
+            return article_html
+        raise AssertionError(f"unexpected url: {url}")
 
     monkeypatch.setattr(connectors, "_http_get_text", _fake_get_text)
 
@@ -29,6 +44,7 @@ async def test_fetch_rss_feed_parses_items(monkeypatch) -> None:
     assert items[0].tier == "B"
     assert items[0].source == "rss"
     assert items[0].title == "AI Infra Weekly"
+    assert "extraction_method" in items[0].metadata
 
 
 @pytest.mark.asyncio
@@ -56,6 +72,7 @@ async def test_fetch_web_article_extracts_title_and_body(monkeypatch) -> None:
     assert items[0].tier == "B"
     assert "Edge Deployment Playbook" in items[0].title
     assert "Step 1" in items[0].body
+    assert items[0].metadata.get("extraction_method")
 
 
 @pytest.mark.asyncio

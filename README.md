@@ -1,6 +1,28 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Live Connectors Enrichment (New)
+- 本次目标：
+  - 让 `live` 模式抓取结果从“标题级摘要”升级为“可写文案的正文级内容”。
+  - 对每条来源记录抽取方法与失败原因，供后续质量门禁使用。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`：
+    - GitHub：仓库抓取补充 README 文本 + stars/forks/last_push，release 抓取 release notes 全文与发布时间。
+    - HuggingFace：模型/数据集补充 card markdown 抓取（`README.md`），写入 `last_modified/extraction_method`。
+    - HackerNews：补充 top comments 摘要并合并进 body。
+    - RSS/WebArticle：新增正文抽取链（`trafilatura -> readability -> newspaper3k -> fallback`），落盘 `extraction_method/extraction_error/extraction_failed`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_connectors.py`：
+    - 增加 RSS 文章页抽取分支与 extraction 元数据断言。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`sources/connectors.py`, `tests/v2/test_connectors.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2/test_connectors.py tests/v2/test_runtime_integration.py tests/v2/test_e2e_smoke_command.py`
+  - `pytest -q tests/v2`
+- 已知风险与回滚：
+  - 风险：不同环境可能缺少 `trafilatura/readability/newspaper3k`，会自动降级到 fallback 抽取，质量会受限。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Live/Smoke Mode Isolation & Run Context (New)
 - 本次目标：
   - 将 `live` 与 `smoke` 运行模式解耦，避免 smoke fixture 污染线上输出。
