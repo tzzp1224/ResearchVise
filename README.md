@@ -1,6 +1,27 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Motion Graphics Fallback Renderer (Commit 3)
+- 本次目标：
+  - 将 `fallback_render/stitch_shots` 从占位合成升级为可发布预览的工程化视频输出。
+  - 禁用默认 `testsrc/colorbars` 路径。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/render/manager.py`：
+    - 新增 storyboard-driven motion graphics 渲染（开场卡 + shot 卡 + 结尾 CTA 卡）。
+    - `stitch_shots` 在拼接失败时优先回退到 `fallback_render(board)`，不再走占位字节拼接。
+    - `fallback_render` 优先使用文本动效渲染，不再默认 `testsrc`。
+    - 保留原子写与 `ffprobe` 校验，渲染状态继续落盘 `valid_mp4/probe_error`。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`render/manager.py`。
+- 如何验证：
+  - `pytest -q tests/v2/test_render_manager.py tests/v2/test_runtime_integration.py tests/v2/test_e2e_smoke_command.py`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_c3 > /tmp/ara_v2_smoke_c3/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_smoke_c3/runs/<run_id> --render-dir /tmp/ara_v2_smoke_c3/render_jobs/<render_job_id>`
+- 已知风险与回滚：
+  - 风险：当前动效渲染仍以文字卡片为主，素材截图/图层模板将在后续 commit 增强。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Content Realization & Quality Metrics (Commit 2)
 - 本次目标：
   - 将 `script/onepager/materials` 从占位描述升级为可审阅内容。

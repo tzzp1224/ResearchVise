@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence
@@ -21,6 +21,21 @@ from .adapters import BaseRendererAdapter, SeedanceAdapter, ShotRenderResult
 logger = logging.getLogger(__name__)
 _FFMPEG_BIN = shutil.which("ffmpeg")
 _FFPROBE_BIN = shutil.which("ffprobe")
+_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+]
+_CARD_BG_COLORS = [
+    "#0b1220",
+    "#101a2e",
+    "#13233a",
+    "#1a2440",
+    "#162d3b",
+    "#20263a",
+]
 
 
 def _utcnow() -> datetime:
@@ -29,6 +44,43 @@ def _utcnow() -> datetime:
 
 def _new_render_job_id() -> str:
     return f"render_{_utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+
+
+def _compact_text(value: str, max_len: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _safe_drawtext(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", r"\:")
+    text = text.replace("'", r"\'")
+    text = text.replace("%", r"\%")
+    text = text.replace("\n", r"\n")
+    return text
+
+
+def _wrap_text(value: str, *, max_chars: int = 34, max_lines: int = 3) -> str:
+    words = str(value or "").split()
+    if not words:
+        return ""
+    lines: List[str] = []
+    current: List[str] = []
+    for word in words:
+        candidate = " ".join(current + [word]).strip()
+        if current and len(candidate) > max_chars:
+            lines.append(" ".join(current))
+            current = [word]
+            if len(lines) >= max_lines:
+                break
+        else:
+            current.append(word)
+    if len(lines) < max_lines and current:
+        lines.append(" ".join(current))
+    return "\n".join(lines[:max_lines])
 
 
 @dataclass
@@ -169,7 +221,11 @@ class RenderManager:
                 preview_path = self.fallback_render(fallback_board, out_dir=job.output_dir)
                 job.status.errors.append("seedance_failed_using_fallback")
             else:
-                preview_path = self.stitch_shots(list(job.shot_outputs.values()), out_dir=job.output_dir)
+                preview_path = self.stitch_shots(
+                    list(job.shot_outputs.values()),
+                    out_dir=job.output_dir,
+                    board=self._board_from_prompts(job),
+                )
 
             job.preview_completed = True
             job.preview_output_path = preview_path
@@ -200,7 +256,11 @@ class RenderManager:
             job.status.errors.append("seedance_failed_using_fallback")
 
         if not job.status.output_path:
-            stitched = self.stitch_shots(list(job.shot_outputs.values()), out_dir=job.output_dir)
+            stitched = self.stitch_shots(
+                list(job.shot_outputs.values()),
+                out_dir=job.output_dir,
+                board=self._board_from_prompts(job),
+            )
             job.status.output_path = stitched
 
         self._update_output_validation(job)
@@ -253,6 +313,9 @@ class RenderManager:
         target_dir.mkdir(parents=True, exist_ok=True)
         out_path = target_dir / "fallback_render.mp4"
 
+        if self._render_motion_graphics(board=board, out_path=out_path):
+            return str(out_path)
+
         if self._synthesize_video(
             out_path=out_path,
             duration_sec=max(1.0, float(board.duration_sec or 30)),
@@ -260,17 +323,19 @@ class RenderManager:
         ):
             return str(out_path)
 
-        payload = [
-            b"FALLBACK_MP4_PLACEHOLDER\n",
-            f"run_id={board.run_id}\n".encode("utf-8"),
-            f"item_id={board.item_id}\n".encode("utf-8"),
-            f"duration_sec={board.duration_sec}\n".encode("utf-8"),
-            f"shots={len(board.shots)}\n".encode("utf-8"),
-        ]
-        self._atomic_write_mp4ish(out_path, b"".join(payload))
+        payload = (
+            f"run_id={board.run_id}\nitem_id={board.item_id}\nduration_sec={board.duration_sec}\nshots={len(board.shots)}\n"
+        ).encode("utf-8")
+        self._atomic_write_mp4ish(out_path, payload)
         return str(out_path)
 
-    def stitch_shots(self, shot_paths: Sequence[str], out_dir: Optional[Path] = None) -> str:
+    def stitch_shots(
+        self,
+        shot_paths: Sequence[str],
+        out_dir: Optional[Path] = None,
+        *,
+        board: Optional[Storyboard] = None,
+    ) -> str:
         """Stitch rendered shots into final MP4 path (concat preferred, synth fallback)."""
         target_dir = Path(out_dir or self._work_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -280,15 +345,15 @@ class RenderManager:
         if existing and self._concat_videos(existing, out_path=out_path):
             return str(out_path)
 
-        duration = max(4.0, float(len(existing) * 4 if existing else 8))
+        if board is not None:
+            return self.fallback_render(board, out_dir=target_dir)
+
+        duration = max(4.0, float(len(existing) * 4 if existing else 10))
         if self._synthesize_video(out_path=out_path, duration_sec=duration, aspect="9:16"):
             return str(out_path)
 
-        payload = [b"STITCHED_MP4_PLACEHOLDER\n"]
-        for path in existing:
-            digest = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
-            payload.append(f"{path.name}:{digest}\n".encode("utf-8"))
-        self._atomic_write_mp4ish(out_path, b"".join(payload))
+        payload = "\n".join(path.name for path in existing).encode("utf-8")
+        self._atomic_write_mp4ish(out_path, payload)
         return str(out_path)
 
     def _concat_videos(self, shot_paths: Sequence[Path], *, out_path: Path) -> bool:
@@ -340,11 +405,65 @@ class RenderManager:
             if tmp_out.exists():
                 tmp_out.unlink()
 
-    def _synthesize_video(self, *, out_path: Path, duration_sec: float, aspect: str) -> bool:
+    @staticmethod
+    def _pick_fontfile() -> Optional[str]:
+        for candidate in _FONT_CANDIDATES:
+            if Path(candidate).exists():
+                return candidate
+        return None
+
+    def _render_text_card(
+        self,
+        *,
+        out_path: Path,
+        duration_sec: float,
+        aspect: str,
+        bg_color: str,
+        title: str,
+        body: str,
+        footer: str,
+    ) -> bool:
         if not _FFMPEG_BIN:
             return False
         width, height = self._resolution_from_aspect(aspect)
-        duration = max(1.0, float(duration_sec))
+        duration = max(0.8, float(duration_sec))
+        fontfile = self._pick_fontfile()
+        title_text = _safe_drawtext(_wrap_text(_compact_text(title, 96), max_chars=24, max_lines=2))
+        body_text = _safe_drawtext(_wrap_text(_compact_text(body, 180), max_chars=30, max_lines=4))
+        footer_text = _safe_drawtext(_compact_text(footer, 96))
+
+        text_filters = []
+        if title_text:
+            title_filter = (
+                f"drawtext=text='{title_text}':fontcolor=white:fontsize=54:"
+                "x=(w-text_w)/2:y=h*0.14:line_spacing=10"
+            )
+            text_filters.append(title_filter if not fontfile else title_filter + f":fontfile={fontfile}")
+        if body_text:
+            body_filter = (
+                f"drawtext=text='{body_text}':fontcolor=white:fontsize=36:"
+                "x=(w-text_w)/2:y=h*0.38:line_spacing=8"
+            )
+            text_filters.append(body_filter if not fontfile else body_filter + f":fontfile={fontfile}")
+        if footer_text:
+            footer_filter = (
+                f"drawtext=text='{footer_text}':fontcolor=#cbd5e1:fontsize=24:"
+                "x=(w-text_w)/2:y=h*0.88"
+            )
+            text_filters.append(footer_filter if not fontfile else footer_filter + f":fontfile={fontfile}")
+
+        if not text_filters:
+            text_filters = ["null"]
+
+        vf = ",".join(
+            [
+                f"drawbox=x=0:y=0:w=iw:h=ih:color={bg_color}@0.98:t=fill",
+                "drawbox=x=0:y=0:w=iw:h=ih:color=#0ea5e9@0.06:t=fill",
+                f"drawbox=x=mod(t*110\\,{width}):y={int(height*0.8)}:w={int(width*0.28)}:h=10:color=#22d3ee@0.55:t=fill",
+            ]
+            + text_filters
+        )
+
         tmp_out = out_path.parent / f".{out_path.name}.{uuid4().hex}.tmp"
         cmd = [
             _FFMPEG_BIN,
@@ -354,11 +473,120 @@ class RenderManager:
             "-f",
             "lavfi",
             "-i",
-            f"testsrc2=size={width}x{height}:rate=24:duration={duration:.2f}",
+            f"color=c={bg_color}:s={width}x{height}:rate=24:d={duration:.2f}",
             "-f",
             "lavfi",
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf",
+            vf,
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(tmp_out),
+        ]
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return False
+            if not tmp_out.exists() or tmp_out.stat().st_size <= 0:
+                return False
+            os.replace(tmp_out, out_path)
+            return True
+        finally:
+            if tmp_out.exists():
+                tmp_out.unlink()
+
+    def _render_motion_graphics(self, *, board: Storyboard, out_path: Path) -> bool:
+        if not _FFMPEG_BIN:
+            return False
+
+        sequence = [
+            {
+                "duration": 1.8,
+                "title": "Tech Brief",
+                "body": _compact_text(f"Run {board.run_id} | {board.item_id}", 120),
+                "footer": "Generated from ranked evidence",
+            }
+        ]
+
+        for shot in list(board.shots or []):
+            overlay = _compact_text(str(shot.overlay_text or shot.action or "Key update"), 170)
+            source_hint = str(shot.reference_assets[0]).strip() if shot.reference_assets else "source://curated"
+            sequence.append(
+                {
+                    "duration": max(1.4, float(shot.duration or 3.5)),
+                    "title": f"Shot {int(shot.idx)}",
+                    "body": overlay,
+                    "footer": _compact_text(f"{shot.scene} | {source_hint}", 90),
+                }
+            )
+
+        sequence.append(
+            {
+                "duration": 2.0,
+                "title": "Summary",
+                "body": "Track this topic daily and verify claims using the listed citations.",
+                "footer": "CTA: follow for next run",
+            }
+        )
+
+        segment_dir = out_path.parent / f".segments_{uuid4().hex[:8]}"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        segment_paths: List[Path] = []
+        try:
+            for idx, segment in enumerate(sequence):
+                segment_path = segment_dir / f"segment_{idx:03d}.mp4"
+                ok = self._render_text_card(
+                    out_path=segment_path,
+                    duration_sec=float(segment["duration"]),
+                    aspect=str(board.aspect or "9:16"),
+                    bg_color=_CARD_BG_COLORS[idx % len(_CARD_BG_COLORS)],
+                    title=str(segment["title"]),
+                    body=str(segment["body"]),
+                    footer=str(segment["footer"]),
+                )
+                if not ok:
+                    return False
+                segment_paths.append(segment_path)
+
+            return self._concat_videos(segment_paths, out_path=out_path)
+        finally:
+            shutil.rmtree(segment_dir, ignore_errors=True)
+
+    def _synthesize_video(self, *, out_path: Path, duration_sec: float, aspect: str) -> bool:
+        if not _FFMPEG_BIN:
+            return False
+        width, height = self._resolution_from_aspect(aspect)
+        duration = max(1.0, float(duration_sec))
+        accent = "0x14b8a6"
+        tmp_out = out_path.parent / f".{out_path.name}.{uuid4().hex}.tmp"
+        cmd = [
+            _FFMPEG_BIN,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=#0f172a:s={width}x{height}:rate=24:d={duration:.2f}",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf",
+            (
+                "drawbox=x=0:y=0:w=iw:h=ih:color=#1f2937@0.35:t=fill,"
+                f"drawbox=x=mod(t*90\\,{width}):y={int(height*0.82)}:w={int(width*0.35)}:h=12:color={accent}@0.55:t=fill"
+            ),
             "-shortest",
             "-c:v",
             "libx264",
@@ -521,15 +749,17 @@ class RenderManager:
         shots: List[Shot] = []
         for idx, spec in enumerate(job.prompt_specs, start=1):
             duration = float(spec.seedance_params.get("duration_sec", 4.0) or 4.0)
+            scene = str(spec.seedance_params.get("scene", "analysis scene") or "analysis scene")
+            overlay = _compact_text(spec.prompt_text, max_len=160) or f"Shot {idx}"
             shots.append(
                 Shot(
                     idx=idx,
                     duration=max(1.0, duration),
                     camera=str(spec.seedance_params.get("camera", "medium")),
-                    scene="fallback scene",
+                    scene=scene,
                     subject_id=str(spec.seedance_params.get("character_id", "host_01")),
                     action=spec.prompt_text,
-                    overlay_text=None,
+                    overlay_text=overlay,
                     reference_assets=list(spec.references or []),
                 )
             )
