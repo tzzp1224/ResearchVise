@@ -87,6 +87,15 @@ def _fact_bullets(item: NormalizedItem) -> List[str]:
     metrics = _quality_metrics(item)
     metadata = dict(item.metadata or {})
     bullets: List[str] = []
+    facts = dict(metadata.get("facts") or {})
+    for entry in list(facts.get("how_it_works") or [])[:3]:
+        line = _compact_text(str(entry or ""), max_len=180)
+        if line:
+            bullets.append(line)
+    for entry in list(facts.get("proof") or [])[:2]:
+        line = _compact_text(str(entry or ""), max_len=180)
+        if line and line not in bullets:
+            bullets.append(line)
 
     stars = int(float(metadata.get("stars", 0) or 0))
     forks = int(float(metadata.get("forks", 0) or 0))
@@ -147,6 +156,15 @@ def _rank_reasons(item: object) -> str:
     return "无"
 
 
+def _relevance(item: object) -> float | None:
+    if isinstance(item, RankedItem):
+        try:
+            return float(item.relevance_score)
+        except Exception:
+            return None
+    return None
+
+
 def generate_onepager(
     items: Sequence[object],
     citations: Sequence[Citation],
@@ -190,6 +208,7 @@ def generate_onepager(
         metrics = _quality_metrics(item)
         fact_bullets = _fact_bullets(item)
         citation_bullets = _citation_bullets(item)
+        relevance_value = _relevance(payload)
 
         lines.extend(
             [
@@ -197,6 +216,7 @@ def generate_onepager(
                 f"- Source URL: {item.url or 'N/A'}",
                 f"- Source Domain: `{_domain(item.url)}`",
                 f"- Tier/Credibility: `{item.tier}` / `{credibility}`",
+                f"- Topic Relevance: `{relevance_value:.2f}`" if relevance_value is not None else "- Topic Relevance: `N/A`",
                 (
                     "- Quality Metrics: "
                     f"body_len={metrics['body_len']}, "

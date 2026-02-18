@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Dict, List
 
 from core import PromptSpec, Shot, Storyboard
@@ -29,10 +30,15 @@ def compile_shot_prompt(shot: Shot, style_profile: Dict[str, str]) -> PromptSpec
     char_id = str(profile.get("character_id", "host_01")).strip()
     style_id = str(profile.get("style_id", "style_01")).strip()
 
+    def _clean(value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", str(value or ""))
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     prompt = (
         f"{style}; {mood}; "
-        f"camera={shot.camera}; scene={shot.scene}; action={shot.action}; "
-        f"subject={shot.subject_id or char_id}; overlay={shot.overlay_text or 'none'}"
+        f"camera={_clean(shot.camera)}; scene={_clean(shot.scene)}; action={_clean(shot.action)}; "
+        f"subject={_clean(shot.subject_id or char_id)}; overlay={_clean(shot.overlay_text or 'none')}"
     )
     negative = (
         "blurry, low-detail, random text artifacts, watermark,"

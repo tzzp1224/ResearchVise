@@ -164,6 +164,7 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert status_before_render["state"] == "completed"
 
     artifact_types = {item["type"] for item in bundle_before_render["artifacts"]}
+    assert "facts" in artifact_types
     assert "script" in artifact_types
     assert "storyboard" in artifact_types
     assert "onepager" in artifact_types
@@ -177,8 +178,12 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     script_payload = json.loads((run_dir / "script.json").read_text(encoding="utf-8"))
     assert "structure" in script_payload
     assert len(script_payload["structure"]["key_points"]) == 3
+    assert "facts" in script_payload
+    assert (run_dir / "facts.json").exists()
     run_context_payload = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
     assert run_context_payload["data_mode"] == "live"
+    assert run_context_payload["topic"] == "mcp deployment"
+    assert "ranking_stats" in run_context_payload
     assert "connector_stats" in run_context_payload
     assert "extraction_stats" in run_context_payload
 

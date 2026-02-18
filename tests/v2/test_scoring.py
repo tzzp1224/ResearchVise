@@ -7,6 +7,7 @@ from pipeline_v2.scoring import (
     rank_items,
     score_credibility,
     score_novelty,
+    score_relevance,
     score_talkability,
     score_visual_assets,
 )
@@ -51,6 +52,7 @@ def test_score_functions_return_bounded_values() -> None:
         score_talkability(item),
         score_credibility(item),
         score_visual_assets(item),
+        score_relevance(item, "ai agent"),
     ]:
         assert 0.0 <= value <= 1.0
 
@@ -115,3 +117,24 @@ def test_rank_items_allows_tier_b_top3_when_talkability_is_high() -> None:
     ranked = rank_items([tier_b_high_talk] + tier_a_items)
     top3_ids = [row.item.id for row in ranked[:3]]
     assert "b2" in top3_ids
+
+
+def test_rank_items_topic_relevance_gate_filters_offtopic_items() -> None:
+    related = _item(
+        "a_rel",
+        tier="A",
+        source="github",
+        title="AI agent orchestration for tool calling",
+        metadata={"stars": 500, "credibility": "high", "citation_count": 2},
+    )
+    unrelated = _item(
+        "a_off",
+        tier="A",
+        source="github",
+        title="VSCode dark theme collection",
+        metadata={"stars": 800, "credibility": "high", "citation_count": 2},
+    )
+
+    ranked = rank_items([unrelated, related], topic="AI agent", relevance_threshold=0.55)
+    assert ranked[0].item.id == "a_rel"
+    assert any("penalty.relevance_lt_0.55" in reason for reason in ranked[1].reasons)

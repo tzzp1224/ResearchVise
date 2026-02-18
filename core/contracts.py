@@ -20,6 +20,7 @@ class ArtifactType(str, Enum):
     """Supported artifact categories."""
 
     SCRIPT = "script"
+    FACTS = "facts"
     STORYBOARD = "storyboard"
     ONEPAGER = "onepager"
     MP4 = "mp4"
@@ -124,6 +125,7 @@ class RankedItem(BaseModel):
     talkability_score: float
     credibility_score: float
     visual_assets_score: float
+    relevance_score: float = 1.0
     reasons: List[str] = Field(default_factory=list)
 
 

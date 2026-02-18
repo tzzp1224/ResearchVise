@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from core import NormalizedItem
+from pipeline_v2.sanitize import is_allowed_citation_url
 
 _FORBIDDEN_TOKENS = re.compile(r"\b(placeholder|dummy|lorem|todo|testsrc|colorbars)\b", re.IGNORECASE)
+_HTML_TAGS = re.compile(r"<[^>]+>")
 
 
 def _compact_text(value: str, max_len: int) -> str:
@@ -21,6 +23,7 @@ def _compact_text(value: str, max_len: int) -> str:
 
 def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = str(text or "")
+    value = _HTML_TAGS.sub(" ", value)
     value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", value)
     value = re.sub(r"https?://[^\s)\]>]+", "", value)
     value = re.sub(r"\s+", " ", value).strip(" -:;,.")
@@ -38,7 +41,7 @@ def _split_sentences(text: str) -> List[str]:
     seen = set()
     for chunk in chunks:
         sentence = _clean_sentence(chunk, max_len=260)
-        if len(sentence) < 18:
+        if len(sentence) < 20:
             continue
         token = sentence.lower()
         if token in seen:
@@ -72,80 +75,102 @@ def _platform_hint(platform: str) -> Dict[str, str]:
     }
 
 
-def _derive_thesis(item: NormalizedItem, sentences: Sequence[str]) -> str:
-    for sentence in list(sentences or []):
-        if len(sentence) >= 24:
-            return _compact_text(sentence, max_len=190)
-    domain = _domain(item.url)
-    fallback = f"{item.title} is gaining momentum because teams are reporting measurable production impact across {domain} discussions."
-    return _compact_text(fallback, max_len=190)
+def _body_text(item: NormalizedItem) -> str:
+    metadata = dict(item.metadata or {})
+    return str(metadata.get("clean_text") or item.body_md or "")
 
 
-def _metric_point(item: NormalizedItem) -> str:
+def _links(item: NormalizedItem) -> List[str]:
+    urls: List[str] = []
+    for citation in list(item.citations or []):
+        url = str(citation.url or "").strip()
+        if is_allowed_citation_url(url) and url not in urls:
+            urls.append(url)
+    item_url = str(item.url or "").strip()
+    if is_allowed_citation_url(item_url) and item_url not in urls:
+        urls.append(item_url)
+    return urls[:4]
+
+
+def _engagement_line(item: NormalizedItem) -> str:
     metadata = dict(item.metadata or {})
     stars = int(float(metadata.get("stars", 0) or 0))
     downloads = int(float(metadata.get("downloads", 0) or 0))
     points = int(float(metadata.get("points", 0) or 0))
     comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
     if stars > 0:
-        return f"GitHub traction is visible with about {stars} stars, suggesting strong developer pull."
+        return f"Community traction is visible with around {stars} stars and active contributor interest."
     if downloads > 0:
-        return f"Adoption signals are strong with roughly {downloads} downloads in the recent window."
+        return f"Adoption signal is strong with roughly {downloads} downloads in the recent cycle."
     if points > 0 or comments > 0:
-        return f"Community interest is high with {points} points and {comments} comments driving discussion."
-    return "Community signals indicate this topic is moving from experimentation toward repeatable deployment."
+        return f"Discussion signal is high with about {points} points and {comments} comments from practitioners."
+    return "Evidence suggests this is moving from isolated demos toward repeatable production workflows."
 
 
-def _derive_key_points(item: NormalizedItem, thesis: str, sentences: Sequence[str]) -> List[str]:
-    points: List[str] = []
-    thesis_token = thesis.lower()
-    for sentence in list(sentences or []):
-        token = sentence.lower()
-        if token == thesis_token:
+def _why_now(item: NormalizedItem) -> str:
+    metadata = dict(item.metadata or {})
+    recency = metadata.get("published_recency")
+    if recency not in (None, "", "unknown"):
+        try:
+            days = float(recency)
+            return f"The update is recent (about {days:.1f} days old), so teams can apply these changes immediately."
+        except Exception:
+            pass
+    return _engagement_line(item)
+
+
+def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[str, object]:
+    """Extract a structured fact brief used by script/storyboard generation."""
+    text = _body_text(item)
+    sentences = _split_sentences(text)
+    topic_text = str(topic or "").strip()
+
+    what_it_is = ""
+    for sentence in sentences:
+        if len(sentence) >= 32:
+            what_it_is = sentence
+            break
+    if not what_it_is:
+        what_it_is = f"{item.title} is a practical update that targets production engineering workflows."
+
+    how_it_works: List[str] = []
+    for sentence in sentences:
+        if sentence.lower() == what_it_is.lower():
             continue
-        if len(sentence) < 22:
-            continue
-        points.append(_compact_text(sentence, max_len=180))
-        if len(points) >= 2:
+        how_it_works.append(sentence)
+        if len(how_it_works) >= 3:
             break
 
-    citation_snippets = [
-        _clean_sentence(citation.snippet or citation.title, max_len=180)
-        for citation in list(item.citations or [])
-        if _clean_sentence(citation.snippet or citation.title, max_len=180)
-    ]
-    for snippet in citation_snippets:
-        if snippet.lower() == thesis_token:
-            continue
-        if snippet not in points:
-            points.append(snippet)
-        if len(points) >= 3:
+    while len(how_it_works) < 3:
+        fallback = _engagement_line(item) if len(how_it_works) == 0 else f"{item.title} provides concrete implementation signals for engineering teams this week."
+        how_it_works.append(_clean_sentence(fallback, max_len=180))
+
+    proof: List[str] = [_engagement_line(item)]
+    for citation in list(item.citations or [])[:3]:
+        snippet = _clean_sentence(citation.snippet or citation.title, max_len=180)
+        if snippet and snippet not in proof:
+            proof.append(snippet)
+        if len(proof) >= 3:
             break
 
-    if len(points) < 3:
-        points.append(_metric_point(item))
-
-    if len(points) < 3:
-        domain = _domain(item.url)
-        points.append(f"Primary evidence and references are traceable back to {domain}, reducing ambiguity in the narrative.")
-
-    while len(points) < 3:
-        points.append(f"{item.title} provides concrete implementation cues that teams can adapt this week.")
-
-    return [points[0], points[1], points[2]]
-
-
-def _build_hook(item: NormalizedItem) -> str:
-    domain = _domain(item.url)
-    return _compact_text(f"What changed in {item.title}, and why are teams shipping it now across {domain}?", max_len=170)
-
-
-def _build_cta(item: NormalizedItem) -> str:
-    domain = _domain(item.url)
-    return _compact_text(
-        f"Save this brief, review the linked sources, and follow for tomorrow's ranked updates from {domain} and adjacent communities.",
-        max_len=170,
+    links = _links(item)
+    hook = (
+        f"If you're tracking {topic_text}, this is one update worth watching today."
+        if topic_text
+        else f"{item.title} is surfacing as a practical signal teams are shipping now."
     )
+    cta = "Save this brief, review the cited sources, and use the checklist before your next rollout."
+
+    return {
+        "topic": topic_text or None,
+        "hook": _clean_sentence(hook, max_len=170),
+        "what_it_is": _clean_sentence(what_it_is, max_len=190),
+        "why_now": _clean_sentence(_why_now(item), max_len=190),
+        "how_it_works": [_clean_sentence(point, max_len=180) for point in how_it_works[:3]],
+        "proof": [_clean_sentence(point, max_len=180) for point in proof[:3]],
+        "links": links,
+        "cta": _clean_sentence(cta, max_len=170),
+    }
 
 
 def _allocate_sections(total_duration: int) -> List[float]:
@@ -164,31 +189,42 @@ def generate_script(
     duration_sec: int,
     platform: str,
     tone: str,
+    *,
+    facts: Optional[Dict[str, object]] = None,
+    topic: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Generate a time-coded script with deterministic structure."""
+    """Generate a time-coded script from structured facts (no raw snippet stitching)."""
     target = max(20, min(int(duration_sec), 75))
     tone_text = str(tone or "professional").strip() or "professional"
     hints = _platform_hint(platform)
 
-    sentences = _split_sentences(item.body_md)
-    hook = _build_hook(item)
-    thesis = _derive_thesis(item, sentences)
-    key_points = _derive_key_points(item, thesis, sentences)
-    cta_text = _build_cta(item)
+    facts_payload = dict(facts or build_facts(item, topic=topic))
+    hook = _clean_sentence(str(facts_payload.get("hook") or ""), max_len=170)
+    thesis = _clean_sentence(str(facts_payload.get("what_it_is") or ""), max_len=190)
+    key_points_raw = list(facts_payload.get("how_it_works") or [])
+    key_points = [_clean_sentence(str(point), max_len=180) for point in key_points_raw if _clean_sentence(str(point), max_len=180)]
+    while len(key_points) < 3:
+        key_points.append(_clean_sentence(_engagement_line(item), max_len=180))
+    key_points = key_points[:3]
+    cta_text = _clean_sentence(str(facts_payload.get("cta") or ""), max_len=170)
+
+    links = [str(url).strip() for url in list(facts_payload.get("links") or []) if is_allowed_citation_url(str(url).strip())]
+    if not links:
+        links = _links(item)
 
     section_plan = [
-        ("hook", hook),
-        ("thesis", thesis),
-        ("point_1", key_points[0]),
-        ("point_2", key_points[1]),
-        ("point_3", key_points[2]),
-        ("cta", cta_text),
+        ("hook", hook, links[:1]),
+        ("thesis", thesis, links[:1]),
+        ("point_1", key_points[0], links[:2]),
+        ("point_2", key_points[1], links[1:3] or links[:1]),
+        ("point_3", key_points[2], links[2:4] or links[:1]),
+        ("cta", cta_text, links[:1]),
     ]
     durations = _allocate_sections(target)
 
     lines: List[Dict[str, object]] = []
     cursor = 0.0
-    for idx, ((section, sentence), slot) in enumerate(zip(section_plan, durations), start=1):
+    for idx, ((section, sentence, refs), slot) in enumerate(zip(section_plan, durations), start=1):
         duration = max(1.6, float(slot))
         end = min(float(target), cursor + duration)
         line_text = _clean_sentence(sentence, max_len=180)
@@ -202,6 +238,7 @@ def generate_script(
                 "duration_sec": round(end - cursor, 2),
                 "section": section,
                 "text": line_text,
+                "references": [ref for ref in refs if str(ref).strip()],
             }
         )
         cursor = end
@@ -209,6 +246,31 @@ def generate_script(
     if lines:
         lines[-1]["end_sec"] = float(target)
         lines[-1]["duration_sec"] = round(float(target) - float(lines[-1]["start_sec"]), 2)
+
+    evidence: List[Dict[str, str]] = []
+    for idx, proof in enumerate(list(facts_payload.get("proof") or [])[:3], start=1):
+        text = _clean_sentence(str(proof), max_len=180)
+        if not text:
+            continue
+        evidence.append(
+            {
+                "title": f"fact_{idx}",
+                "url": links[min(idx - 1, len(links) - 1)] if links else "",
+                "snippet": text,
+            }
+        )
+
+    for citation in item.citations[:5]:
+        snippet = _clean_sentence(citation.snippet or citation.title, max_len=200)
+        if not snippet:
+            continue
+        evidence.append(
+            {
+                "title": _clean_sentence(citation.title, max_len=140),
+                "url": citation.url,
+                "snippet": snippet,
+            }
+        )
 
     return {
         "item_id": item.id,
@@ -219,6 +281,7 @@ def generate_script(
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "hook_strategy": hints["hook"],
         "cadence": hints["cadence"],
+        "facts": facts_payload,
         "structure": {
             "hook": hook,
             "main_thesis": thesis,
@@ -226,14 +289,7 @@ def generate_script(
             "cta": cta_text,
         },
         "lines": lines,
-        "evidence": [
-            {
-                "title": _clean_sentence(citation.title, max_len=140),
-                "url": citation.url,
-                "snippet": _clean_sentence(citation.snippet, max_len=200),
-            }
-            for citation in item.citations[:8]
-        ],
+        "evidence": evidence[:8],
     }
 
 

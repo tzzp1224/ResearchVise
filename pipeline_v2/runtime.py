@@ -22,7 +22,7 @@ from pipeline_v2.notification import notify_user, post_to_web, send_email
 from pipeline_v2.prompt_compiler import compile_storyboard
 from pipeline_v2.report_export import export_package, generate_onepager, generate_thumbnail
 from pipeline_v2.scoring import rank_items
-from pipeline_v2.script_generator import generate_script
+from pipeline_v2.script_generator import build_facts, generate_script
 from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
 from render import align_subtitles, mix_bgm, tts_generate
 from render.manager import RenderManager
@@ -169,6 +169,7 @@ class RunPipelineRuntime:
             data_mode=data_mode,
             raw_items=raw_items,
             run_id=run_id,
+            topic=request.topic,
         )
         run_context_path = self._write_json(out_dir / "run_context.json", run_context)
         self._orchestrator.mark_run_progress(run_id, 0.18)
@@ -184,25 +185,43 @@ class RunPipelineRuntime:
         embeddings = embed(unique_items)
         grouped = cluster(unique_items, embeddings)
         merged = [merge_cluster(group) for group in grouped]
-        ranked = rank_items(merged)
+        ranked = rank_items(merged, topic=request.topic)
         top_count = self._top_n(request)
         picks = ranked[:top_count]
         if not picks:
             raise RuntimeError("no ranked items available")
+
+        run_context["ranking_stats"] = {
+            "topic": str(request.topic or "").strip() or None,
+            "top_item_ids": [entry.item.id for entry in picks],
+            "top_relevance_scores": [round(float(entry.relevance_score), 4) for entry in picks],
+            "relevance_threshold": 0.55,
+            "min_body_len_for_top_picks": 300,
+        }
+        run_context_path = self._write_json(out_dir / "run_context.json", run_context)
 
         self._orchestrator.mark_run_progress(run_id, 0.42)
         self._orchestrator.append_event(run_id, "ranking_done", f"picked={len(picks)}")
 
         primary = picks[0].item
         duration = self._duration_sec(request)
+        facts = build_facts(primary, topic=request.topic)
+        primary.metadata["facts"] = facts
+        facts_path = self._write_json(out_dir / "facts.json", facts)
+        self._record_artifact(run_id, Artifact(type=ArtifactType.FACTS, path=facts_path, metadata={"item_id": primary.id}))
         script = generate_script(
             primary,
             duration_sec=duration,
             platform=self._platform(request),
             tone=self._tone(request),
+            facts=facts,
+            topic=request.topic,
         )
         script_path = self._write_json(out_dir / "script.json", script)
-        self._record_artifact(run_id, Artifact(type=ArtifactType.SCRIPT, path=script_path, metadata={"item_id": primary.id}))
+        self._record_artifact(
+            run_id,
+            Artifact(type=ArtifactType.SCRIPT, path=script_path, metadata={"item_id": primary.id, "facts_path": facts_path}),
+        )
         self._ensure_not_canceled(run_id)
 
         board = script_to_storyboard(
@@ -244,6 +263,7 @@ class RunPipelineRuntime:
                     "prompt_bundle_path": prompt_bundle_path,
                     "materials_path": materials_path,
                     "shots": len(board.shots),
+                    "facts_path": facts_path,
                 },
             ),
         )
@@ -269,6 +289,7 @@ class RunPipelineRuntime:
                     "materials_path": materials_path,
                     "run_context_path": run_context_path,
                     "data_mode": data_mode,
+                    "facts_path": facts_path,
                 },
             ),
         )
@@ -415,6 +436,7 @@ class RunPipelineRuntime:
         run_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         top_items = [entry.item for entry in list(picks or [])]
+        facts = dict(primary.metadata.get("facts") or {})
         screenshot_plan = []
         icon_keywords = set()
         source_urls = set()
@@ -476,10 +498,17 @@ class RunPipelineRuntime:
                 "published_recency": primary.metadata.get("published_recency"),
                 "link_count": int(float(primary.metadata.get("link_count", 0) or 0)),
             },
+            "facts": facts,
         }
 
     @staticmethod
-    def _build_run_context(*, data_mode: str, raw_items: Sequence[RawItem], run_id: str) -> Dict[str, Any]:
+    def _build_run_context(
+        *,
+        data_mode: str,
+        raw_items: Sequence[RawItem],
+        run_id: str,
+        topic: Optional[str],
+    ) -> Dict[str, Any]:
         now = _utcnow().isoformat(timespec="seconds")
         connector_stats: Dict[str, Dict[str, Any]] = {}
         extraction_methods: Dict[str, int] = {}
@@ -507,6 +536,7 @@ class RunPipelineRuntime:
         return {
             "run_id": run_id,
             "data_mode": str(data_mode or "live"),
+            "topic": str(topic or "").strip() or None,
             "connector_stats": connector_stats,
             "extraction_stats": {
                 "methods": extraction_methods,

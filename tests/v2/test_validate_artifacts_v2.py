@@ -34,6 +34,9 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["onepager_domain_rows_ge_3"] is True
     assert report["checks"]["mp4_duration_ge_10"] is True
     assert report["checks"]["render_status_seedance_flag_present"] is True
+    assert report["checks"]["script_no_html_tokens"] is True
+    assert report["checks"]["onepager_no_html_tokens"] is True
+    assert report["checks"]["topic_relevance_ok"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:

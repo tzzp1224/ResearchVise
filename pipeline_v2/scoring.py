@@ -37,6 +37,77 @@ def _quality_metrics(item: NormalizedItem) -> Tuple[int, int, Optional[float], i
     return body_len, citation_count, published_recency, link_count
 
 
+_TOPIC_STOP_WORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "for",
+    "to",
+    "of",
+    "in",
+    "on",
+    "with",
+    "today",
+    "latest",
+    "news",
+}
+
+
+def _topic_tokens(topic: Optional[str]) -> List[str]:
+    parts = re.findall(r"[a-z0-9]+", str(topic or "").lower())
+    tokens = [token for token in parts if token not in _TOPIC_STOP_WORDS and len(token) >= 2]
+    deduped: List[str] = []
+    seen = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def _has_token(text: str, token: str) -> bool:
+    return re.search(rf"\b{re.escape(token)}\b", text) is not None
+
+
+def score_relevance(item: NormalizedItem, topic: Optional[str]) -> float:
+    """Topic relevance score for top-pick gating (lexical MVP, embedding-ready interface)."""
+    tokens = _topic_tokens(topic)
+    if not tokens:
+        return 1.0
+
+    metadata = dict(item.metadata or {})
+    topic_text = " ".join(
+        [
+            str(item.title or ""),
+            str(metadata.get("clean_text") or item.body_md or ""),
+            " ".join(str(tag) for tag in list(metadata.get("topics") or [])),
+            str(metadata.get("item_type") or ""),
+        ]
+    ).lower()
+
+    matched = sum(1 for token in tokens if _has_token(topic_text, token))
+    coverage = float(matched) / float(max(1, len(tokens)))
+
+    phrase = " ".join(tokens)
+    phrase_bonus = 0.2 if phrase and phrase in topic_text else 0.0
+
+    # Token proxies for typical "AI agent" semantics while staying deterministic.
+    proxy_bonus = 0.0
+    if "agent" in tokens and any(
+        hint in topic_text for hint in ("tool calling", "mcp", "workflow", "orchestrat", "assistant", "autonomous")
+    ):
+        proxy_bonus += 0.12
+    if "ai" in tokens and any(hint in topic_text for hint in ("llm", "model", "inference", "reasoning")):
+        proxy_bonus += 0.08
+
+    density = min(1.0, topic_text.count(tokens[0]) / 4.0) if tokens else 0.0
+    base = 0.1 if coverage > 0 else 0.0
+    return _clamp01(base + 0.65 * coverage + 0.15 * density + phrase_bonus + proxy_bonus)
+
+
 def _is_short_announcement(item: NormalizedItem) -> bool:
     text = f"{item.title}\n{item.body_md}".lower()
     markers = [
@@ -143,6 +214,8 @@ def rank_items(
     *,
     tier_b_top3_talkability_threshold: float = 0.88,
     min_body_len_for_top_picks: int = 300,
+    topic: Optional[str] = None,
+    relevance_threshold: float = 0.55,
 ) -> List[RankedItem]:
     """Rank items with explainable subscores and Tier B top3 gate."""
     staged = []
@@ -153,6 +226,8 @@ def rank_items(
             body_len >= int(min_body_len_for_top_picks)
             or (short_announcement and citation_count >= 1 and link_count >= 1)
         )
+        relevance_score = score_relevance(item, topic)
+        relevance_eligible = bool(relevance_score >= float(relevance_threshold))
 
         scores = {
             "novelty": score_novelty(item),
@@ -161,6 +236,7 @@ def rank_items(
             "visual_assets": score_visual_assets(item),
         }
         total = _weighted_total(scores)
+        total = _clamp01(total * (0.5 + 0.5 * relevance_score))
 
         if citation_count <= 0:
             total = _clamp01(total * 0.76)
@@ -168,6 +244,8 @@ def rank_items(
             total = _clamp01(total * 0.82)
         if not quality_eligible:
             total = _clamp01(total * 0.72)
+        if topic and not relevance_eligible:
+            total = _clamp01(total * 0.45)
 
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
@@ -186,6 +264,8 @@ def rank_items(
                 link_count,
                 quality_eligible,
                 short_announcement,
+                relevance_score,
+                relevance_eligible,
             )
         )
 
@@ -195,8 +275,24 @@ def rank_items(
     top: List[tuple] = []
     deferred_tier_b: List[tuple] = []
     deferred_quality_gate: List[tuple] = []
+    deferred_relevance_gate: List[tuple] = []
     for row in staged:
-        item, scores, _total, _body_len, _citation_count, _published_recency, _link_count, quality_eligible, _short_announcement = row
+        (
+            item,
+            scores,
+            _total,
+            _body_len,
+            _citation_count,
+            _published_recency,
+            _link_count,
+            quality_eligible,
+            _short_announcement,
+            relevance_score,
+            relevance_eligible,
+        ) = row
+        if topic and not relevance_eligible:
+            deferred_relevance_gate.append(row)
+            continue
         if not quality_eligible:
             deferred_quality_gate.append(row)
             continue
@@ -205,7 +301,7 @@ def rank_items(
             continue
         top.append(row)
 
-    ordered = top + deferred_tier_b + deferred_quality_gate
+    ordered = top + deferred_tier_b + deferred_quality_gate + deferred_relevance_gate
     ranked: List[RankedItem] = []
     for idx, (
         item,
@@ -217,18 +313,22 @@ def rank_items(
         link_count,
         quality_eligible,
         short_announcement,
+        relevance_score,
+        relevance_eligible,
     ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
             f"talkability={scores['talkability']:.2f}",
             f"credibility={scores['credibility']:.2f}",
             f"visual_assets={scores['visual_assets']:.2f}",
+            f"relevance={relevance_score:.2f}",
             f"tier={item.tier}",
             f"quality.body_len={body_len}",
             f"quality.citation_count={citation_count}",
             f"quality.published_recency_days={published_recency if published_recency is not None else 'unknown'}",
             f"quality.link_count={link_count}",
             f"quality.top_pick_gate={'pass' if quality_eligible else 'deferred'}",
+            f"quality.relevance_gate={'pass' if relevance_eligible else 'deferred'}",
         ]
         if short_announcement:
             reasons.append("quality.short_announcement=true")
@@ -238,6 +338,8 @@ def rank_items(
             reasons.append("penalty.missing_published_time")
         if not quality_eligible:
             reasons.append(f"penalty.body_len_lt_{int(min_body_len_for_top_picks)}")
+        if topic and not relevance_eligible:
+            reasons.append(f"penalty.relevance_lt_{float(relevance_threshold):.2f}")
         if item.tier == "B" and idx <= 3 and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             reasons.append("tier_b_top3_override=talkability")
 
@@ -250,6 +352,7 @@ def rank_items(
                 talkability_score=scores["talkability"],
                 credibility_score=scores["credibility"],
                 visual_assets_score=scores["visual_assets"],
+                relevance_score=relevance_score,
                 reasons=reasons,
             )
         )

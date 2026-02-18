@@ -44,6 +44,7 @@ def script_to_storyboard(script: Dict[str, object], constraints: Dict[str, objec
         end_sec = float(line.get("end_sec", start_sec + 4.0) or (start_sec + 4.0))
         duration = max(1.0, end_sec - start_sec)
         text = str(line.get("text") or "").strip()
+        references = [str(item).strip() for item in list(line.get("references") or []) if str(item).strip()]
 
         shots.append(
             Shot(
@@ -54,7 +55,7 @@ def script_to_storyboard(script: Dict[str, object], constraints: Dict[str, objec
                 subject_id=f"subject_{idx}",
                 action=text or "Explain technical insight",
                 overlay_text=text[:72] if text else None,
-                reference_assets=[],
+                reference_assets=references,
             )
         )
 

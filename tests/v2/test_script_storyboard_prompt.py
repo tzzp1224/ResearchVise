@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core import NormalizedItem, Shot, Storyboard
+from core import Citation, NormalizedItem, Shot, Storyboard
 from pipeline_v2.prompt_compiler import compile_shot_prompt, compile_storyboard, consistency_pack
 from pipeline_v2.script_generator import generate_script, generate_variants
 from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
@@ -17,11 +17,18 @@ def _sample_item() -> NormalizedItem:
             "Deployment guide includes rollback strategy and canary metrics. "
             "Benchmark chart compares baseline and optimized path."
         ),
-        citations=[],
+        citations=[
+            Citation(
+                title="Release notes",
+                url="https://example.com/item_1/release",
+                snippet="Latency improved by 23% in production routing.",
+                source="github",
+            )
+        ],
         tier="A",
         lang="en",
         hash="hash_item_1",
-        metadata={"credibility": "high"},
+        metadata={"credibility": "high", "clean_text": "Architecture update improves context routing latency by 23% with canary metrics."},
     )
 
 
@@ -36,6 +43,8 @@ def test_generate_script_and_variants() -> None:
     assert "main_thesis" in script["structure"]
     assert len(list(script["structure"]["key_points"])) == 3
     assert "placeholder" not in str(script).lower()
+    assert "facts" in script
+    assert str(script["facts"]["what_it_is"]).strip() != ""
 
     variants = generate_variants(script, ["reels", "youtube"])
     assert "reels" in variants
@@ -53,6 +62,7 @@ def test_script_to_storyboard_validate_and_autofix() -> None:
     ok, errors = validate_storyboard(board)
     assert ok is True
     assert errors == []
+    assert any(shot.reference_assets for shot in board.shots)
 
     broken = Storyboard(
         run_id="run_1",

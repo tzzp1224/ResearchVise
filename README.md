@@ -1,6 +1,44 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Sanitize + Relevance Gate + Facts-Driven Script (New)
+- 本次目标：
+  - 消除 live 产物中的 README HTML/badge/赞助链接污染。
+  - 增加 topic relevance 硬门禁，防止选题跑偏。
+  - 用 `facts.json` 驱动 script/storyboard/prompt，避免 raw snippet 拼接。
+- 实际改动：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py`：
+    - 清洗 HTML/徽章/推广链接/图片直链，提供 citation URL denylist 过滤。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - 全链路改用清洗后的 `clean_text` 做正文与质量指标。
+    - `extract_citations` 新增 denylist 过滤（屏蔽 `img.shields.io`/`buymeacoffee`/`github sponsors`/图片直链）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - 新增 `score_relevance(topic)` 与 `relevance_threshold` 门禁。
+    - Top picks 需通过 `body/evidence/relevance` 三重 gate。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - 新增 `build_facts`，输出结构化事实（what/why/how/proof/links）。
+    - `generate_script` 改为 facts 驱动并输出 `facts` 字段，行级 references 落盘。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/storyboard_generator.py`：
+    - 将 script 行级 `references` 映射到 `shot.reference_assets`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - ranking 传入 `topic`；新增 `facts.json` 产物；`run_context.json` 落盘 `topic/ranking_stats`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增门禁：`script/onepager/storyboard/prompt_bundle` 不含 HTML token。
+    - 新增门禁：citation denylist 检查、topic relevance 检查。
+  - 修改 contracts/exports/tests：
+    - `ArtifactType` 新增 `facts`，`RankedItem` 新增 `relevance_score`。
+    - 新增 `tests/v2/test_sanitize.py`，并更新 normalize/scoring/script/runtime/validator 测试。
+- 新增/删除文件：
+  - 新增：`pipeline_v2/sanitize.py`, `tests/v2/test_sanitize.py`
+  - 修改：`core/contracts.py`, `pipeline_v2/{__init__.py,normalize.py,scoring.py,script_generator.py,storyboard_generator.py,runtime.py,report_export.py,prompt_compiler.py}`, `scripts/validate_artifacts_v2.py`, `tests/v2/{test_normalize.py,test_scoring.py,test_script_storyboard_prompt.py,test_runtime_integration.py,test_validate_artifacts_v2.py}`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_quality_check > /tmp/ara_v2_quality_check/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_quality_check/runs/<run_id> --render-dir /tmp/ara_v2_quality_check/render_jobs/<render_job_id>`
+- 已知风险与回滚：
+  - 风险：`topic relevance` 阈值偏高时可能减少 Top picks 数量（尤其是 narrow topic + 弱内容源场景）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Run-Once Live Workflow & Live-Smoke Validator Guard (New)
 - 本次目标：
   - 把“最小可运行链路”统一到单命令 `run-once --mode live`，降低操作复杂度。

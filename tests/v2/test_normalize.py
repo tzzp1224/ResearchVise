@@ -22,6 +22,29 @@ def test_extract_citations_from_markdown_and_url() -> None:
     assert "https://example.com/main" in urls
 
 
+def test_extract_citations_filters_badge_and_image_urls() -> None:
+    raw = RawItem(
+        id="raw_bad",
+        source="github",
+        title="Repo",
+        url="https://github.com/acme/repo",
+        body=(
+            "[badge](https://img.shields.io/badge/ci-pass)\n"
+            "See https://buymeacoffee.com/demo\n"
+            "image https://example.com/logo.svg\n"
+            "docs https://example.com/docs"
+        ),
+        metadata={},
+    )
+
+    citations = extract_citations(raw)
+    urls = {item.url for item in citations}
+    assert "https://example.com/docs" in urls
+    assert "https://img.shields.io/badge/ci-pass" not in urls
+    assert "https://buymeacoffee.com/demo" not in urls
+    assert "https://example.com/logo.svg" not in urls
+
+
 def test_normalize_assigns_tier_b_credibility_and_hash() -> None:
     raw = RawItem(
         id="raw_2",

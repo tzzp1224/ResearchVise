@@ -8,7 +8,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from typing import Dict, List, Optional, Tuple
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from pipeline_v2.sanitize import contains_html_like_tokens, is_allowed_citation_url
 
 
 BLOCKLIST = {"placeholder", "dummy", "lorem", "todo", "testsrc", "colorbars"}
@@ -27,6 +34,10 @@ def _load_json(path: Path) -> Dict:
 def _contains_blocklist(text: str) -> List[str]:
     lowered = str(text or "").lower()
     return [word for word in sorted(BLOCKLIST) if word in lowered]
+
+
+def _extract_urls(text: str) -> List[str]:
+    return [str(url).strip().rstrip(".,;:") for url in re.findall(r"https?://[^\s)]+", str(text or ""))]
 
 
 def _ffprobe_info(path: Path) -> Tuple[bool, Dict, str]:
@@ -156,6 +167,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         "script": run_dir / "script.json",
         "onepager": run_dir / "onepager.md",
         "storyboard": run_dir / "storyboard.json",
+        "prompt_bundle": run_dir / "prompt_bundle.json",
         "materials": run_dir / "materials.json",
         "mp4": render_dir / "rendered_final.mp4",
     }
@@ -168,6 +180,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
     script_path = required["script"]
     onepager_path = required["onepager"]
     storyboard_path = required["storyboard"]
+    prompt_bundle_path = required["prompt_bundle"]
     mp4_path = required["mp4"]
     if not mp4_path.exists():
         fallback_mp4 = render_dir / "fallback_render.mp4"
@@ -186,29 +199,44 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["script_len_ok"] = len(script_text) >= MIN_SCRIPT_LEN
         report["checks"]["script_blocklist_ok"] = len(block_hits) == 0
         report["checks"]["script_has_lines"] = bool(script_payload.get("lines"))
+        report["checks"]["script_no_html_tokens"] = not contains_html_like_tokens(script_text)
         report["checks"]["script_structure_ok"] = bool(
             str(structure.get("hook") or "").strip()
             and str(structure.get("main_thesis") or "").strip()
             and len([item for item in key_points if str(item).strip()]) >= 3
             and str(structure.get("cta") or "").strip()
         )
+        script_urls = _extract_urls(script_text)
+        script_bad_urls = [url for url in script_urls if not is_allowed_citation_url(url)]
+        report["checks"]["script_citation_denylist_ok"] = len(script_bad_urls) == 0
         if block_hits:
             report["errors"].append("script_blocklist:" + ",".join(block_hits))
+        if not report["checks"]["script_no_html_tokens"]:
+            report["errors"].append("script_html_tokens_present")
+        if script_bad_urls:
+            report["errors"].append("script_citation_denylist:" + ",".join(sorted(set(script_bad_urls))[:6]))
 
     if onepager_path.exists():
         onepager = onepager_path.read_text(encoding="utf-8")
-        urls = re.findall(r"https?://[^\s)]+", onepager)
+        urls = _extract_urls(onepager)
         top_pick_headings = re.findall(r"^###\s+\d+\.\s+", onepager, flags=re.MULTILINE)
         domain_rows = re.findall(r"^-\s*Source Domain:\s*`[^`]+`", onepager, flags=re.MULTILINE)
         block_hits = _contains_blocklist(onepager)
+        bad_urls = [url for url in urls if not is_allowed_citation_url(url)]
         report["checks"]["onepager_url_count_ge_3"] = len(urls) >= 3
         report["checks"]["onepager_top_picks_ge_3"] = len(top_pick_headings) >= 3
         report["checks"]["onepager_domain_rows_ge_3"] = len(domain_rows) >= 3
         report["checks"]["onepager_blocklist_ok"] = len(block_hits) == 0
+        report["checks"]["onepager_no_html_tokens"] = not contains_html_like_tokens(onepager)
+        report["checks"]["onepager_citation_denylist_ok"] = len(bad_urls) == 0
         report["details"]["onepager_url_count"] = len(urls)
         report["details"]["onepager_top_pick_count"] = len(top_pick_headings)
         if block_hits:
             report["errors"].append("onepager_blocklist:" + ",".join(block_hits))
+        if bad_urls:
+            report["errors"].append("onepager_citation_denylist:" + ",".join(sorted(set(bad_urls))[:6]))
+        if not report["checks"]["onepager_no_html_tokens"]:
+            report["errors"].append("onepager_html_tokens_present")
         mode_match = re.search(r"^- DataMode:\s*`?(live|smoke)`?\s*$", onepager, flags=re.IGNORECASE | re.MULTILINE)
         if mode_match:
             report["details"]["data_mode"] = str(mode_match.group(1)).lower()
@@ -220,6 +248,16 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["storyboard_overlay_non_empty"] = all(
             str((shot or {}).get("overlay_text") or "").strip() != "" for shot in shots
         )
+        report["checks"]["storyboard_no_html_tokens"] = not contains_html_like_tokens(json.dumps(storyboard, ensure_ascii=False))
+        if not report["checks"]["storyboard_no_html_tokens"]:
+            report["errors"].append("storyboard_html_tokens_present")
+
+    if prompt_bundle_path.exists():
+        prompt_bundle = _load_json(prompt_bundle_path)
+        bundle_text = json.dumps(prompt_bundle, ensure_ascii=False)
+        report["checks"]["prompt_bundle_no_html_tokens"] = not contains_html_like_tokens(bundle_text)
+        if not report["checks"]["prompt_bundle_no_html_tokens"]:
+            report["errors"].append("prompt_bundle_html_tokens_present")
 
     if mp4_path.exists():
         ok, info, error = _ffprobe_info(mp4_path)
@@ -298,6 +336,30 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("live_placeholder_repo_url")
     elif data_mode == "smoke":
         report["checks"]["smoke_mode_detected"] = True
+
+    topic_value = ""
+    ranking_stats = {}
+    if run_context_path.exists():
+        try:
+            run_context = _load_json(run_context_path)
+            topic_value = str(run_context.get("topic") or "").strip()
+            ranking_stats = dict(run_context.get("ranking_stats") or {})
+        except Exception:
+            topic_value = ""
+            ranking_stats = {}
+
+    if topic_value and data_mode == "live":
+        scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
+        if not scores and onepager_path.exists():
+            onepager = onepager_path.read_text(encoding="utf-8")
+            scores = [float(value) for value in re.findall(r"Topic Relevance:\\s*`([0-9.]+)`", onepager)]
+        report["checks"]["topic_relevance_ok"] = bool(scores and min(scores[:3]) >= 0.55)
+        report["details"]["topic"] = topic_value
+        report["details"]["topic_relevance_scores"] = scores[:3]
+        if not report["checks"]["topic_relevance_ok"]:
+            report["errors"].append("topic_relevance_below_threshold")
+    else:
+        report["checks"]["topic_relevance_ok"] = True
 
     report["ok"] = len(report["errors"]) == 0 and all(bool(v) for v in report["checks"].values())
     return report

@@ -9,10 +9,11 @@ from .scoring import (
     rank_items,
     score_credibility,
     score_novelty,
+    score_relevance,
     score_talkability,
     score_visual_assets,
 )
-from .script_generator import generate_script, generate_variants
+from .script_generator import build_facts, generate_script, generate_variants
 from .storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
 from .notification import notify_user, post_to_web, send_email
 
@@ -27,6 +28,7 @@ __all__ = [
     "embed",
     "export_package",
     "extract_citations",
+    "build_facts",
     "generate_onepager",
     "generate_script",
     "generate_thumbnail",
@@ -41,6 +43,7 @@ __all__ = [
     "send_email",
     "score_credibility",
     "score_novelty",
+    "score_relevance",
     "score_talkability",
     "score_visual_assets",
     "script_to_storyboard",

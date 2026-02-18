@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from core import Citation, NormalizedItem, RawItem
+from pipeline_v2.sanitize import is_allowed_citation_url, sanitize_markdown
 
 
 _TIER_A_SOURCES = {
@@ -87,24 +88,31 @@ def extract_citations(item: Any) -> List[Citation]:
     raw = _to_raw_item(item)
     metadata = dict(raw.metadata or {})
     body = str(raw.body or "")
+    _clean_md, clean_text, _sanitize_stats = sanitize_markdown(body)
 
     citations: List[Citation] = []
 
     for entry in list(metadata.get("citations") or []):
         if isinstance(entry, dict):
+            url = str(entry.get("url") or "").strip()
+            if url and not is_allowed_citation_url(url):
+                continue
             citations.append(
                 Citation(
                     title=_compact_text(entry.get("title") or raw.title, max_len=140),
-                    url=str(entry.get("url") or "").strip(),
+                    url=url,
                     snippet=_compact_text(entry.get("snippet") or "", max_len=220),
                     source=str(entry.get("source") or raw.source),
                 )
             )
         elif isinstance(entry, str) and entry.strip().startswith("http"):
+            url = entry.strip()
+            if not is_allowed_citation_url(url):
+                continue
             citations.append(
                 Citation(
                     title=_compact_text(raw.title, max_len=140),
-                    url=entry.strip(),
+                    url=url,
                     snippet="",
                     source=raw.source,
                 )
@@ -112,32 +120,36 @@ def extract_citations(item: Any) -> List[Citation]:
 
     md_links = re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", body)
     for title, link in md_links:
+        if not is_allowed_citation_url(str(link).strip()):
+            continue
         citations.append(
             Citation(
                 title=_compact_text(title, max_len=140),
                 url=str(link).strip(),
-                snippet=_compact_text(body, max_len=220),
+                snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
         )
 
     plain_urls = re.findall(r"https?://[^\s)\]>]+", body)
     for link in plain_urls[:6]:
+        if not is_allowed_citation_url(str(link).strip()):
+            continue
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
                 url=str(link).strip(),
-                snippet=_compact_text(body, max_len=220),
+                snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
         )
 
-    if raw.url:
+    if raw.url and is_allowed_citation_url(str(raw.url).strip()):
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
                 url=str(raw.url).strip(),
-                snippet=_compact_text(raw.body, max_len=220),
+                snippet=_compact_text(clean_text, max_len=220),
                 source=raw.source,
             )
         )
@@ -157,12 +169,13 @@ def extract_citations(item: Any) -> List[Citation]:
 def content_hash(item: Any) -> str:
     """Stable content hash for exact deduplication."""
     raw = _to_raw_item(item)
+    _clean_md, clean_text, _sanitize_stats = sanitize_markdown(str(raw.body or ""))
     payload = "|".join(
         [
             str(raw.source or "").strip().lower(),
             str(raw.title or "").strip().lower(),
             str(raw.url or "").strip().lower(),
-            re.sub(r"\s+", " ", str(raw.body or "").strip().lower()),
+            re.sub(r"\s+", " ", str(clean_text or "").strip().lower()),
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
@@ -211,11 +224,12 @@ def normalize(raw: Any) -> NormalizedItem:
     citations = extract_citations(item)
     digest = content_hash(item)
     published = _parse_datetime(item.published_at)
+    clean_md, clean_text, sanitize_stats = sanitize_markdown(str(item.body or ""))
 
     metadata: Dict[str, Any] = dict(item.metadata or {})
-    body_text = str(item.body or "").strip()
+    body_text = str(clean_text or "").strip()
     body_len = len(re.sub(r"\s+", " ", body_text))
-    link_count = _count_links(body_text, str(item.url or ""))
+    link_count = max(_count_links(body_text, str(item.url or "")), len(citations))
     published_recency = _published_recency_days(published)
 
     metadata["credibility"] = _infer_credibility(
@@ -238,6 +252,8 @@ def normalize(raw: Any) -> NormalizedItem:
         "published_recency": published_recency,
         "link_count": link_count,
     }
+    metadata["clean_text"] = clean_text
+    metadata["sanitize"] = sanitize_stats
 
     return NormalizedItem(
         id=str(item.id).strip(),
@@ -246,7 +262,7 @@ def normalize(raw: Any) -> NormalizedItem:
         url=str(item.url or "").strip(),
         author=str(item.author).strip() if item.author else None,
         published_at=published,
-        body_md=body_text,
+        body_md=clean_md or body_text,
         citations=citations,
         tier=tier,  # type: ignore[arg-type]
         lang=str(metadata.get("lang") or "en").strip() or "en",
