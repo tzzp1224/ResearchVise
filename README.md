@@ -1,59 +1,201 @@
-# AcademicResearchAgent v2
+# AcademicResearchAgent v2 状态说明（实装审计版）
 
-This repository now runs a unified v2 pipeline:
+本文档说明当前仓库的真实实现状态、可运行命令、产物路径、Seedance 接入现状、限制与下一步。
 
-`RunRequest -> connectors -> normalize -> dedup/cluster -> rank -> script -> storyboard -> prompt compile -> render queue -> postprocess -> export/notify`
+## 1) 当前真实入口与数据流
 
-## Entry Points
+### 1.1 触发入口
+- CLI 入口：`main.py`
+  - 点播：`ondemand`
+  - 订阅：`daily-subscribe`
+  - 定时触发：`daily-tick`
+  - Worker：`worker-run-next` / `worker-render-next`
+- API 入口：`webapp/v2_app.py`
+  - 点播：`POST /api/v2/runs/ondemand`
+  - 订阅：`POST /api/v2/runs/daily/schedule`
+  - 定时触发：`POST /api/v2/runs/daily/tick`
+  - Worker：`POST /api/v2/workers/runs/next` / `POST /api/v2/workers/render/next`
+- 队列与调度：
+  - Run 队列：`orchestrator/queue.py` `InMemoryRunQueue`
+  - Orchestrator：`orchestrator/service.py` `RunOrchestrator`
+  - 状态存储：`orchestrator/store.py` `InMemoryRunStore`
+- 日常 08:00 机制：
+  - 由 `RunOrchestrator.trigger_due_daily_runs()` 计算本地时区是否到点并入队。
+  - 本项目未内置 OS 级 cron 守护，需外部调度器定时调用 `daily-tick` 或对应 API。
 
-- CLI: `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/main.py`
-- API: `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/webapp/v2_app.py`
-- Smoke command: `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/e2e_smoke_v2.py`
+### 1.2 核心结构定义
+- `RunRequest` / `RunStatus` / `RenderStatus` / `Artifact`：
+  - 定义在 `core/contracts.py`
+- `RenderJob`（渲染内部任务对象）：
+  - 定义在 `render/manager.py`
 
-## Quick Start
+### 1.3 E2E 调用链（真实代码）
 
-1. On-demand enqueue
-
-```bash
-python main.py ondemand --user-id u1 --topic "mcp deployment" --time-window 24h --tz America/Los_Angeles
+```text
+CLI/API
+  -> RunOrchestrator.enqueue_run()                         (orchestrator/service.py)
+  -> InMemoryRunQueue.enqueue()                            (orchestrator/queue.py)
+  -> worker-run-next / POST /workers/runs/next
+  -> RunPipelineRuntime.run_next()                         (pipeline_v2/runtime.py)
+      -> _collect_raw_items() -> sources.connectors.*      (sources/connectors.py)
+      -> normalize()                                        (pipeline_v2/normalize.py)
+      -> dedup_exact/embed/cluster/merge_cluster()          (pipeline_v2/dedup_cluster.py)
+      -> rank_items()                                       (pipeline_v2/scoring.py)
+      -> generate_script()                                  (pipeline_v2/script_generator.py)
+      -> script_to_storyboard()/validate/auto_fix           (pipeline_v2/storyboard_generator.py)
+      -> compile_storyboard()                               (pipeline_v2/prompt_compiler.py)
+      -> enqueue_render()                                   (render/manager.py)
+      -> tts_generate/align_subtitles/mix_bgm              (render/audio_subtitles.py)
+      -> generate_onepager/thumbnail/export_package         (pipeline_v2/report_export.py)
+  -> worker-render-next / POST /workers/render/next
+  -> RenderManager.process_next()                           (render/manager.py)
+      -> stitch_shots()/fallback_render()
+      -> validate_mp4() -> RenderStatus.valid_mp4/probe_error
 ```
 
-2. Process run worker
+## 2) PRD 模块对照（代码证据）
 
+| 模块 | 状态 | 代码证据 | 备注 |
+|---|---|---|---|
+| A Orchestrator | ✅ | `orchestrator/service.py` `schedule_daily_digest/enqueue_run/get_run_status/cancel_run/trigger_due_daily_runs` | 支持点播+订阅入队 |
+| B Source Connectors | ✅ | `sources/connectors.py` `fetch_github_trending/fetch_github_releases/fetch_huggingface_trending/fetch_hackernews_top/fetch_rss_feed/fetch_web_article` | Tier A/B 全部函数存在 |
+| C Normalization | ✅ | `pipeline_v2/normalize.py` `normalize/extract_citations/content_hash` | 含 tier/credibility/citation_count |
+| D Dedup & Clustering | ✅ | `pipeline_v2/dedup_cluster.py` `dedup_exact/embed/cluster/merge_cluster` | 本地哈希 embedding，非外部模型 |
+| E Scoring & Ranking | ✅ | `pipeline_v2/scoring.py` `score_* / rank_items` | 可解释 reasons，Tier B Top3 门控 |
+| F Script Generator | ✅ | `pipeline_v2/script_generator.py` `generate_script/generate_variants` | 时码脚本已实现 |
+| G Storyboard Generator | ✅ | `pipeline_v2/storyboard_generator.py` `script_to_storyboard/validate_storyboard/auto_fix_storyboard` | 约束 5-8 镜头 |
+| H Prompt Compiler | ✅ | `pipeline_v2/prompt_compiler.py` `compile_shot_prompt/compile_storyboard/consistency_pack` | 输出 PromptSpec |
+| I Render Manager | 🟡 | `render/manager.py` `enqueue_render/process_next/retry_failed_shots/fallback_render/stitch_shots` | 任务编排完整；Seedance 真实调用见第 4 节 |
+| J Audio/Subtitles | 🟡 | `render/audio_subtitles.py` `tts_generate/align_subtitles/mix_bgm` | 当前为本地占位 WAV/SRT/BGM copy |
+| K Report & Export | ✅ | `pipeline_v2/report_export.py` `generate_onepager/generate_thumbnail/export_package` | 可产出 onepager/svg/zip |
+| L Notification | 🟡 | `pipeline_v2/notification.py` `notify_user/post_to_web/send_email` | 当前为本地 JSONL 记录，不是真实外发 |
+
+## 3) MP4 可播放性说明（已修复）
+
+历史问题根因：
+- 旧逻辑在 `render/manager.py` 中把 `rendered_final.mp4` / `fallback_render.mp4` 直接写成文本占位字节，不是 MP4 容器。
+
+当前修复后：
+- 优先使用 `ffmpeg` 进行拼接或合成，输出真实 MP4（H.264 + AAC）。
+- 输出写入采用原子写（`tmp -> os.replace`）。
+- 渲染结束后执行 `ffprobe` 校验，结果写入：
+  - `RenderStatus.valid_mp4`
+  - `RenderStatus.probe_error`
+
+## 4) Seedance 接入现状（结论）
+
+结论：`🟡 接了 adapter 边界，但默认 mock/不可用；未直接内置真实 Seedance HTTP/SDK 调用配置`
+
+代码证据：
+- Adapter 边界：`render/adapters/base.py` `BaseRendererAdapter`
+- Seedance 适配器：`render/adapters/seedance.py` `SeedanceAdapter`
+  - 当前只调用注入的 `client` 回调
+  - 未内置固定 endpoint/SDK/client
+  - 未从 `config`/env 自动读取 key/region/base_url
+
+### 如何开启真实调用（当前版本）
+你需要在应用启动时注入一个真实 client 回调给 `SeedanceAdapter(client=...)`，并在回调里用你自己的 HTTP/SDK 调用。
+
+建议环境变量（示例）：
+- `SEEDANCE_BASE_URL=https://api.seedance.example`
+- `SEEDANCE_API_KEY=...`
+- `SEEDANCE_REGION=us`
+
+风险提示：
+- 成本风险：镜头级调用会快速累积费用，务必设置 `max_total_cost` 和 `max_retries`。
+- 时延风险：外部接口超时会触发重试和 fallback。
+- 合规风险：需自行接入内容安全/审核策略。
+
+## 5) 多源抓取现状与质量
+
+### 5.1 Connector 列表
+- GitHub Trending：`sources/connectors.py` `fetch_github_trending`
+- GitHub Releases：`sources/connectors.py` `fetch_github_releases`
+- HuggingFace：`sources/connectors.py` `fetch_huggingface_trending`
+- HackerNews：`sources/connectors.py` `fetch_hackernews_top`
+- RSS：`sources/connectors.py` `fetch_rss_feed`
+- WebArticle：`sources/connectors.py` `fetch_web_article`
+
+### 5.2 是否复用旧抓取代码
+- 已复用旧抓取器：
+  - `scrapers/social/github_scraper.py`
+  - `scrapers/huggingface_scraper.py`
+  - `scrapers/hackernews_scraper.py`
+- 新增统一封装层：
+  - `sources/connectors.py`（统一输出 `RawItem`）
+
+### 5.3 抽取质量现状
+- 正文抽取：
+  - `fetch_web_article` 使用正则 + 去 HTML 标签，鲁棒性中等（复杂网页可能退化）。
+- 引用抽取：
+  - `normalize.extract_citations` 会从 metadata、markdown link、正文 URL 提取并去重。
+- 去重/聚类：
+  - `dedup_exact` + `embed/cluster/merge_cluster` 已具备。
+
+## 6) 最小可运行命令
+
+### 6.1 点播跑一次（CLI）
 ```bash
+python main.py ondemand --user-id u1 --topic "MCP deployment" --time-window 24h --tz America/Los_Angeles --targets web,mp4
 python main.py worker-run-next
-```
-
-3. Process render worker
-
-```bash
 python main.py worker-render-next
-```
-
-4. Query status
-
-```bash
 python main.py status --run-id <run_id>
 ```
 
-## Daily Digest
-
-1. Register schedule (default 08:00 local)
-
+### 6.2 daily 模拟跑一次（CLI）
 ```bash
-python main.py daily-subscribe --user-id u1 --tz America/Los_Angeles --run-at 08:00 --top-k 3
+python main.py daily-subscribe --user-id u1 --run-at 08:00 --tz America/Los_Angeles --top-k 3
+python main.py daily-tick --now-utc 2026-02-18T16:10:00+00:00
+python main.py worker-run-next
+python main.py worker-render-next
 ```
 
-2. Trigger due schedules (for cron/timer worker)
+## 7) 产物类型与路径示例
+
+典型目录：`data/outputs/v2_runs/<run_id>/`
+- `script.json`
+- `storyboard.json`
+- `prompt_bundle.json`
+- `materials.json`
+- `onepager.md`
+- `thumbnail_*.svg`
+- `tts_narration.wav`
+- `tts_narration_with_bgm.wav`
+- `captions.srt`
+- `<run_id>_package.zip`
+
+渲染目录：`data/outputs/render_jobs/<render_job_id>/`
+- `rendered_final.mp4` 或 `fallback_render.mp4`
+
+## 8) 自检命令（含 MP4 校验）
 
 ```bash
-python main.py daily-tick
+python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke > /tmp/ara_v2_smoke/result.json
 ```
-
-## Local Smoke Test
 
 ```bash
-python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke
+python - <<'PY'
+import json, pathlib, subprocess
+p = pathlib.Path('/tmp/ara_v2_smoke/result.json')
+d = json.loads(p.read_text())
+mp4 = next(a['path'] for a in d['artifacts'] if a['type']=='mp4')
+print('run_id=', d['run_id'])
+print('mp4=', mp4)
+print('valid_mp4=', d['render_status'].get('valid_mp4'))
+subprocess.run(['ffprobe','-hide_banner','-v','error','-show_format','-show_streams',mp4], check=False)
+PY
 ```
 
-The command prints a JSON bundle containing run status and artifact paths.
+## 9) 已知限制与下一步
+
+已知限制：
+- 当前测试中的 renderer 多为 mock，镜头文件可能是占位文本；最终 MP4 由 stitch/fallback 合成为可播文件。
+- Notification 仍是本地日志，不是实际 Webhook/SMTP 投递。
+- Seedance 真实 HTTP/SDK 未内置，需注入 client。
+- 队列与状态存储目前是内存实现，进程重启后丢失。
+
+下一步建议：
+1. 接入持久化队列（Redis/RQ/Celery）与 DB 状态表。
+2. 落地真实 Seedance client（含鉴权、超时、重试、限流）。
+3. 用真实音频与视频后期链替换占位实现（TTS/BGM/字幕对齐）。
+4. 增加抓取质量指标（正文长度、引用密度、来源新鲜度）并纳入排序权重。
