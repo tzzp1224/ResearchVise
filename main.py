@@ -1,288 +1,146 @@
-"""
-Academic Research Agent - Main Entry Point
-"""
-import asyncio
+"""CLI entrypoint for v2 orchestration + runtime workers."""
+
+from __future__ import annotations
+
 import argparse
-import logging
-import sys
-from pathlib import Path
+from datetime import datetime, timezone
+import json
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.panel import Panel
-from rich.markdown import Markdown
-
-from config import get_settings
-from aggregator import DataAggregator
-from models import AggregatedResult
+from core import RunMode, RunRequest
+from webapp.runtime import get_orchestrator, get_runtime
 
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    handlers=[RichHandler(rich_tracebacks=True)]
-)
-logger = logging.getLogger(__name__)
-console = Console()
+def _json(text: str):
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    return json.loads(raw)
 
 
-def print_banner():
-    """Print welcome banner"""
-    banner = """
-# 🎓 Academic Research Agent
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AcademicResearchAgent v2 CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-> 学术严谨与社区热度兼顾的智能研究助手
+    ond = sub.add_parser("ondemand")
+    ond.add_argument("--user-id", required=True)
+    ond.add_argument("--topic", required=True)
+    ond.add_argument("--time-window", default="24h")
+    ond.add_argument("--tz", default="UTC")
+    ond.add_argument("--budget-json", default="{}")
+    ond.add_argument("--targets", default="web,mp4")
 
-**Supported Sources:**
-- 📄 ArXiv (Papers)
-- 🤗 Hugging Face (Models & Datasets)  
-- 🐦 Twitter/X (Discussions)
-- 🔴 Reddit (Community)
-- 🐙 GitHub (Code & Issues)
-    """
-    console.print(Panel(Markdown(banner), border_style="blue"))
+    daily = sub.add_parser("daily-subscribe")
+    daily.add_argument("--user-id", required=True)
+    daily.add_argument("--run-at", default="08:00")
+    daily.add_argument("--tz", default="UTC")
+    daily.add_argument("--top-k", type=int, default=3)
 
+    tick = sub.add_parser("daily-tick")
+    tick.add_argument("--now-utc", default="")
 
-def print_results(result: AggregatedResult):
-    """Print detailed results"""
-    
-    # Top Papers
-    if result.papers:
-        console.print("\n📄 [bold cyan]Top Papers (ArXiv)[/bold cyan]")
-        console.print("-" * 50)
-        for i, paper in enumerate(result.papers[:5], 1):
-            console.print(f"{i}. [bold]{paper.title}[/bold]")
-            authors = ", ".join([a.name for a in paper.authors[:3]])
-            if len(paper.authors) > 3:
-                authors += " et al."
-            console.print(f"   Authors: {authors}")
-            console.print(f"   📅 {paper.published_date.strftime('%Y-%m-%d') if paper.published_date else 'N/A'}")
-            console.print(f"   🔗 {paper.url}")
-            console.print()
-    
-    # Top Models
-    if result.models:
-        console.print("\n🤗 [bold cyan]Top Models (Hugging Face)[/bold cyan]")
-        console.print("-" * 50)
-        for i, model in enumerate(result.models[:5], 1):
-            console.print(f"{i}. [bold]{model.id}[/bold]")
-            console.print(f"   ⬇️ Downloads: {model.downloads:,}  ❤️ Likes: {model.likes}")
-            console.print(f"   🔗 {model.url}")
-            console.print()
-    
-    # Top GitHub Repos
-    if result.github_repos:
-        console.print("\n🐙 [bold cyan]Top GitHub Repos[/bold cyan]")
-        console.print("-" * 50)
-        for i, repo in enumerate(result.github_repos[:5], 1):
-            console.print(f"{i}. [bold]{repo.full_name}[/bold]")
-            if repo.description:
-                console.print(f"   {repo.description[:100]}...")
-            console.print(f"   ⭐ {repo.stars:,}  🍴 {repo.forks:,}  📝 {repo.language or 'N/A'}")
-            console.print(f"   🔗 {repo.url}")
-            console.print()
-    
-    # Top Social Posts
-    if result.social_posts:
-        console.print("\n💬 [bold cyan]Top Social Discussions[/bold cyan]")
-        console.print("-" * 50)
-        
-        # Sort by engagement
-        sorted_posts = sorted(
-            result.social_posts, 
-            key=lambda x: x.likes + x.comments, 
-            reverse=True
-        )
-        
-        for i, post in enumerate(sorted_posts[:5], 1):
-            source_emoji = {"twitter": "🐦", "reddit": "🔴", "github": "🐙"}.get(post.source.value, "💬")
-            console.print(f"{i}. {source_emoji} [{post.source.value.upper()}] [bold]{post.author}[/bold]")
-            content = post.content[:150].replace('\n', ' ')
-            if len(post.content) > 150:
-                content += "..."
-            console.print(f"   {content}")
-            console.print(f"   ❤️ {post.likes}  💬 {post.comments}")
-            console.print(f"   🔗 {post.url}")
-            console.print()
-    
-    # Top Stack Overflow Questions
-    if result.stackoverflow_questions:
-        console.print("\n📚 [bold cyan]Top Stack Overflow Questions[/bold cyan]")
-        console.print("-" * 50)
-        
-        sorted_questions = sorted(
-            result.stackoverflow_questions, 
-            key=lambda x: x.score, 
-            reverse=True
-        )
-        
-        for i, q in enumerate(sorted_questions[:5], 1):
-            answered = "✅" if q.is_answered else "❓"
-            console.print(f"{i}. {answered} [bold]{q.title}[/bold]")
-            console.print(f"   👤 {q.author} (Rep: {q.author_reputation:,})")
-            console.print(f"   🏷️ {', '.join(q.tags[:5])}")
-            console.print(f"   👍 {q.score}  👁️ {q.view_count:,}  💬 {q.answer_count}")
-            console.print(f"   🔗 {q.url}")
-            console.print()
-    
-    # Top Hacker News Items
-    if result.hackernews_items:
-        console.print("\n🔶 [bold cyan]Top Hacker News Discussions[/bold cyan]")
-        console.print("-" * 50)
-        
-        sorted_items = sorted(
-            result.hackernews_items, 
-            key=lambda x: x.points, 
-            reverse=True
-        )
-        
-        for i, item in enumerate(sorted_items[:5], 1):
-            console.print(f"{i}. [bold]{item.title}[/bold]")
-            console.print(f"   👤 {item.author}  🔥 {item.points} points  💬 {item.comment_count}")
-            if item.url:
-                console.print(f"   🔗 {item.url}")
-            console.print(f"   📰 {item.hn_url}")
-            console.print()
+    sub.add_parser("worker-run-next")
+    sub.add_parser("worker-render-next")
 
+    status = sub.add_parser("status")
+    status.add_argument("--run-id", required=True)
 
-async def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description="Academic Research Agent - Multi-source research aggregator"
-    )
-    parser.add_argument(
-        "--topic", "-t",
-        type=str,
-        required=True,
-        help="Research topic to search for"
-    )
-    parser.add_argument(
-        "--max-results", "-n",
-        type=int,
-        default=30,
-        help="Maximum results per source (default: 30)"
-    )
-    parser.add_argument(
-        "--sort", "-s",
-        type=str,
-        choices=["relevance", "date", "updated"],
-        default=None,  # None means use .env config
-        help="Sort order for ArXiv: relevance, date, updated (default: from .env or relevance)"
-    )
-    parser.add_argument(
-        "--no-arxiv",
-        action="store_true",
-        help="Disable ArXiv search"
-    )
-    parser.add_argument(
-        "--no-huggingface",
-        action="store_true",
-        help="Disable Hugging Face search"
-    )
-    parser.add_argument(
-        "--no-twitter",
-        action="store_true",
-        help="Disable Twitter search"
-    )
-    parser.add_argument(
-        "--no-reddit",
-        action="store_true",
-        help="Disable Reddit search"
-    )
-    parser.add_argument(
-        "--no-github",
-        action="store_true",
-        help="Disable GitHub search"
-    )
-    parser.add_argument(
-        "--no-semantic-scholar",
-        action="store_true",
-        help="Disable Semantic Scholar search"
-    )
-    parser.add_argument(
-        "--no-stackoverflow",
-        action="store_true",
-        help="Disable Stack Overflow search"
-    )
-    parser.add_argument(
-        "--no-hackernews",
-        action="store_true",
-        help="Disable Hacker News search"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        help="Output file path (JSON format)"
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose logging"
-    )
-    
+    cancel = sub.add_parser("cancel")
+    cancel.add_argument("--run-id", required=True)
+
     args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    print_banner()
-    
-    # Create aggregator with specified options
-    async with DataAggregator(
-        enable_arxiv=not args.no_arxiv,
-        enable_huggingface=not args.no_huggingface,
-        enable_twitter=not args.no_twitter,
-        enable_reddit=not args.no_reddit,
-        enable_github=not args.no_github,
-        enable_semantic_scholar=not args.no_semantic_scholar,
-        enable_stackoverflow=not args.no_stackoverflow,
-        enable_hackernews=not args.no_hackernews,
-    ) as aggregator:
-        
-        # Map sort option to ArXiv sort_by
-        # Priority: CLI arg > .env config > default (relevance)
-        sort_map = {
-            "relevance": "relevance",
-            "date": "submittedDate",
-            "updated": "lastUpdatedDate",
-        }
-        
-        if args.sort:
-            # CLI 指定了排序方式
-            arxiv_sort = sort_map.get(args.sort, "relevance")
-        else:
-            # 使用 .env 配置，如果没有则默认 relevance
-            settings = get_settings()
-            env_sort = settings.arxiv.sort_by
-            # 反向映射：submittedDate -> date
-            reverse_map = {"submittedDate": "date", "lastUpdatedDate": "updated", "relevance": "relevance"}
-            arxiv_sort = env_sort if env_sort in sort_map.values() else "relevance"
-        
-        # Run aggregation
-        result = await aggregator.aggregate(
+    orchestrator = get_orchestrator()
+    runtime = get_runtime()
+
+    if args.command == "ondemand":
+        budget = _json(args.budget_json)
+        targets = [item.strip() for item in str(args.targets).split(",") if item.strip()]
+        req = RunRequest(
+            user_id=args.user_id,
+            mode=RunMode.ONDEMAND,
             topic=args.topic,
-            max_results_per_source=args.max_results,
-            arxiv_sort_by=arxiv_sort,
+            time_window=args.time_window,
+            tz=args.tz,
+            budget=budget,
+            output_targets=targets,
         )
-        
-        # Print results
-        print_results(result)
-        
-        # Save to file if specified
-        if args.output:
-            import json
-            output_path = Path(args.output)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(result.model_dump(mode='json'), f, ensure_ascii=False, indent=2, default=str)
-            
-            console.print(f"\n✅ Results saved to: {output_path}")
+        idem = f"ondemand:{args.user_id}:{args.topic}:{args.time_window}:{args.tz}"
+        run_id = orchestrator.enqueue_run(req, idempotency_key=idem)
+        print(json.dumps({"run_id": run_id}, ensure_ascii=False))
+        return
+
+    if args.command == "daily-subscribe":
+        sub_id = orchestrator.schedule_daily_digest(
+            user_id=args.user_id,
+            run_at=args.run_at,
+            tz=args.tz,
+            top_k=int(args.top_k),
+        )
+        print(json.dumps({"subscription_id": sub_id}, ensure_ascii=False))
+        return
+
+    if args.command == "daily-tick":
+        now_utc = None
+        if str(args.now_utc).strip():
+            now_utc = datetime.fromisoformat(str(args.now_utc).replace("Z", "+00:00")).astimezone(timezone.utc)
+        run_ids = orchestrator.trigger_due_daily_runs(now_utc=now_utc)
+        print(json.dumps({"created_run_ids": run_ids}, ensure_ascii=False))
+        return
+
+    if args.command == "worker-run-next":
+        result = runtime.run_next()
+        if not result:
+            print(json.dumps({"processed": False}, ensure_ascii=False))
+            return
+        print(
+            json.dumps(
+                {
+                    "processed": True,
+                    "run_id": result.run_id,
+                    "output_dir": result.output_dir,
+                    "render_job_id": result.render_job_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    if args.command == "worker-render-next":
+        status = runtime.process_next_render()
+        if not status:
+            print(json.dumps({"processed": False}, ensure_ascii=False))
+            return
+        print(
+            json.dumps(
+                {
+                    "processed": True,
+                    "run_id": status.run_id,
+                    "render_job_id": status.render_job_id,
+                    "state": status.state,
+                    "output_path": status.output_path,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    if args.command == "status":
+        print(json.dumps(runtime.get_run_bundle(args.run_id), ensure_ascii=False, default=str))
+        return
+
+    if args.command == "cancel":
+        canceled = orchestrator.cancel_run(args.run_id)
+        status_payload = orchestrator.get_run_status(args.run_id)
+        print(
+            json.dumps(
+                {
+                    "run_id": args.run_id,
+                    "canceled": canceled,
+                    "status": status_payload.model_dump(mode="json") if status_payload else None,
+                },
+                ensure_ascii=False,
+            )
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

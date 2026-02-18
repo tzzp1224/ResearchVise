@@ -102,16 +102,11 @@ def get_scraper_logger() -> logging.Logger:
     return get_logger("academic_agent.scrapers")
 
 
-def get_storage_logger() -> logging.Logger:
-    """获取存储日志器"""
-    return get_logger("academic_agent.storage")
+def get_pipeline_logger() -> logging.Logger:
+    """获取 v2 pipeline 日志器"""
+    return get_logger("academic_agent.pipeline_v2")
 
 
-def get_processing_logger() -> logging.Logger:
-    """获取处理日志器"""
-    return get_logger("academic_agent.processing")
-
-
-def get_rag_logger() -> logging.Logger:
-    """获取 RAG 日志器"""
-    return get_logger("academic_agent.rag")
+def get_render_logger() -> logging.Logger:
+    """获取渲染日志器"""
+    return get_logger("academic_agent.render")
