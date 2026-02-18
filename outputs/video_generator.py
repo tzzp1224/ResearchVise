@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import inspect
 import json
 import logging
 import math
@@ -66,13 +67,6 @@ def _sanitize_text(value: Any) -> str:
     return text
 
 
-def _chunk(items: Sequence[str], size: int) -> List[List[str]]:
-    cleaned = [item for item in (_sanitize_text(x) for x in items) if item]
-    if size <= 0:
-        return [cleaned] if cleaned else []
-    return [cleaned[i : i + size] for i in range(0, len(cleaned), size)]
-
-
 def _parse_duration_estimate_to_seconds(value: str) -> Optional[int]:
     text = str(value or "").strip().lower()
     if not text:
@@ -117,11 +111,16 @@ def _short_label(text: str, *, cjk_max: int = 10, latin_max: int = 20) -> str:
     if not cleaned:
         return ""
 
-    cut_points = [":", "：", "。", ".", "，", ",", ";", "；", "(", "（"]
+    cut_points = [":", "：", "。", "，", ",", ";", "；", "(", "（"]
     for marker in cut_points:
         if marker in cleaned:
             cleaned = cleaned.split(marker, 1)[0].strip()
             break
+
+    # Keep decimal versions like "2.5", but still cut full-stop sentence tails.
+    parts = re.split(r"(?<!\d)\.(?!\d)", cleaned, maxsplit=1)
+    if parts:
+        cleaned = parts[0].strip()
 
     limit = cjk_max if _contains_cjk(cleaned) else latin_max
     if len(cleaned) <= limit:
@@ -130,11 +129,6 @@ def _short_label(text: str, *, cjk_max: int = 10, latin_max: int = 20) -> str:
     if wrapped:
         return " / ".join(wrapped[:2])
     return cleaned
-
-
-def _wrap_for_preview(text: str, max_len: int = 120) -> str:
-    cleaned = _sanitize_text(text)
-    return _compact_text(cleaned, max_len=max_len) if cleaned else ""
 
 
 def _slugify(value: str) -> str:
@@ -270,6 +264,139 @@ _NON_TECH_PATTERNS = [
 ]
 
 _WEAK_PREFIXES = ("但", "然后", "并且", "此外", "其中", "而且", "以及", "同时", "另外")
+_GENERIC_SINGLE_BULLETS = {
+    "architecture",
+    "performance",
+    "deployment",
+    "comparison",
+    "limitation",
+    "risk",
+    "metrics",
+    "overview",
+    "summary",
+}
+
+_CATEGORY_TO_THEME = {
+    "architecture": "architecture",
+    "mechanism": "architecture",
+    "deployment": "implementation",
+    "performance": "metrics",
+    "benchmark": "metrics",
+    "comparison": "comparison",
+    "limitation": "risk",
+    "training": "implementation",
+    "community": "risk",
+}
+
+_THEME_KEYWORDS: Dict[str, List[str]] = {
+    "overview": ["overview", "summary", "目标", "范围", "结论", "背景", "问题定义", "hook"],
+    "architecture": [
+        "architecture",
+        "pipeline",
+        "workflow",
+        "routing",
+        "context",
+        "module",
+        "protocol",
+        "架构",
+        "机制",
+        "链路",
+        "检索",
+        "推理",
+        "组件",
+        "协议",
+    ],
+    "metrics": [
+        "benchmark",
+        "latency",
+        "throughput",
+        "precision",
+        "recall",
+        "cost",
+        "指标",
+        "性能",
+        "吞吐",
+        "延迟",
+        "准确率",
+        "召回",
+        "成本",
+        "oom",
+        "qps",
+    ],
+    "comparison": [
+        "compare",
+        "versus",
+        "vs",
+        "trade-off",
+        "alternative",
+        "baseline",
+        "对比",
+        "取舍",
+        "替代",
+        "基线",
+    ],
+    "implementation": [
+        "deploy",
+        "production",
+        "runtime",
+        "infra",
+        "monitor",
+        "rollback",
+        "工程",
+        "落地",
+        "部署",
+        "监控",
+        "灰度",
+        "回滚",
+        "实现",
+    ],
+    "risk": [
+        "risk",
+        "limitation",
+        "failure",
+        "drift",
+        "attack",
+        "constraint",
+        "风险",
+        "局限",
+        "失败",
+        "攻击面",
+        "约束",
+    ],
+    "next_step": ["next", "action", "roadmap", "todo", "建议", "下一步", "行动", "验证"],
+}
+
+_THEME_TITLES = {
+    "overview": "研究范围与核心结论",
+    "architecture": "机制与架构拆解",
+    "metrics": "指标与实验结果",
+    "comparison": "方案对比与取舍",
+    "implementation": "工程落地与运维策略",
+    "risk": "风险与失效边界",
+    "next_step": "下一步验证计划",
+}
+
+_THEME_NOTES = {
+    "overview": "先定义研究范围，再进入细节。",
+    "architecture": "强调组件关系和执行机制。",
+    "metrics": "说明指标口径与实验边界。",
+    "comparison": "对比收益与代价，避免单边结论。",
+    "implementation": "聚焦可执行配置、监控和回滚。",
+    "risk": "风险要对应缓解动作，而不是只列问题。",
+    "next_step": "给出立即可执行的验证任务。",
+}
+
+_THEME_VISUAL_KIND = {
+    "overview": "diagram",
+    "architecture": "diagram",
+    "metrics": "chart",
+    "comparison": "diagram",
+    "implementation": "diagram",
+    "risk": "none",
+    "next_step": "none",
+}
+
+_THEME_PRIORITY = ["overview", "architecture", "metrics", "comparison", "implementation", "risk", "next_step"]
 
 
 def _has_unbalanced_brackets(text: str) -> bool:
@@ -308,11 +435,13 @@ def build_video_prompt(
     video_brief: Optional[Dict[str, Any]] = None,
     one_pager: Optional[Dict[str, Any]] = None,
     facts: Optional[List[Dict[str, Any]]] = None,
+    search_results: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """构建视频讲解脚本提示词。"""
     vb = VideoBrief.from_dict(video_brief or {}, default_title=f"{topic} Video Brief")
     op = OnePager.from_dict(one_pager or {}, default_title=f"{topic} One-Pager")
     facts = facts or []
+    search_results = list(search_results or [])
 
     fact_lines: List[str] = []
     for fact in facts[:12]:
@@ -334,6 +463,37 @@ def build_video_prompt(
         [f"- {_compact_text(_sanitize_text(item), max_len=180)}" for item in op.key_findings[:6] if _sanitize_text(item)]
     ) or "- N/A"
 
+    source_priority = {
+        "arxiv": 0,
+        "semantic_scholar": 1,
+        "openreview": 2,
+        "github": 3,
+        "huggingface": 4,
+        "stackoverflow": 5,
+        "hackernews": 6,
+        "reddit": 7,
+        "twitter": 8,
+    }
+    evidence_lines: List[str] = []
+    for item in sorted(
+        [row for row in search_results if isinstance(row, dict)],
+        key=lambda row: source_priority.get(_sanitize_text(row.get("source", "")).lower(), 99),
+    )[:16]:
+        source = _sanitize_text(item.get("source", "")) or "unknown"
+        rid = _sanitize_text(item.get("id", ""))
+        title = _compact_text(_sanitize_text(item.get("title", "")), max_len=90)
+        content = _compact_text(_sanitize_text(item.get("content", "")), max_len=170)
+        snippet = content
+        if snippet:
+            parts = re.split(r"[。.!?；;\n]+", snippet)
+            snippet = _compact_text(_sanitize_text(parts[0] if parts else snippet), max_len=130)
+        if not title and not snippet:
+            continue
+        rid_text = f"{rid} | " if rid else ""
+        evidence_lines.append(f"- [{source}] {rid_text}{title}: {snippet}")
+        if len(evidence_lines) >= 8:
+            break
+
     prompt = f"""
 Create a technical explainer slide video about "{topic}".
 
@@ -349,13 +509,17 @@ Core findings:
 Verified facts:
 {os.linesep.join(fact_lines) if fact_lines else "- N/A"}
 
+Retrieved evidence:
+{os.linesep.join(evidence_lines) if evidence_lines else "- N/A"}
+
 Slide plan:
-{os.linesep.join(segment_lines) if segment_lines else "- Follow a 3-part technical structure with architecture, benchmarks, and deployment trade-offs."}
+{os.linesep.join(segment_lines) if segment_lines else "- Prefer evidence-backed sections only; if evidence is weak, include explicit evidence-gap section."}
 
 Constraints:
 - Keep high factual density and explicit technical details.
 - Explain mechanism, benchmark context, engineering trade-offs, and deployment guidance.
 - Avoid hype and unsupported claims.
+- If evidence is insufficient, state uncertainty and list concrete follow-up validation tasks.
 """.strip()
 
     return prompt
@@ -380,6 +544,7 @@ class BaseVideoGenerator:
         video_brief: Optional[Dict[str, Any]] = None,
         one_pager: Optional[Dict[str, Any]] = None,
         facts: Optional[List[Dict[str, Any]]] = None,
+        search_results: Optional[List[Dict[str, Any]]] = None,
     ) -> VideoArtifact:
         raise NotImplementedError
 
@@ -390,8 +555,29 @@ class SlideSpec:
     bullets: List[str] = field(default_factory=list)
     duration_sec: int = 30
     notes: str = ""
-    visual_kind: str = "diagram"  # diagram / chart / formula / image / none
+    visual_kind: str = "diagram"  # diagram / chart / image / none
     visual_payload: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvidencePoint:
+    text: str
+    theme: str
+    source: str
+    score: float = 1.0
+    title_hint: str = ""
+
+
+@dataclass
+class SectionDraft:
+    theme: str
+    title: str
+    bullets: List[str]
+    notes: str = ""
+    visual_kind: str = "diagram"
+    visual_payload: Dict[str, Any] = field(default_factory=dict)
+    weight: float = 1.0
+    backup_points: List[str] = field(default_factory=list)
 
 
 class SlidevVideoGenerator(BaseVideoGenerator):
@@ -404,9 +590,9 @@ class SlidevVideoGenerator(BaseVideoGenerator):
     def __init__(
         self,
         *,
-        target_duration_sec: int = 420,
-        min_duration_sec: int = 360,
-        max_duration_sec: int = 600,
+        target_duration_sec: int = 180,
+        min_duration_sec: int = 150,
+        max_duration_sec: int = 180,
         fps: int = 24,
         width: int = 1920,
         height: int = 1080,
@@ -416,13 +602,13 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         enable_narration: bool = True,
         tts_provider: str = "auto",
         tts_voice: Optional[str] = None,
-        tts_speed: float = 1.2,
+        tts_speed: float = 1.25,
         narration_model: str = "deepseek-chat",
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.target_duration_sec = int(target_duration_sec)
-        self.min_duration_sec = int(min_duration_sec)
-        self.max_duration_sec = int(max_duration_sec)
+        self.max_duration_sec = max(int(max_duration_sec), self.target_duration_sec)
+        self.min_duration_sec = min(int(min_duration_sec), self.max_duration_sec)
         self.fps = int(fps)
         self.width = int(width)
         self.height = int(height)
@@ -445,6 +631,7 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             contains_cjk=_contains_cjk,
             split_sentences=_split_sentences,
         )
+        self._contract_slide_titles: List[str] = []
 
     def _emit_progress(self, message: str) -> None:
         logger.info("[SlidevVideo] %s", message)
@@ -494,7 +681,7 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         if candidate is None:
             candidate = self.target_duration_sec
         duration = max(self.min_duration_sec, min(self.max_duration_sec, int(candidate)))
-        min_by_slide_count = slide_count * 22
+        min_by_slide_count = slide_count * 12
         if duration < min_by_slide_count:
             duration = min(min_by_slide_count, self.max_duration_sec)
         return duration
@@ -630,6 +817,9 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         cleaned = _sanitize_text(text)
         if not cleaned:
             return ""
+        lowered = cleaned.lower()
+        if lowered in _GENERIC_SINGLE_BULLETS:
+            return ""
         max_len = 72 if _contains_cjk(cleaned) else 120
         compressed = self._compress_sentence(cleaned, max_len=max_len)
         if not compressed:
@@ -713,34 +903,6 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             tags = ["Inputs", "Reasoning", "Outputs"]
         return {"title": _diagram_label(title), "tags": tags[:4]}
 
-    def _metric_symbol(self, metric_key: str, *, index: int = 0) -> str:
-        lowered = _sanitize_text(metric_key).lower()
-        symbol_map = [
-            (("latency", "delay", "p95", "p99", "延迟", "时延"), "LAT"),
-            (("throughput", "qps", "rps", "吞吐", "并发"), "THR"),
-            (("cost", "price", "费用", "成本"), "COST"),
-            (("precision", "准确", "em", "f1"), "ACC"),
-            (("recall", "召回"), "REC"),
-            (("coverage", "覆盖"), "COV"),
-            (("error", "风险", "fail", "oom"), "ERR"),
-            (("memory", "显存", "内存"), "MEM"),
-        ]
-        for keywords, symbol in symbol_map:
-            if any(token in lowered for token in keywords):
-                return symbol
-
-        tokens = re.findall(r"[A-Za-z]+", lowered)
-        if tokens:
-            candidate = tokens[0][:4].upper()
-            return candidate or f"M_{index + 1}"
-        return f"M_{index + 1}"
-
-    def _topic_symbol(self, topic: str) -> str:
-        tokens = re.findall(r"[A-Za-z]+", _sanitize_text(topic))
-        if tokens:
-            return tokens[0][:4].upper()
-        return "SYS"
-
     def _bullet_uniqueness_key(self, text: str) -> str:
         cleaned = _sanitize_text(text)
         cleaned = re.sub(r"^\[[^\]]+\]\s*", "", cleaned)
@@ -750,79 +912,32 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         cleaned = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", cleaned)
         return cleaned
 
-    def _build_formula_payload(
-        self,
-        *,
-        topic: str,
-        metrics: Dict[str, str],
-        facts: Sequence[Dict[str, Any]],
-        key_findings: Sequence[str],
-    ) -> Dict[str, Any]:
-        topic_symbol = self._topic_symbol(topic)
-        metric_entries: List[Tuple[str, str, Optional[float]]] = []
-        used_symbols: Dict[str, int] = {}
-        for idx, (key, value) in enumerate(list(metrics.items())[:8]):
-            symbol = self._metric_symbol(str(key), index=idx)
-            dup_count = used_symbols.get(symbol, 0)
-            used_symbols[symbol] = dup_count + 1
-            if dup_count > 0:
-                symbol = f"{symbol}_{dup_count + 1}"
-            metric_entries.append((symbol, _sanitize_text(str(key)), _extract_numeric(str(value))))
-
-        positives: List[str] = []
-        negatives: List[str] = []
-        for symbol, name, _ in metric_entries:
-            lowered = name.lower()
-            if any(token in lowered for token in ["latency", "delay", "cost", "error", "risk", "延迟", "成本", "风险", "失效"]):
-                negatives.append(symbol)
-            else:
-                positives.append(symbol)
-
-        signed_terms: List[str] = []
-        for idx, symbol in enumerate(positives[:2], start=1):
-            signed_terms.append(f"+ w_{{{idx}}} \\cdot {symbol}")
-        for idx, symbol in enumerate(negatives[:2], start=1):
-            signed_terms.append(f"- \\lambda_{{{idx}}} \\cdot {symbol}")
-        if not signed_terms:
-            signed_terms = [
-                r"+ w_{1} \cdot Quality",
-                r"+ w_{2} \cdot Coverage",
-                r"- \lambda_{1} \cdot Latency",
-                r"- \lambda_{2} \cdot Cost",
-            ]
-
-        objective = f"Score_{{{topic_symbol}}} = " + " ".join(signed_terms).lstrip("+ ").strip()
-
-        primary_symbol = metric_entries[0][0] if metric_entries else "M"
-        normalized_metric = (
-            f"{primary_symbol}_{{norm}} = "
-            f"\\frac{{{primary_symbol} - {primary_symbol}_{{min}}}}{{{primary_symbol}_{{max}} - {primary_symbol}_{{min}} + \\varepsilon}}"
-        )
-
-        fact_count = max(1, min(12, len(list(facts))))
-        evidence = (
-            f"Evidence_{{{topic_symbol}}} = "
-            f"\\frac{{\\sum_{{i=1}}^{{{fact_count}}} c_i \\cdot w_i}}{{\\sum_{{i=1}}^{{{fact_count}}} w_i}}"
-        )
-
-        domain_text = " ".join(
-            [
-                _sanitize_text(topic),
-                " ".join([_sanitize_text(item) for item in key_findings[:4]]),
-                " ".join([_sanitize_text(str((fact or {}).get("claim", ""))) for fact in list(facts)[:4]]),
-            ]
-        ).lower()
-        if any(token in domain_text for token in ["retrieval", "rag", "检索", "召回"]):
-            domain_formula = r"Recall@k = \frac{Relevant@k}{Relevant\_Total}"
-        elif any(token in domain_text for token in ["video", "world model", "时序", "一致性"]):
-            domain_formula = r"TemporalConsistency_t = \frac{1}{N}\sum_{i=1}^{N}\mathbb{1}(state_i^{t} \approx state_i^{t-1})"
-        elif positives and negatives:
-            domain_formula = f"Efficiency = \\frac{{{positives[0]}}}{{{negatives[0]} + \\varepsilon}}"
-        else:
-            domain_formula = r"Throughput = \frac{Requests}{Second}"
-
-        formulas = [objective, normalized_metric, evidence, domain_formula]
-        return {"formulas": formulas}
+    def _theme_scaffold_bullets(self, *, theme: str, title: str, topic: str) -> List[str]:
+        topic_text = _sanitize_text(topic) or "该主题"
+        title_text = _sanitize_text(title) or _THEME_TITLES.get(theme, "关键板块")
+        templates = {
+            "architecture": [
+                f"{title_text}：拆解核心组件、数据流和关键约束，明确能力边界。",
+                f"{topic_text} 的架构选择需结合上下文长度、推理吞吐和内存成本综合评估。",
+            ],
+            "metrics": [
+                f"{title_text}：统一指标口径（准确率、延迟、吞吐、成本）并标注测试条件。",
+                "对照基线报告绝对值与相对提升，避免只汇报单一最优结果。",
+            ],
+            "comparison": [
+                f"{title_text}：明确与主流替代方案的收益、代价和适用场景差异。",
+                "比较时需同时给出能力上限、工程复杂度和稳定性风险。",
+            ],
+            "implementation": [
+                f"{title_text}：定义上线流程、依赖组件、监控阈值与回滚条件。",
+                "落地前应先做灰度验证并记录可复现实验脚本与配置。",
+            ],
+            "risk": [
+                f"{title_text}：列出失效边界，并为每项风险绑定可执行缓解动作。",
+                "对高风险路径建立告警与熔断机制，避免局部故障扩散。",
+            ],
+        }
+        return templates.get(theme, [f"{title_text}：补充可验证证据，收敛关键技术结论。"])
 
     def _build_image_payload(self, one_pager: OnePager) -> Dict[str, Any]:
         for resource in list(one_pager.resources or [])[:10]:
@@ -836,453 +951,660 @@ class SlidevVideoGenerator(BaseVideoGenerator):
                     return {"image_path": str(path), "caption": title or path.name}
         return {}
 
-    def _build_slide_specs(
+    def _infer_theme(self, text: str, *, category: str = "", source: str = "") -> str:
+        category_key = _sanitize_text(category).lower().replace("-", "_")
+        if category_key in _CATEGORY_TO_THEME:
+            return _CATEGORY_TO_THEME[category_key]
+
+        cleaned = _sanitize_text(text).lower()
+        best_theme = ""
+        best_score = 0
+        for theme, keywords in _THEME_KEYWORDS.items():
+            score = 0
+            for keyword in keywords:
+                if keyword and keyword in cleaned:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_theme = theme
+        if best_theme:
+            return best_theme
+
+        if source.startswith("video_segment"):
+            return "architecture"
+        if source.startswith("fact"):
+            return "overview"
+        return "overview"
+
+    def _pick_section_title(self, *, topic: str, theme: str, hints: Sequence[str]) -> str:
+        for raw in hints:
+            candidate = _sanitize_text(raw)
+            if not candidate:
+                continue
+            lowered = candidate.lower()
+            if re.fullmatch(r"(segment|section)\s*\d+", lowered):
+                continue
+            if len(candidate) >= 4:
+                return _short_label(candidate, cjk_max=16, latin_max=34)
+
+        default_title = _THEME_TITLES.get(theme, "关键发现")
+        topic_text = _sanitize_text(topic)
+        if theme == "overview" and topic_text:
+            return _short_label(f"{topic_text}：{default_title}", cjk_max=18, latin_max=40)
+        return default_title
+
+    def _collect_evidence_points(
         self,
         *,
         topic: str,
         video_brief: VideoBrief,
         one_pager: OnePager,
         facts: List[Dict[str, Any]],
-    ) -> List[SlideSpec]:
-        facts_sorted = sorted(list(facts or []), key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
-        fact_bullets = [self._fact_to_bullet(item) for item in facts_sorted]
-        fact_bullets = [item for item in fact_bullets if item]
+        search_results: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[EvidencePoint]:
+        points: List[EvidencePoint] = []
 
-        segment_pool: List[str] = []
-        for segment in video_brief.segments[:8]:
-            segment_pool.append(_sanitize_text(segment.get("title", "")))
-            segment_pool.append(_sanitize_text(segment.get("content", "")))
-            segment_pool.extend([_sanitize_text(item) for item in list(segment.get("talking_points") or [])[:4]])
+        def _add(
+            text: str,
+            *,
+            source: str,
+            score: float,
+            theme: Optional[str] = None,
+            category: str = "",
+            title_hint: str = "",
+        ) -> None:
+            cleaned = _sanitize_text(text)
+            if not cleaned:
+                return
 
-        metric_lines = [
-            f"{_sanitize_text(key)}: {_sanitize_text(value)}"
-            for key, value in list(one_pager.metrics.items())[:8]
-            if _sanitize_text(key) and _sanitize_text(value)
-        ]
-        deep_dive_pool = list(one_pager.technical_deep_dive or [])
-        impl_pool = list(one_pager.implementation_notes or [])
-        risk_pool = list(one_pager.risks_and_mitigations or []) + list(one_pager.weaknesses or [])
-        strength_pool = list(one_pager.strengths or []) + list(one_pager.key_findings or [])
+            normalized = self._normalize_bullet_text(cleaned)
+            if not normalized:
+                normalized = self._compress_sentence(cleaned, max_len=120) or cleaned
+            if not normalized:
+                return
 
-        global_pool = _dedupe_texts(
-            [
-                one_pager.executive_summary,
-                video_brief.conclusion,
-                *segment_pool,
-                *deep_dive_pool,
-                *impl_pool,
-                *strength_pool,
-                *risk_pool,
-                *fact_bullets,
-            ]
+            resolved_theme = theme or self._infer_theme(normalized, category=category, source=source)
+            hint = _sanitize_text(title_hint)
+            points.append(
+                EvidencePoint(
+                    text=normalized,
+                    theme=resolved_theme,
+                    source=source,
+                    score=float(max(0.1, score)),
+                    title_hint=hint,
+                )
+            )
+
+        _add(
+            one_pager.executive_summary or video_brief.hook or f"研究主题：{_sanitize_text(topic)}",
+            source="one_pager.summary",
+            score=1.8,
+            theme="overview",
+            title_hint=topic,
+        )
+        _add(video_brief.conclusion, source="video_brief.conclusion", score=1.4, theme="next_step")
+        _add(video_brief.call_to_action, source="video_brief.cta", score=1.6, theme="next_step")
+
+        for item in list(one_pager.key_findings or [])[:10]:
+            _add(item, source="one_pager.key_findings", score=1.6)
+
+        for key, value in list(one_pager.metrics.items())[:10]:
+            key_clean = _sanitize_text(key)
+            val_clean = _sanitize_text(value)
+            if not key_clean or not val_clean:
+                continue
+            _add(
+                f"{key_clean}: {val_clean}",
+                source="one_pager.metrics",
+                score=1.9,
+                theme="metrics",
+                title_hint="关键指标",
+            )
+
+        for item in list(one_pager.technical_deep_dive or [])[:10]:
+            _add(item, source="one_pager.deep_dive", score=1.7, theme="architecture")
+        for item in list(one_pager.implementation_notes or [])[:10]:
+            _add(item, source="one_pager.impl", score=1.7, theme="implementation")
+        for item in list(one_pager.risks_and_mitigations or [])[:10]:
+            _add(item, source="one_pager.risk", score=1.6, theme="risk")
+        for item in list(one_pager.weaknesses or [])[:8]:
+            _add(item, source="one_pager.weakness", score=1.4, theme="risk")
+        for item in list(one_pager.strengths or [])[:8]:
+            _add(item, source="one_pager.strength", score=1.3)
+
+        for segment in list(video_brief.segments or [])[:10]:
+            seg_title = _sanitize_text(segment.get("title", ""))
+            seg_content = _sanitize_text(segment.get("content", ""))
+            seg_theme = self._infer_theme(
+                f"{seg_title} {seg_content}",
+                source="video_segment.content",
+            )
+            _add(
+                seg_content,
+                source="video_segment.content",
+                score=1.55,
+                theme=seg_theme,
+                title_hint=seg_title,
+            )
+            for talking in list(segment.get("talking_points") or [])[:6]:
+                _add(
+                    talking,
+                    source="video_segment.talking_point",
+                    score=1.45,
+                    theme=seg_theme,
+                    title_hint=seg_title,
+                )
+            _add(seg_title, source="video_segment.title", score=1.2, theme=seg_theme, title_hint=seg_title)
+
+        for fact in sorted(list(facts or []), key=lambda item: float(item.get("confidence", 0.0)), reverse=True):
+            category = _sanitize_text(fact.get("category", ""))
+            confidence = float(fact.get("confidence", 0.0) or 0.0)
+            bullet = self._fact_to_bullet(fact) or _sanitize_text(fact.get("claim", ""))
+            _add(
+                bullet,
+                source=f"fact.{category or 'other'}",
+                score=1.2 + max(0.0, min(1.0, confidence)),
+                category=category,
+            )
+
+        source_priority = {
+            "arxiv": 0,
+            "semantic_scholar": 1,
+            "openreview": 2,
+            "github": 3,
+            "huggingface": 4,
+            "stackoverflow": 5,
+            "hackernews": 6,
+            "reddit": 7,
+            "twitter": 8,
+        }
+        ranked_results = sorted(
+            [item for item in list(search_results or []) if isinstance(item, dict)],
+            key=lambda item: (
+                source_priority.get(_sanitize_text(item.get("source", "")).lower(), 99),
+                -len(_sanitize_text(item.get("content", ""))),
+            ),
+        )
+        for item in ranked_results[:20]:
+            source = _sanitize_text(item.get("source", "")).lower() or "unknown"
+            title = _sanitize_text(item.get("title", ""))
+            content = _sanitize_text(item.get("content", ""))
+            if not title and not content:
+                continue
+            parts = _split_sentences(content)
+            sentence = parts[0] if parts else content
+            metadata = dict(item.get("metadata", {}) or {})
+            metrics: List[str] = []
+            for key in ("citation_count", "stars", "downloads", "score", "points", "published_date", "year"):
+                value = _sanitize_text(metadata.get(key, ""))
+                if value:
+                    metrics.append(f"{key}={value}")
+                if len(metrics) >= 3:
+                    break
+            metrics_text = f" ({', '.join(metrics)})" if metrics else ""
+            evidence_text = _compact_text(
+                f"[{source}] {title}{metrics_text}: {sentence}",
+                max_len=220,
+            )
+            if not evidence_text:
+                continue
+            _add(
+                evidence_text,
+                source=f"search_result.{source}",
+                score=1.25 if source in {"arxiv", "semantic_scholar", "openreview", "github", "huggingface"} else 1.05,
+                title_hint=title,
+            )
+
+        deduped: Dict[str, EvidencePoint] = {}
+        for point in points:
+            key = _normalize_key(point.text)
+            if not key:
+                continue
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = point
+                continue
+            if point.score > existing.score:
+                if not point.title_hint and existing.title_hint:
+                    point.title_hint = existing.title_hint
+                deduped[key] = point
+            elif not existing.title_hint and point.title_hint:
+                existing.title_hint = point.title_hint
+                deduped[key] = existing
+
+        return sorted(deduped.values(), key=lambda item: item.score, reverse=True)
+
+    def _build_metrics_chart_from_points(
+        self,
+        *,
+        one_pager: OnePager,
+        points: Sequence[EvidencePoint],
+    ) -> Dict[str, Any]:
+        payload = self._build_metrics_chart_payload(one_pager.metrics)
+        if payload:
+            return payload
+
+        derived: Dict[str, str] = {}
+        for point in points:
+            text = _sanitize_text(point.text)
+            if ":" not in text:
+                continue
+            key, value = text.split(":", 1)
+            key = _sanitize_text(key)
+            value = _sanitize_text(value)
+            if not key or not value:
+                continue
+            if _extract_numeric(value) is None:
+                continue
+            if key not in derived:
+                derived[key] = value
+            if len(derived) >= 6:
+                break
+        return self._build_metrics_chart_payload(derived)
+
+    def _bucket_points_by_theme(self, points: Sequence[EvidencePoint]) -> Dict[str, List[EvidencePoint]]:
+        buckets: Dict[str, List[EvidencePoint]] = {}
+        for point in points:
+            buckets.setdefault(point.theme, []).append(point)
+        return buckets
+
+    def _ordered_themes(self, buckets: Dict[str, List[EvidencePoint]], point_count: int) -> List[str]:
+        theme_scores = {theme: sum(item.score for item in items) for theme, items in buckets.items()}
+        priority_index = {name: idx for idx, name in enumerate(_THEME_PRIORITY)}
+
+        ordered_themes: List[str] = []
+        if "overview" in buckets:
+            ordered_themes.append("overview")
+
+        rest = [theme for theme in buckets.keys() if theme != "overview"]
+        rest.sort(key=lambda theme: (-theme_scores.get(theme, 0.0), priority_index.get(theme, 99), theme))
+        ordered_themes.extend(rest)
+
+        for tail in ("risk", "next_step"):
+            if tail in ordered_themes:
+                ordered_themes.remove(tail)
+                ordered_themes.append(tail)
+
+        target_sections = max(2, min(8, int(math.ceil(point_count / 5.0))))
+        return ordered_themes[:target_sections]
+
+    def _resolve_visual_for_theme(
+        self,
+        *,
+        theme: str,
+        title: str,
+        bullets: Sequence[str],
+        metric_payload: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        visual_kind = _THEME_VISUAL_KIND.get(theme, "diagram")
+        visual_payload: Dict[str, Any] = {}
+        if visual_kind == "chart":
+            visual_payload = dict(metric_payload)
+            if not visual_payload:
+                visual_kind = "diagram"
+        if visual_kind == "diagram":
+            visual_payload = self._build_diagram_payload(title, list(bullets))
+        return visual_kind, visual_payload
+
+    def _build_primary_section_draft(
+        self,
+        *,
+        theme: str,
+        topic: str,
+        bucket: List[EvidencePoint],
+        metric_payload: Dict[str, Any],
+    ) -> Optional[SectionDraft]:
+        raw_pool = [item.text for item in bucket]
+        bullets = self._fit_bullets(
+            raw_pool,
+            max_bullets=5,
+            max_len=72,
+            technical_only=theme not in {"overview", "next_step"},
+        )
+        if len(bullets) < 2:
+            bullets = self._fit_bullets(
+                raw_pool,
+                max_bullets=5,
+                max_len=80,
+                technical_only=False,
+            )
+        if not bullets:
+            return None
+
+        title_hints = [item.title_hint for item in bucket if _sanitize_text(item.title_hint)]
+        title = self._pick_section_title(topic=topic, theme=theme, hints=title_hints)
+        visual_kind, visual_payload = self._resolve_visual_for_theme(
+            theme=theme,
+            title=title,
+            bullets=bullets,
+            metric_payload=metric_payload,
         )
 
-        fallback_templates: Dict[str, List[str]] = {
-            "问题定义与学习目标": [
-                "输入约束：主题、检索范围、时间窗口与证据类型必须显式给定。",
-                "输出目标：机制解释、指标口径、工程决策三类结果齐备。",
-                "质量要求：仅保留可验证技术事实，过滤叙事性表述。",
-                "验收标准：每页至少包含一条可执行工程建议。",
-            ],
-            "系统边界与输入输出": [
-                "输入侧包含论文、代码仓库、技术文档与实验日志。",
-                "处理中间层拆分为检索、推理、生成与评估四段。",
-                "输出侧固定为结构化要点、指标表与可复现结论。",
-                "边界定义避免把未经验证信息混入核心链路。",
-            ],
-            "核心架构：检索-推理-生成链路": [
-                "检索层负责召回高相关证据并附带来源与置信信息。",
-                "推理层在证据约束下完成机制归纳与冲突消解。",
-                "生成层按固定模板输出讲解页，保证结构一致性。",
-                "评估层基于准确率、延迟与成本做闭环优化。",
-            ],
-            "机制一：API上下文检索": [
-                "先基于主题构建查询，再生成 API 候选集合。",
-                "候选通过相关性与可用性双指标进行重排序。",
-                "命中证据写入上下文窗口并保留来源锚点。",
-                "检索失败场景必须回退到可解释的默认策略。",
-            ],
-            "机制二：世界建模与视频生成": [
-                "模型需要同时保持空间一致性与时序一致性。",
-                "生成控制信号来自结构化上下文而非自由采样。",
-                "复杂场景重点关注动作连续性与因果合理性。",
-                "输出质量通过可控性、稳定性与事实性联合评估。",
-            ],
-            "关键公式与计算框架": [
-                "目标函数显式权衡质量、覆盖、延迟与成本四个维度。",
-                "指标需要归一化后再进入加权评分，避免量纲污染。",
-                "证据分数应按来源可信度进行加权平均。",
-                "公式服务于决策解释，必须与实验结论联合使用。",
-            ],
-            "实验设置与指标口径": [
-                "评估必须同时覆盖质量、覆盖率、延迟与单位成本。",
-                "Precision@k 用于衡量检索命中质量。",
-                "Throughput 用于衡量并发扩展能力。",
-                "所有指标都需声明数据口径与统计区间。",
-            ],
-            "结果与证据解读": [
-                "结果解读区分“观察事实”与“外推结论”。",
-                "高置信证据优先进入主结论链路。",
-                "冲突证据必须显式标注并给出解释路径。",
-                "结论仅在已验证边界内成立。",
-            ],
-            "工程实现与模块拆解": [
-                "模块划分建议采用检索服务、编排服务与渲染服务。",
-                "状态管理采用幂等任务与可重试队列。",
-                "缓存层区分热数据与冷数据并设置失效策略。",
-                "故障隔离要求单模块异常不影响整条流水线。",
-            ],
-            "部署、并发与成本": [
-                "部署目标是稳定吞吐与可预测尾延迟。",
-                "并发策略采用队列限流与批处理调度组合。",
-                "成本监控关注每请求算力时长与存储开销。",
-                "上线前必须完成容量压测与降级预案演练。",
-            ],
-            "风险与失败模式": [
-                "主要风险包括证据噪声、检索漂移与生成偏差。",
-                "缓解策略包含数据回放、告警阈值与人工抽检。",
-                "高风险结果需触发二次验证而非直接发布。",
-                "失败案例应沉淀为回归测试样本库。",
-            ],
-            "结论与下一步验证": [
-                "下一步优先补齐缺失指标并建立自动评测基线。",
-                "对关键机制执行 A/B 验证并跟踪回归曲线。",
-                "以工程成本为约束持续优化质量-延迟平衡点。",
-                "发布前完成可复现实验与文档化交付。",
-            ],
-        }
+        return SectionDraft(
+            theme=theme,
+            title=title,
+            bullets=bullets[:5],
+            notes=_THEME_NOTES.get(theme, ""),
+            visual_kind=visual_kind,
+            visual_payload=visual_payload,
+            weight=1.0 + min(0.45, 0.07 * len(bucket)) + (0.15 if visual_kind == "chart" else 0.0),
+            backup_points=raw_pool[:12],
+        )
 
-        def _resolve_template(title: str) -> List[str]:
-            if title in fallback_templates:
-                return fallback_templates[title]
-            for key, value in fallback_templates.items():
-                if title in key or key in title:
-                    return value
+    def _inject_metric_chart_draft_if_missing(
+        self,
+        *,
+        drafts: List[SectionDraft],
+        buckets: Dict[str, List[EvidencePoint]],
+        topic: str,
+        one_pager: OnePager,
+        metric_payload: Dict[str, Any],
+    ) -> None:
+        has_chart = any(item.visual_kind == "chart" for item in drafts)
+        if not metric_payload or has_chart:
+            return
+
+        metric_pool = [item.text for item in buckets.get("metrics", [])]
+        if not metric_pool:
+            metric_pool = [
+                f"{_sanitize_text(key)}: {_sanitize_text(value)}"
+                for key, value in list(one_pager.metrics.items())[:8]
+                if _sanitize_text(key) and _sanitize_text(value)
+            ]
+        metric_bullets = self._fit_bullets(metric_pool, max_bullets=5, max_len=72, technical_only=False)
+        if not metric_bullets:
+            return
+
+        metric_draft = SectionDraft(
+            theme="metrics",
+            title=self._pick_section_title(topic=topic, theme="metrics", hints=["关键指标"]),
+            bullets=metric_bullets[:5],
+            notes=_THEME_NOTES.get("metrics", ""),
+            visual_kind="chart",
+            visual_payload=dict(metric_payload),
+            weight=1.2,
+            backup_points=metric_pool[:12],
+        )
+        drafts.insert(min(2, len(drafts)), metric_draft)
+
+    def _append_missing_theme_drafts(
+        self,
+        *,
+        drafts: List[SectionDraft],
+        buckets: Dict[str, List[EvidencePoint]],
+        topic: str,
+        metric_payload: Dict[str, Any],
+    ) -> None:
+        existing_themes = {item.theme for item in drafts}
+        for theme in ("architecture", "metrics", "comparison", "implementation", "risk"):
+            if theme in existing_themes:
+                continue
+            bucket = sorted(buckets.get(theme, []), key=lambda item: item.score, reverse=True)
+            if not bucket:
+                continue
+
+            raw_pool = [item.text for item in bucket]
+            relaxed_len = 96 if theme in {"comparison", "implementation", "risk"} else 84
+            bullets = self._fit_bullets(
+                raw_pool,
+                max_bullets=5,
+                max_len=relaxed_len,
+                technical_only=False,
+            )
+            title_hints = [item.title_hint for item in bucket if _sanitize_text(item.title_hint)]
+            title = self._pick_section_title(topic=topic, theme=theme, hints=title_hints)
+            if not bullets:
+                bullets = self._theme_scaffold_bullets(theme=theme, title=title, topic=topic)
+
+            visual_kind, visual_payload = self._resolve_visual_for_theme(
+                theme=theme,
+                title=title,
+                bullets=bullets,
+                metric_payload=metric_payload,
+            )
+            drafts.append(
+                SectionDraft(
+                    theme=theme,
+                    title=title,
+                    bullets=bullets[:5],
+                    notes=_THEME_NOTES.get(theme, ""),
+                    visual_kind=visual_kind,
+                    visual_payload=visual_payload,
+                    weight=0.95,
+                    backup_points=raw_pool[:12],
+                )
+            )
+            existing_themes.add(theme)
+
+    def _draft_sections(
+        self,
+        *,
+        topic: str,
+        points: List[EvidencePoint],
+        one_pager: OnePager,
+    ) -> List[SectionDraft]:
+        if not points:
             return []
 
-        def fallback(points: Sequence[str], title: str) -> List[str]:
-            items = self._fit_bullets(points, max_bullets=4, max_len=72, technical_only=True)
-            if items:
-                return items
-            template = _resolve_template(title)
-            if template:
-                return template[:4]
-            return [f"{title}：技术证据不足，建议补充可复现实验与指标后重试。"]
+        buckets = self._bucket_points_by_theme(points)
+        selected_themes = self._ordered_themes(buckets, len(points))
+        metric_payload = self._build_metrics_chart_from_points(one_pager=one_pager, points=points)
 
-        def diagram_payload(title: str, tags: Sequence[str]) -> Dict[str, Any]:
-            cleaned = [_sanitize_text(tag) for tag in tags if _sanitize_text(tag)]
-            return {"title": title, "tags": cleaned[:4]}
-
-        def slide_points(
-            *,
-            include: Sequence[str],
-            exclude: Sequence[str] = (),
-            pools: Sequence[Sequence[str]],
-            max_bullets: int = 4,
-        ) -> List[str]:
-            collected: List[str] = []
-            for pool in pools:
-                collected.extend(
-                    self._select_points(
-                        pool,
-                        include_keywords=include,
-                        exclude_keywords=exclude,
-                        max_bullets=max_bullets,
-                        max_len=72,
-                    )
-                )
-            deduped = _dedupe_texts(collected)
-            return deduped[:max_bullets]
-
-        slides: List[SlideSpec] = []
-
-        intro_points = fallback(
-            slide_points(
-                include=["目标", "问题", "输入", "输出", "指标", "评估", "技术", "约束"],
-                pools=[deep_dive_pool, strength_pool, segment_pool, global_pool],
-                max_bullets=4,
+        drafts: List[SectionDraft] = []
+        for theme in selected_themes:
+            bucket = sorted(buckets.get(theme, []), key=lambda item: item.score, reverse=True)
+            if not bucket:
+                continue
+            draft = self._build_primary_section_draft(
+                theme=theme,
+                topic=topic,
+                bucket=bucket,
+                metric_payload=metric_payload,
             )
-            + [f"任务范围：{_sanitize_text(topic)}"],
-            "问题定义与学习目标",
-        )
-        slides.append(
-            SlideSpec(
-                title="问题定义与学习目标",
-                bullets=intro_points[:4],
-                notes="定义问题、输入和可验证输出。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("问题定义", ["问题输入", "目标输出", "评估指标", "学习路径"]),
-            )
-        )
+            if draft:
+                drafts.append(draft)
 
-        boundary_points = slide_points(
-            include=["输入", "输出", "接口", "api", "pipeline", "流程", "模块", "source"],
-            pools=[segment_pool, impl_pool, deep_dive_pool, global_pool],
-            max_bullets=4,
+        self._inject_metric_chart_draft_if_missing(
+            drafts=drafts,
+            buckets=buckets,
+            topic=topic,
+            one_pager=one_pager,
+            metric_payload=metric_payload,
         )
-        slides.append(
-            SlideSpec(
-                title="系统边界与输入输出",
-                bullets=fallback(boundary_points or segment_pool, "系统边界与输入输出")[:4],
-                notes="先给系统边界，再进入机制层。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("系统边界", ["输入来源", "上下文检索", "结构化输出", "生成约束"]),
-            )
+        self._append_missing_theme_drafts(
+            drafts=drafts,
+            buckets=buckets,
+            topic=topic,
+            metric_payload=metric_payload,
         )
+        return drafts[:10]
 
-        architecture_points = slide_points(
-            include=["架构", "pipeline", "流程", "检索", "推理", "生成", "context", "模型"],
-            pools=[deep_dive_pool, segment_pool, impl_pool, global_pool],
-            max_bullets=4,
-        )
-        slides.append(
-            SlideSpec(
-                title="核心架构：检索-推理-生成链路",
-                bullets=fallback(architecture_points, "核心架构")[:4],
-                notes="把组件关系讲清楚，避免抽象空话。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("核心架构", ["事实检索", "上下文推理", "内容生成", "质量评估"]),
-            )
-        )
+    def _ensure_minimum_section_drafts(self, drafts: List[SectionDraft], topic: str) -> None:
+        if drafts:
+            return
 
-        retrieval_points = slide_points(
-            include=["api", "检索", "context", "rag", "索引", "precision", "top"],
-            pools=[deep_dive_pool, fact_bullets, segment_pool, global_pool],
-            max_bullets=4,
-        )
-        slides.append(
-            SlideSpec(
-                title="机制一：API上下文检索",
-                bullets=fallback(retrieval_points, "机制一")[:4],
-                notes="强调检索口径、命中质量和误差来源。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("机制一", ["Query构建", "API候选", "命中排序", "一致性约束"]),
-            )
-        )
-
-        generation_points = slide_points(
-            include=["视频", "生成", "世界", "空间", "时序", "一致性", "sora", "model"],
-            pools=[segment_pool, deep_dive_pool, fact_bullets, global_pool],
-            max_bullets=4,
-        )
-        slides.append(
-            SlideSpec(
-                title="机制二：世界建模与视频生成",
-                bullets=fallback(generation_points, "机制二")[:4],
-                notes="把建模能力与局限并列说明。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("机制二", ["空间建模", "时序一致性", "动作推理", "可控生成"]),
-            )
-        )
-
-        slides.append(
-            SlideSpec(
-                title="关键公式与计算框架",
-                bullets=[
-                    "统一目标函数用于平衡质量、覆盖、延迟与成本。",
-                    "Precision@k 评估检索质量，Throughput 评估系统扩展能力。",
-                    "公式用于解释工程决策，不用于替代实验验证。",
-                ],
-                notes="先解释变量含义，再给数值口径。",
-                visual_kind="formula",
-                visual_payload=self._build_formula_payload(
-                    topic=topic,
-                    metrics=one_pager.metrics,
-                    facts=facts_sorted,
-                    key_findings=one_pager.key_findings,
-                ),
-            )
-        )
-
-        metric_chart = self._build_metrics_chart_payload(one_pager.metrics)
-        metric_points = fallback(metric_lines + fact_bullets, "实验设置与指标口径")
-        slides.append(
-            SlideSpec(
-                title="实验设置与指标口径",
-                bullets=metric_points[:4],
-                notes="每个指标都要说明测量方式和口径。",
-                visual_kind="chart",
-                visual_payload=metric_chart,
-            )
-        )
-
-        evidence_points = fallback(fact_bullets + strength_pool, "结果与证据解读")
-        slides.append(
-            SlideSpec(
-                title="结果与证据解读",
-                bullets=evidence_points[:5],
-                notes="区分“观察到的结果”和“可外推结论”。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("结果解读", ["实验结果", "证据锚点", "适用边界", "外推风险"]),
-            )
-        )
-
-        implementation_points = slide_points(
-            include=["模块", "服务", "缓存", "调度", "接口", "部署", "pipeline", "engine", "索引"],
-            pools=[impl_pool, deep_dive_pool, global_pool],
-            max_bullets=4,
-        )
-        slides.append(
-            SlideSpec(
-                title="工程实现与模块拆解",
-                bullets=fallback(implementation_points + impl_pool, "工程实现与模块拆解")[:4],
-                notes="强调模块边界、状态管理和依赖关系。",
-                visual_kind="diagram",
-                visual_payload=diagram_payload("工程实现", ["模块划分", "状态管理", "缓存策略", "故障隔离"]),
-            )
-        )
-
-        scale_points = slide_points(
-            include=["延迟", "吞吐", "成本", "并发", "部署", "资源", "gpu", "cpu", "扩展"],
-            pools=[metric_lines, impl_pool, risk_pool, fact_bullets, global_pool],
-            max_bullets=4,
-        )
-        slides.append(
-            SlideSpec(
-                title="部署、并发与成本",
-                bullets=fallback(scale_points + metric_lines, "部署、并发与成本")[:4],
-                notes="同时说明性能上限与资源预算。",
-                visual_kind="chart",
-                visual_payload=metric_chart,
-            )
-        )
-
-        risk_points = fallback(risk_pool + one_pager.weaknesses + fact_bullets, "风险与失败模式")
-        slides.append(
-            SlideSpec(
-                title="风险与失败模式",
-                bullets=risk_points[:4],
-                notes="给出可执行缓解策略，不只列问题。",
+        topic_text = _sanitize_text(topic) or "当前主题"
+        bullets = [
+            f"{topic_text} 当前证据不足，无法稳定支撑完整视频结构。",
+            "优先补齐论文、代码实现与线上观测三类证据链后再扩展脚本。",
+        ]
+        drafts.append(
+            SectionDraft(
+                theme="next_step",
+                title="证据覆盖与缺口",
+                bullets=bullets,
+                notes="证据薄弱时只保留补证路线，避免编造细节。",
                 visual_kind="none",
+                visual_payload={},
+                weight=0.88,
+                backup_points=list(bullets),
             )
         )
 
-        closing_points = fallback(
-            slide_points(
-                include=["下一步", "实验", "评估", "部署", "指标", "成本", "延迟", "并发", "验证", "监控"],
-                pools=[impl_pool, risk_pool, metric_lines, fact_bullets, global_pool],
-                max_bullets=4,
-            )
-            + [
-                "下一步：补齐缺失指标并做可复现实验。",
-                "下一步：构建自动化评估基线，跟踪回归。",
-            ],
-            "结论与下一步验证",
-        )
-        slides.append(
-            SlideSpec(
-                title="结论与下一步验证",
-                bullets=closing_points[:4],
-                notes="收束结论并给出立即可执行动作。",
-                visual_kind="none",
-            )
-        )
-
+    def _append_image_section_draft(self, drafts: List[SectionDraft], one_pager: OnePager) -> None:
         image_payload = self._build_image_payload(one_pager)
-        if image_payload:
-            slides.append(
-                SlideSpec(
-                    title="附录：图像证据",
-                    bullets=[
-                        "图像证据用于支撑核心结论，不替代实验指标。",
-                        f"图像来源：{_sanitize_text(image_payload.get('caption', '未知来源'))}",
-                    ],
-                    notes="图像只作为辅助证据。",
-                    visual_kind="image",
-                    visual_payload=image_payload,
-                )
-            )
+        if not image_payload:
+            return
 
+        drafts.append(
+            SectionDraft(
+                theme="evidence_image",
+                title="图像证据",
+                bullets=[
+                    "该页展示补充证据图像，用于辅助理解关键结论。",
+                    f"图像来源：{_sanitize_text(image_payload.get('caption', '未知来源'))}",
+                ],
+                notes="图像可与对应实验指标交叉核对。",
+                visual_kind="image",
+                visual_payload=image_payload,
+                weight=0.85,
+                backup_points=[],
+            )
+        )
+
+    def _append_unique_bullets(
+        self,
+        *,
+        target: List[str],
+        candidates: Sequence[str],
+        local_keys: set[str],
+        global_keys: set[str],
+        max_items: int = 5,
+    ) -> None:
+        for raw in candidates:
+            if len(target) >= max_items:
+                break
+            bullet = self._normalize_bullet_text(raw)
+            if not bullet:
+                continue
+            local_key = self._bullet_uniqueness_key(bullet)
+            global_key = re.sub(r"\s+", " ", bullet).strip().lower()
+            if not local_key or local_key in local_keys or global_key in global_keys:
+                continue
+            local_keys.add(local_key)
+            global_keys.add(global_key)
+            target.append(bullet)
+
+    def _normalize_drafts_to_slides(
+        self,
+        *,
+        drafts: Sequence[SectionDraft],
+        topic: str,
+    ) -> Tuple[List[SlideSpec], List[float]]:
         normalized: List[SlideSpec] = []
-        global_bullet_keys: set[str] = set()
+        normalized_weights: List[float] = []
+        global_bullet_texts: set[str] = set()
         seen_slide_signatures: set[str] = set()
 
-        def _append_unique_bullets(
-            target: List[str],
-            candidates: Sequence[str],
-            *,
-            local_keys: set[str],
-            max_items: int = 5,
-        ) -> None:
-            for raw in candidates:
-                if len(target) >= max_items:
-                    break
-                bullet = self._normalize_bullet_text(raw)
-                if not bullet:
-                    continue
-                key = self._bullet_uniqueness_key(bullet)
-                if not key or key in local_keys or key in global_bullet_keys:
-                    continue
-                local_keys.add(key)
-                global_bullet_keys.add(key)
-                target.append(bullet)
-
-        for slide in slides:
-            title = _sanitize_text(slide.title)
-            notes = _sanitize_text(slide.notes)
+        for draft in drafts:
+            title = _sanitize_text(draft.title)
+            notes = _sanitize_text(draft.notes)
             if not title:
                 continue
 
             local_keys: set[str] = set()
             unique_bullets: List[str] = []
-            _append_unique_bullets(
-                unique_bullets,
-                slide.bullets,
+            self._append_unique_bullets(
+                target=unique_bullets,
+                candidates=draft.bullets,
                 local_keys=local_keys,
+                global_keys=global_bullet_texts,
                 max_items=5,
             )
 
             if len(unique_bullets) < 2:
-                supplement_pool: List[str] = []
-                supplement_pool.extend(_resolve_template(title))
-                supplement_pool.extend(global_pool)
-                supplement_pool.extend(fact_bullets)
-                supplement_pool.extend(metric_lines)
-                _append_unique_bullets(
-                    unique_bullets,
-                    supplement_pool,
+                self._append_unique_bullets(
+                    target=unique_bullets,
+                    candidates=draft.backup_points,
                     local_keys=local_keys,
+                    global_keys=global_bullet_texts,
                     max_items=5,
                 )
+
+            if len(unique_bullets) < 2:
+                self._append_unique_bullets(
+                    target=unique_bullets,
+                    candidates=self._theme_scaffold_bullets(theme=draft.theme, title=title, topic=topic),
+                    local_keys=local_keys,
+                    global_keys=global_bullet_texts,
+                    max_items=5,
+                )
+
+            if len(unique_bullets) < 2:
+                gap_line = self._normalize_bullet_text(f"该板块证据不足：{title}，建议补充更多可验证来源。")
+                if gap_line:
+                    key = self._bullet_uniqueness_key(gap_line)
+                    global_key = re.sub(r"\s+", " ", gap_line).strip().lower()
+                    if key and key not in local_keys and global_key not in global_bullet_texts:
+                        unique_bullets.append(gap_line)
+                        local_keys.add(key)
+                        global_bullet_texts.add(global_key)
 
             if len(unique_bullets) < 2:
                 continue
 
             slide_signature = "|".join(
-                [title, slide.visual_kind]
-                + [self._bullet_uniqueness_key(item) for item in unique_bullets[:3]]
+                [title, draft.visual_kind] + [self._bullet_uniqueness_key(item) for item in unique_bullets[:3]]
             )
             if slide_signature in seen_slide_signatures:
                 continue
             seen_slide_signatures.add(slide_signature)
 
+            visual_payload = dict(draft.visual_payload or {})
+            if draft.visual_kind == "diagram" and not visual_payload:
+                visual_payload = self._build_diagram_payload(title, unique_bullets)
+
             normalized.append(
                 SlideSpec(
                     title=title,
                     bullets=unique_bullets[:5],
-                    duration_sec=slide.duration_sec,
+                    duration_sec=30,
                     notes=notes,
-                    visual_kind=slide.visual_kind,
-                    visual_payload=dict(slide.visual_payload),
+                    visual_kind=draft.visual_kind,
+                    visual_payload=visual_payload,
                 )
             )
+            normalized_weights.append(float(max(0.6, draft.weight)))
 
-        normalized = normalized[:14]
-        target_total = self._resolve_target_duration(video_brief.duration_estimate, len(normalized))
+        return normalized, normalized_weights
 
-        weights: List[float] = []
-        for slide in normalized:
-            base = 1.0
-            if slide.visual_kind == "chart":
-                base = 1.2
-            elif slide.visual_kind == "formula":
-                base = 1.15
-            elif "机制" in slide.title or "工程" in slide.title:
-                base = 1.15
-            weights.append(base)
+    def _ensure_minimum_slide_count(
+        self,
+        *,
+        normalized: List[SlideSpec],
+        normalized_weights: List[float],
+        topic: str,
+        one_pager: OnePager,
+    ) -> None:
+        if normalized:
+            return
 
-        weight_sum = sum(weights) if weights else 1.0
-        durations = [max(22, int(target_total * w / weight_sum)) for w in weights]
+        topic_text = _sanitize_text(topic) or "当前主题"
+        normalized.append(
+            SlideSpec(
+                title="证据缺口与后续动作",
+                bullets=[
+                    f"{topic_text} 当前证据不足，无法安全生成完整技术讲解。",
+                    "建议补充可验证论文、代码实现、线上指标后重试。",
+                ],
+                duration_sec=30,
+                notes="避免在证据薄弱时输出模板化或推测性内容。",
+                visual_kind="none",
+                visual_payload={},
+            )
+        )
+        normalized_weights.append(0.85)
+
+    def _compute_slide_durations(
+        self,
+        *,
+        slide_count: int,
+        duration_estimate: str,
+        normalized_weights: Sequence[float],
+    ) -> List[int]:
+        target_total = self._resolve_target_duration(duration_estimate, slide_count)
+        weight_sum = sum(normalized_weights) if normalized_weights else float(slide_count)
+        durations = [max(12, int(target_total * w / max(0.1, weight_sum))) for w in normalized_weights]
         diff = target_total - sum(durations)
         index = 0
         while diff != 0 and durations:
@@ -1290,17 +1612,59 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             if diff > 0:
                 durations[pos] += 1
                 diff -= 1
-            elif durations[pos] > 22:
+            elif durations[pos] > 12:
                 durations[pos] -= 1
                 diff += 1
             index += 1
             if index > 10000:
                 break
+        return durations
 
-        for slide, duration in zip(normalized, durations):
+    def _apply_slide_durations(self, slides: List[SlideSpec], durations: Sequence[int]) -> None:
+        for slide, duration in zip(slides, durations):
             slide.duration_sec = int(duration)
             if slide.visual_kind == "diagram" and not slide.visual_payload:
                 slide.visual_payload = self._build_diagram_payload(slide.title, slide.bullets)
+
+    def _build_slide_specs(
+        self,
+        *,
+        topic: str,
+        video_brief: VideoBrief,
+        one_pager: OnePager,
+        facts: List[Dict[str, Any]],
+        search_results: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[SlideSpec]:
+        points = self._collect_evidence_points(
+            topic=topic,
+            video_brief=video_brief,
+            one_pager=one_pager,
+            facts=facts,
+            search_results=search_results,
+        )
+        drafts = self._draft_sections(topic=topic, points=points, one_pager=one_pager)
+        self._ensure_minimum_section_drafts(drafts, topic)
+        self._append_image_section_draft(drafts, one_pager)
+
+        normalized, normalized_weights = self._normalize_drafts_to_slides(drafts=drafts, topic=topic)
+        self._ensure_minimum_slide_count(
+            normalized=normalized,
+            normalized_weights=normalized_weights,
+            topic=topic,
+            one_pager=one_pager,
+        )
+
+        normalized = normalized[:10]
+        normalized_weights = normalized_weights[: len(normalized)]
+        if not normalized:
+            return []
+
+        durations = self._compute_slide_durations(
+            slide_count=len(normalized),
+            duration_estimate=video_brief.duration_estimate,
+            normalized_weights=normalized_weights,
+        )
+        self._apply_slide_durations(normalized, durations)
         return normalized
 
     def _write_slide_plan_markdown(self, slides: List[SlideSpec], out_dir: Path) -> Path:
@@ -1343,20 +1707,10 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         return path
 
     def _write_script_contract(self, out_dir: Path) -> Path:
-        framework = [
-            "1) 问题定义与学习目标",
-            "2) 系统边界与输入输出",
-            "3) 核心架构：检索-推理-生成链路",
-            "4) 机制一：API上下文检索",
-            "5) 机制二：世界建模与视频生成",
-            "6) 关键公式与计算框架",
-            "7) 实验设置与指标口径",
-            "8) 结果与证据解读",
-            "9) 工程实现与模块拆解",
-            "10) 部署、并发与成本",
-            "11) 风险与失败模式",
-            "12) 结论与下一步验证",
-        ]
+        titles = [_sanitize_text(item) for item in list(self._contract_slide_titles or []) if _sanitize_text(item)]
+        framework = [f"{idx}) {title}" for idx, title in enumerate(titles, start=1)]
+        if not framework:
+            framework = ["1) 研究范围与核心结论", "2) 关键机制与指标", "3) 风险与下一步验证"]
 
         lines: List[str] = [
             "# Slide Script Contract",
@@ -1365,16 +1719,11 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             *[f"- {item}" for item in framework],
             "",
             "## Content Constraints",
-            "- 每页最多 4 条正文要点（公式页除外）。",
+            "- 每页最多 5 条正文要点。",
             "- 单条要点不允许硬截断（禁止 `...` / `…`）。",
             "- 单条要点必须是完整技术语义，不允许残缺括号或破碎短语。",
             "- 优先保留含 `API/检索/架构/指标/延迟/吞吐/成本/部署/实验` 的技术内容。",
-            "- 非技术叙述（科普修辞、愿景口号）默认过滤。",
-            "",
-            "## Formula Constraints",
-            "- 公式页启用 KaTeX（`katex: true`）。",
-            "- 关键公式以块级数学语法输出，避免被当作普通文本。",
-            "",
+            "- 当某板块证据不足时，允许显式标注“证据不足”，禁止编造细节。",
         ]
         path = out_dir / "video_script_contract.md"
         path.write_text("\n".join(lines), encoding="utf-8")
@@ -1473,31 +1822,6 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         parts.extend(["</div>", "</div>"])
         return "\n".join(parts)
 
-    def _render_formula_panel(self, payload: Dict[str, Any]) -> str:
-        formulas = [item for item in (payload.get("formulas") or []) if _sanitize_text(item)]
-        if not formulas:
-            formulas = [r"Utility = \alpha Q + \beta C - \gamma L - \delta Cost"]
-
-        blocks: List[str] = ["<div class='visual-card'>", "<div class='visual-title'>关键公式</div>"]
-        blocks.append(f"<div class='formula-main'>{_escape_html(formulas[0])}</div>")
-        for formula in formulas[1:4]:
-            blocks.append(f"<div class='formula-line'>{_escape_html(formula)}</div>")
-        blocks.append("</div>")
-        return "\n".join(blocks)
-
-    def _render_formula_markdown_lines(self, payload: Dict[str, Any]) -> List[str]:
-        formulas = [item for item in (payload.get("formulas") or []) if _sanitize_text(item)]
-        if not formulas:
-            formulas = [r"Utility = \alpha \cdot Q + \beta \cdot C - \gamma \cdot L - \delta \cdot Cost"]
-
-        lines: List[str] = ["## 关键公式", ""]
-        for formula in formulas[:4]:
-            lines.append("$$")
-            lines.append(formula)
-            lines.append("$$")
-            lines.append("")
-        return lines
-
     def _render_image_panel(self, payload: Dict[str, Any]) -> str:
         asset_rel = _sanitize_text(payload.get("asset_rel", ""))
         caption = _escape_html(payload.get("caption", "图像证据"))
@@ -1527,8 +1851,6 @@ class SlidevVideoGenerator(BaseVideoGenerator):
     def _render_visual_panel(self, slide: SlideSpec) -> str:
         if slide.visual_kind == "chart":
             return self._render_chart_html(slide.visual_payload)
-        if slide.visual_kind == "formula":
-            return self._render_formula_panel(slide.visual_payload)
         if slide.visual_kind == "image":
             return self._render_image_panel(slide.visual_payload)
         if slide.visual_kind == "none":
@@ -1679,25 +2001,6 @@ class SlidevVideoGenerator(BaseVideoGenerator):
   font-size: 0.84rem;
   overflow-wrap: anywhere;
 }
-.formula-main {
-  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 0.82rem;
-  line-height: 1.35;
-  background: #edf3ff;
-  border: 1px solid #c4d6f7;
-  border-radius: 10px;
-  padding: 0.5rem 0.55rem;
-  margin-bottom: 0.45rem;
-  overflow-wrap: anywhere;
-}
-.formula-line {
-  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 0.78rem;
-  line-height: 1.3;
-  color: #28497e;
-  margin-bottom: 0.35rem;
-  overflow-wrap: anywhere;
-}
 .evidence-image {
   display: block;
   width: 100%;
@@ -1758,17 +2061,6 @@ class SlidevVideoGenerator(BaseVideoGenerator):
                 lines.extend(["---", ""])
             lines.append(f"# {_sanitize_text(slide.title)}")
             lines.append("")
-            if slide.visual_kind == "formula":
-                lines.append("## 技术要点")
-                lines.append("")
-                for bullet in slide.bullets:
-                    lines.append(f"- {_sanitize_text(bullet)}")
-                if slide.notes:
-                    lines.append("")
-                    lines.append(f"<div class='speaker-notes'>Notes: {_escape_html(slide.notes)}</div>")
-                lines.append("")
-                lines.extend(self._render_formula_markdown_lines(slide.visual_payload))
-                continue
 
             lines.append("<div class='deck-grid'>")
             lines.append(self._render_left_panel(slide))
@@ -1950,6 +2242,8 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             "1:a:0",
             "-c:v",
             "copy",
+            "-af",
+            "apad",
             "-c:a",
             "aac",
             "-b:a",
@@ -1962,7 +2256,13 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         self._run_subprocess(mux_cmd, context="ffmpeg mux narration")
         video_only_path.unlink(missing_ok=True)
 
-    def _generate_video_sync(
+    def _require_ffmpeg(self) -> str:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            raise VideoGenerationError("ffmpeg is required for Slidev mode. Please install ffmpeg first.")
+        return ffmpeg_bin
+
+    def _build_plan_assets(
         self,
         *,
         topic: str,
@@ -1970,26 +2270,39 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         video_brief: VideoBrief,
         one_pager: OnePager,
         facts: List[Dict[str, Any]],
-        output_path: Path,
-    ) -> Dict[str, Any]:
-        ffmpeg_bin = shutil.which("ffmpeg")
-        if not ffmpeg_bin:
-            raise VideoGenerationError("ffmpeg is required for Slidev mode. Please install ffmpeg first.")
+        search_results: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[SlideSpec], Path, Path, Path]:
+        slide_kwargs: Dict[str, Any] = {
+            "topic": topic,
+            "video_brief": video_brief,
+            "one_pager": one_pager,
+            "facts": facts,
+        }
+        try:
+            signature = inspect.signature(self._build_slide_specs)
+            if "search_results" in signature.parameters:
+                slide_kwargs["search_results"] = search_results
+        except Exception:
+            slide_kwargs["search_results"] = search_results
 
-        slides = self._build_slide_specs(
-            topic=topic,
-            video_brief=video_brief,
-            one_pager=one_pager,
-            facts=facts,
-        )
+        slides = self._build_slide_specs(**slide_kwargs)
         if not slides:
             raise VideoGenerationError("No slide content available to render video.")
 
+        self._contract_slide_titles = [slide.title for slide in slides]
         plan_md = self._write_slide_plan_markdown(slides, out_dir)
         plan_json = self._write_slide_plan_json(slides, out_dir)
         contract_md = self._write_script_contract(out_dir)
         self._emit_progress(f"Slide plan ready: {len(slides)} slides.")
+        return slides, plan_md, plan_json, contract_md
 
+    def _prepare_slidev_build(
+        self,
+        *,
+        topic: str,
+        out_dir: Path,
+        slides: List[SlideSpec],
+    ) -> Tuple[Path, Path, Path]:
         runtime_dir = self._ensure_runtime_environment()
         build_id = f"{_slugify(out_dir.name)}_{int(time.time())}"
         build_dir = runtime_dir / "builds" / build_id
@@ -1998,12 +2311,20 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         self._emit_progress("Rendering Slidev source...")
         entry_path = self._write_slidev_source(topic=topic, slides=slides, build_dir=build_dir)
 
-        # 保存一份到输出目录，便于调试复现
         source_snapshot = out_dir / "video_slidev_source"
         if source_snapshot.exists():
             shutil.rmtree(source_snapshot)
         shutil.copytree(build_dir, source_snapshot)
+        return runtime_dir, entry_path, source_snapshot
 
+    def _export_slide_images(
+        self,
+        *,
+        runtime_dir: Path,
+        entry_path: Path,
+        out_dir: Path,
+        slides: List[SlideSpec],
+    ) -> Tuple[Path, List[Path], List[SlideSpec]]:
         slides_dir = out_dir / "video_slides"
         self._emit_progress("Exporting slides via Slidev...")
         self._export_slides_with_slidev(
@@ -2028,34 +2349,166 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             if not image_paths:
                 raise VideoGenerationError("Slidev export output mismatch left no usable slides.")
 
-        narration_audio_path: Optional[Path] = None
-        narration_script_path: Optional[Path] = None
-        narration_dir: Optional[Path] = None
-        tts_providers: List[str] = []
-        narration_specs: List[NarrationSpec] = []
-        if self.enable_narration:
-            self._emit_progress("Generating narration audio track...")
-            narration_meta = self._render_narration_segments(
-                slides=slides,
-                out_dir=out_dir,
-                ffmpeg_bin=ffmpeg_bin,
+        return slides_dir, image_paths, slides
+
+    def _apply_narration_durations(self, slides: List[SlideSpec], narration_durations: Sequence[float]) -> None:
+        min_slide_duration = 20 if len(slides) <= 4 else 12
+        for idx, duration in enumerate(narration_durations):
+            if idx >= len(slides):
+                break
+            slides[idx].duration_sec = max(min_slide_duration, int(math.ceil(float(duration) + 0.12)))
+
+    def _maybe_render_narration(
+        self,
+        *,
+        slides: List[SlideSpec],
+        out_dir: Path,
+        ffmpeg_bin: str,
+        plan_md: Path,
+        plan_json: Path,
+    ) -> Tuple[Path, Path, Optional[Path], Optional[Path], Optional[Path], List[str], List[NarrationSpec]]:
+        if not self.enable_narration:
+            return plan_md, plan_json, None, None, None, [], []
+
+        self._emit_progress("Generating narration audio track...")
+        narration_meta = self._render_narration_segments(
+            slides=slides,
+            out_dir=out_dir,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        narration_script_path = narration_meta["script_path"]
+        narration_dir = narration_meta["narration_dir"]
+        tts_providers = list(narration_meta.get("providers_used") or [])
+        narration_specs = list(narration_meta.get("narration_specs") or [])
+        self._apply_narration_durations(slides, list(narration_meta.get("segment_durations") or []))
+
+        # Rewrite plan files with narration-aligned durations to keep timestamps consistent.
+        plan_md = self._write_slide_plan_markdown(slides, out_dir)
+        plan_json = self._write_slide_plan_json(slides, out_dir)
+        narration_audio_path = out_dir / "video_narration.m4a"
+        self._emit_progress("Concatenating narration audio...")
+        self._concat_audio_segments(
+            audio_paths=list(narration_meta["segment_paths"]),
+            output_path=narration_audio_path,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        return (
+            plan_md,
+            plan_json,
+            narration_audio_path,
+            narration_script_path,
+            narration_dir,
+            tts_providers,
+            narration_specs,
+        )
+
+    def _build_slide_timeline(self, slides: Sequence[SlideSpec]) -> List[Dict[str, Any]]:
+        timeline: List[Dict[str, Any]] = []
+        cursor_sec = 0
+        for idx, slide in enumerate(slides, start=1):
+            duration = max(1, int(slide.duration_sec))
+            timeline.append(
+                {
+                    "slide_index": idx,
+                    "title": slide.title,
+                    "start_sec": cursor_sec,
+                    "duration_sec": duration,
+                }
             )
-            narration_script_path = narration_meta["script_path"]
-            narration_dir = narration_meta["narration_dir"]
-            tts_providers = list(narration_meta.get("providers_used") or [])
-            narration_specs = list(narration_meta.get("narration_specs") or [])
-            narration_durations = list(narration_meta.get("segment_durations") or [])
-            for idx, duration in enumerate(narration_durations):
-                if idx >= len(slides):
-                    break
-                slides[idx].duration_sec = max(1, int(math.ceil(float(duration) + 0.12)))
-            narration_audio_path = out_dir / "video_narration.m4a"
-            self._emit_progress("Concatenating narration audio...")
-            self._concat_audio_segments(
-                audio_paths=list(narration_meta["segment_paths"]),
-                output_path=narration_audio_path,
-                ffmpeg_bin=ffmpeg_bin,
-            )
+            cursor_sec += duration
+        return timeline
+
+    def _build_flow_metadata(
+        self,
+        *,
+        slides: Sequence[SlideSpec],
+        slides_dir: Path,
+        segments_dir: Path,
+        plan_md: Path,
+        plan_json: Path,
+        contract_md: Path,
+        source_snapshot: Path,
+        runtime_dir: Path,
+        entry_path: Path,
+        narration_audio_path: Optional[Path],
+        narration_script_path: Optional[Path],
+        narration_dir: Optional[Path],
+        tts_providers: Sequence[str],
+        narration_specs: Sequence[NarrationSpec],
+    ) -> Dict[str, Any]:
+        flow: Dict[str, Any] = {
+            "slide_count": len(slides),
+            "estimated_duration_sec": int(sum(max(1, int(item.duration_sec)) for item in slides)),
+            "slides_dir": str(slides_dir),
+            "segments_dir": str(segments_dir),
+            "plan_md": str(plan_md),
+            "plan_json": str(plan_json),
+            "contract_md": str(contract_md),
+            "source_snapshot": str(source_snapshot),
+            "runtime_dir": str(runtime_dir),
+            "entry_path": str(entry_path),
+            "fps": self.fps,
+            "resolution": f"{self.width}x{self.height}",
+            "slide_timeline": self._build_slide_timeline(slides),
+        }
+        if narration_audio_path:
+            flow["narration_audio_path"] = str(narration_audio_path)
+        if narration_script_path:
+            flow["narration_script_path"] = str(narration_script_path)
+        if narration_dir:
+            flow["narration_segments_dir"] = str(narration_dir)
+        if tts_providers:
+            flow["tts_providers"] = list(tts_providers)
+        if narration_specs:
+            flow["narration_slide_count"] = len(narration_specs)
+        return flow
+
+    def _generate_video_sync(
+        self,
+        *,
+        topic: str,
+        out_dir: Path,
+        video_brief: VideoBrief,
+        one_pager: OnePager,
+        facts: List[Dict[str, Any]],
+        search_results: Optional[List[Dict[str, Any]]] = None,
+        output_path: Path,
+    ) -> Dict[str, Any]:
+        ffmpeg_bin = self._require_ffmpeg()
+        slides, plan_md, plan_json, contract_md = self._build_plan_assets(
+            topic=topic,
+            out_dir=out_dir,
+            video_brief=video_brief,
+            one_pager=one_pager,
+            facts=facts,
+            search_results=search_results,
+        )
+        runtime_dir, entry_path, source_snapshot = self._prepare_slidev_build(
+            topic=topic,
+            out_dir=out_dir,
+            slides=slides,
+        )
+        slides_dir, image_paths, slides = self._export_slide_images(
+            runtime_dir=runtime_dir,
+            entry_path=entry_path,
+            out_dir=out_dir,
+            slides=slides,
+        )
+        (
+            plan_md,
+            plan_json,
+            narration_audio_path,
+            narration_script_path,
+            narration_dir,
+            tts_providers,
+            narration_specs,
+        ) = self._maybe_render_narration(
+            slides=slides,
+            out_dir=out_dir,
+            ffmpeg_bin=ffmpeg_bin,
+            plan_md=plan_md,
+            plan_json=plan_json,
+        )
 
         segments_dir = out_dir / "video_segments"
         self._emit_progress("Rendering per-slide video segments...")
@@ -2074,32 +2527,22 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             narration_audio_path=narration_audio_path,
         )
 
-        total_duration = int(sum(max(1, int(item.duration_sec)) for item in slides))
-        flow: Dict[str, Any] = {
-            "slide_count": len(slides),
-            "estimated_duration_sec": total_duration,
-            "slides_dir": str(slides_dir),
-            "segments_dir": str(segments_dir),
-            "plan_md": str(plan_md),
-            "plan_json": str(plan_json),
-            "contract_md": str(contract_md),
-            "source_snapshot": str(source_snapshot),
-            "runtime_dir": str(runtime_dir),
-            "entry_path": str(entry_path),
-            "fps": self.fps,
-            "resolution": f"{self.width}x{self.height}",
-        }
-        if narration_audio_path:
-            flow["narration_audio_path"] = str(narration_audio_path)
-        if narration_script_path:
-            flow["narration_script_path"] = str(narration_script_path)
-        if narration_dir:
-            flow["narration_segments_dir"] = str(narration_dir)
-        if tts_providers:
-            flow["tts_providers"] = tts_providers
-        if narration_specs:
-            flow["narration_slide_count"] = len(narration_specs)
-        return flow
+        return self._build_flow_metadata(
+            slides=slides,
+            slides_dir=slides_dir,
+            segments_dir=segments_dir,
+            plan_md=plan_md,
+            plan_json=plan_json,
+            contract_md=contract_md,
+            source_snapshot=source_snapshot,
+            runtime_dir=runtime_dir,
+            entry_path=entry_path,
+            narration_audio_path=narration_audio_path,
+            narration_script_path=narration_script_path,
+            narration_dir=narration_dir,
+            tts_providers=tts_providers,
+            narration_specs=narration_specs,
+        )
 
     async def generate(
         self,
@@ -2109,6 +2552,7 @@ class SlidevVideoGenerator(BaseVideoGenerator):
         video_brief: Optional[Dict[str, Any]] = None,
         one_pager: Optional[Dict[str, Any]] = None,
         facts: Optional[List[Dict[str, Any]]] = None,
+        search_results: Optional[List[Dict[str, Any]]] = None,
     ) -> VideoArtifact:
         out_dir.mkdir(parents=True, exist_ok=True)
         prompt = build_video_prompt(
@@ -2116,22 +2560,34 @@ class SlidevVideoGenerator(BaseVideoGenerator):
             video_brief=video_brief,
             one_pager=one_pager,
             facts=facts,
+            search_results=search_results,
         )
         vb = VideoBrief.from_dict(video_brief or {}, default_title=f"{topic} Video Brief")
         op = OnePager.from_dict(one_pager or {}, default_title=f"{topic} One-Pager")
         normalized_facts = list(facts or [])
+        normalized_results = list(search_results or [])
 
         output_path = out_dir / "video_brief.mp4"
         metadata_path = out_dir / "video_generation_metadata.json"
 
+        sync_kwargs: Dict[str, Any] = {
+            "topic": topic,
+            "out_dir": out_dir,
+            "video_brief": vb,
+            "one_pager": op,
+            "facts": normalized_facts,
+            "output_path": output_path,
+        }
+        try:
+            signature = inspect.signature(self._generate_video_sync)
+            if "search_results" in signature.parameters:
+                sync_kwargs["search_results"] = normalized_results
+        except Exception:
+            sync_kwargs["search_results"] = normalized_results
+
         flow_meta = await asyncio.to_thread(
             self._generate_video_sync,
-            topic=topic,
-            out_dir=out_dir,
-            video_brief=vb,
-            one_pager=op,
-            facts=normalized_facts,
-            output_path=output_path,
+            **sync_kwargs,
         )
 
         if not output_path.exists() or output_path.stat().st_size <= 0:

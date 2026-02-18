@@ -37,7 +37,7 @@ class ChatAgent:
         llm: Optional[BaseLLM] = None,
         *,
         default_top_k: int = 6,
-        score_threshold: float = 0.3,
+        score_threshold: float = 0.15,
     ):
         self.llm = llm or get_llm()
         self.default_top_k = max(2, min(int(default_top_k), 20))
@@ -104,6 +104,8 @@ class ChatAgent:
         sources: Optional[List[str]] = None,
         year_filter: Optional[int] = None,
         use_hybrid: bool = True,
+        namespace: Optional[str] = None,
+        topic_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         query = str(question or "").strip()
         if not query:
@@ -125,18 +127,41 @@ class ChatAgent:
                     sources=sources,
                     year_filter=year_filter,
                     top_k=k,
+                    score_threshold=self.score_threshold,
+                    namespace=namespace,
+                    topic_hash=topic_hash,
                 )
             else:
                 docs = await vector_search(
                     query=query,
                     top_k=k,
                     score_threshold=self.score_threshold,
+                    namespace=namespace,
+                    topic_hash=topic_hash,
                 )
         except Exception as exc:
             logger.warning(f"KB search failed: {exc}")
             docs = []
 
         docs = self._dedupe_docs(docs)
+        if not docs and use_hybrid:
+            try:
+                docs = await vector_search(
+                    query=query,
+                    top_k=max(k, 8),
+                    score_threshold=max(0.0, min(self.score_threshold, 0.15)),
+                    namespace=namespace,
+                    topic_hash=topic_hash,
+                )
+                docs = self._dedupe_docs(docs)
+                if docs:
+                    logger.info(
+                        "KB hybrid fallback activated: retrieved=%s namespace=%s",
+                        len(docs),
+                        namespace or "*",
+                    )
+            except Exception as exc:
+                logger.warning(f"KB hybrid fallback search failed: {exc}")
 
         if not docs:
             return {

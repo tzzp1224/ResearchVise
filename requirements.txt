@@ -30,6 +30,7 @@ tenacity>=8.2.0          # 重试机制
 python-dateutil>=2.8.0
 numpy>=1.24.0
 edge-tts>=6.1.0          # 免费高质量 TTS (Microsoft Edge voices)
+pypdf>=4.2.0             # PDF文本提取（论文深度抓取）
 
 # Phase 2: Processing & Storage
 qdrant-client>=1.7.0           # Qdrant 向量数据库 (支持元数据过滤、持久化、并发)
@@ -53,6 +54,11 @@ google-generativeai>=0.8.0     # Google Gemini SDK
 # langchain>=0.3.0
 # langchain-openai>=0.2.0
 # langchain-anthropic>=0.2.0
+
+# Phase 5: API / Web
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
 
 # Dev / Tests
 pytest>=7.0.0

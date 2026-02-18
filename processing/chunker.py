@@ -3,12 +3,10 @@ Text Chunker
 文本分块模块
 """
 from enum import Enum
-from typing import List, Optional, Callable, Any
+from typing import List, Optional
 from dataclasses import dataclass, field
 import re
 import hashlib
-
-from pydantic import BaseModel, Field
 
 
 class ChunkingStrategy(str, Enum):

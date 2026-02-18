@@ -5,14 +5,16 @@ Output Exporter
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Union
 
 from .models import Timeline, OnePager, VideoBrief
 from .renderers import (
+    build_knowledge_tree,
     render_research_report_markdown,
+    render_knowledge_tree_markdown,
     render_timeline_markdown,
     render_one_pager_markdown,
     render_video_brief_markdown,
@@ -55,6 +57,8 @@ def export_research_outputs(
     timeline: Optional[Union[Timeline, Sequence[Dict[str, Any]], Dict[str, Any]]] = None,
     one_pager: Optional[Union[OnePager, Dict[str, Any]]] = None,
     video_brief: Optional[Union[VideoBrief, Dict[str, Any]]] = None,
+    facts: Optional[Sequence[Dict[str, Any]]] = None,
+    search_results: Optional[Sequence[Dict[str, Any]]] = None,
     write_report: bool = True,
 ) -> Dict[str, Path]:
     """
@@ -76,6 +80,21 @@ def export_research_outputs(
     timeline_md = render_timeline_markdown(topic, timeline)
     one_pager_md = render_one_pager_markdown(one_pager, default_title=f"{topic} One-Pager")
     video_brief_md = render_video_brief_markdown(video_brief, default_title=f"{topic} Video Brief")
+    knowledge_tree_data = build_knowledge_tree(
+        topic,
+        timeline=timeline,
+        one_pager=one_pager,
+        facts=facts,
+        search_results=search_results,
+    )
+    knowledge_tree_md = render_knowledge_tree_markdown(
+        topic,
+        timeline=timeline,
+        one_pager=one_pager,
+        facts=facts,
+        search_results=search_results,
+        knowledge_tree=knowledge_tree_data,
+    )
 
     (out_path / "timeline.md").write_text(timeline_md, encoding="utf-8")
     written["timeline_md"] = out_path / "timeline.md"
@@ -86,12 +105,17 @@ def export_research_outputs(
     (out_path / "video_brief.md").write_text(video_brief_md, encoding="utf-8")
     written["video_brief_md"] = out_path / "video_brief.md"
 
+    (out_path / "knowledge_tree.md").write_text(knowledge_tree_md, encoding="utf-8")
+    written["knowledge_tree_md"] = out_path / "knowledge_tree.md"
+
     if write_report:
         report_md = render_research_report_markdown(
             topic,
             timeline=timeline,
             one_pager=one_pager,
             video_brief=video_brief,
+            facts=facts,
+            search_results=search_results,
         )
         (out_path / "report.md").write_text(report_md, encoding="utf-8")
         written["report_md"] = out_path / "report.md"
@@ -106,9 +130,12 @@ def export_research_outputs(
     (out_path / "video_brief.json").write_text(_json_dump(video_brief), encoding="utf-8")
     written["video_brief_json"] = out_path / "video_brief.json"
 
+    (out_path / "knowledge_tree.json").write_text(_json_dump(knowledge_tree_data), encoding="utf-8")
+    written["knowledge_tree_json"] = out_path / "knowledge_tree.json"
+
     manifest = {
         "topic": topic,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "files": {k: str(v.name) for k, v in written.items()},
     }
     (out_path / "manifest.json").write_text(_json_dump(manifest), encoding="utf-8")

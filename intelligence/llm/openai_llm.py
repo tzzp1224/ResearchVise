@@ -2,9 +2,10 @@
 OpenAI LLM
 支持 GPT-4, GPT-4o, GPT-4o-mini 等模型
 """
-from typing import List, Optional, Dict, Any, AsyncGenerator
+from typing import List, Optional, Dict, AsyncGenerator
 import json
 import logging
+import inspect
 
 from .base import BaseLLM, Message, LLMResponse, ToolCall
 
@@ -140,3 +141,18 @@ class OpenAILLM(BaseLLM):
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
+    async def aclose(self) -> None:
+        for client_attr in ("_async_client", "_client"):
+            client = getattr(self, client_attr, None)
+            if client is None:
+                continue
+            try:
+                close_fn = getattr(client, "close", None)
+                if callable(close_fn):
+                    maybe_awaitable = close_fn()
+                    if inspect.isawaitable(maybe_awaitable):
+                        await maybe_awaitable
+            except Exception:
+                pass
+            setattr(self, client_attr, None)

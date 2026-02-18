@@ -2,7 +2,6 @@
 Reddit Scraper
 从 Reddit 抓取社区讨论
 """
-import asyncio
 from datetime import datetime
 from typing import List, Optional
 import logging
@@ -106,12 +105,9 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
         logger.info(f"[Reddit] Searching: {query} in {len(subreddits)} subreddits")
         
         await self._wait_for_rate_limit()
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_search,
                 query,
                 max_results,
@@ -125,8 +121,8 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
             
             return posts
             
-        except Exception as e:
-            self._log_error(f"Search failed for '{query}'", e)
+        except Exception as exc:
+            self._log_error(f"Search failed for '{query}'", exc)
             return []
     
     def _sync_search(
@@ -173,14 +169,11 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
         
         if subreddits is None:
             subreddits = self.DEFAULT_SUBREDDITS
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
             await self._wait_for_rate_limit()
             
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_get_hot,
                 subreddits,
                 max_results,
@@ -188,8 +181,8 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
             
             return [self._convert_to_post(s) for s in results]
             
-        except Exception as e:
-            self._log_error("Failed to get hot posts", e)
+        except Exception as exc:
+            self._log_error("Failed to get hot posts", exc)
             return []
     
     def _sync_get_hot(self, subreddits: List[str], max_results: int) -> list:
@@ -211,14 +204,11 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
         """
         if not self.is_configured():
             return None
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
             await self._wait_for_rate_limit()
             
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._sync_get_submission,
                 post_id,
             )
@@ -227,8 +217,8 @@ class RedditScraper(RateLimitedScraper[SocialPost]):
                 return self._convert_to_post(result)
             return None
             
-        except Exception as e:
-            self._log_error(f"Failed to get post {post_id}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get post {post_id}", exc)
             return None
     
     def _sync_get_submission(self, post_id: str):

@@ -2,8 +2,6 @@
 Twitter/X Scraper
 从 Twitter/X 抓取社交媒体讨论
 """
-import asyncio
-from datetime import datetime
 from typing import List, Optional
 import logging
 
@@ -84,12 +82,9 @@ class TwitterScraper(RateLimitedScraper[SocialPost]):
         logger.info(f"[Twitter] Searching: {query}")
         
         await self._wait_for_rate_limit()
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_search,
                 query,
                 max_results,
@@ -100,8 +95,8 @@ class TwitterScraper(RateLimitedScraper[SocialPost]):
             
             return posts
             
-        except Exception as e:
-            self._log_error(f"Search failed for '{query}'", e)
+        except Exception as exc:
+            self._log_error(f"Search failed for '{query}'", exc)
             return []
     
     def _sync_search(self, query: str, max_results: int) -> list:
@@ -147,14 +142,11 @@ class TwitterScraper(RateLimitedScraper[SocialPost]):
         """
         if not self.is_configured():
             return None
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
             await self._wait_for_rate_limit()
             
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._sync_get_tweet,
                 tweet_id,
             )
@@ -163,8 +155,8 @@ class TwitterScraper(RateLimitedScraper[SocialPost]):
                 return self._convert_to_post(result)
             return None
             
-        except Exception as e:
-            self._log_error(f"Failed to get tweet {tweet_id}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get tweet {tweet_id}", exc)
             return None
     
     def _sync_get_tweet(self, tweet_id: str):

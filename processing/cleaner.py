@@ -4,8 +4,7 @@ Data Cleaner
 """
 import re
 import html
-from typing import Optional, List, Union
-from datetime import datetime
+from typing import Optional
 
 from models import Paper, SocialPost, Model, Dataset, GitHubRepo
 

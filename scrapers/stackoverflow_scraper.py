@@ -3,7 +3,6 @@ Stack Overflow Scraper
 技术问答搜索
 API 文档: https://api.stackexchange.com/docs
 """
-import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging

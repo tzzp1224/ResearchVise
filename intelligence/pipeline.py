@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import hashlib
 import inspect
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 import json
@@ -29,12 +31,13 @@ from intelligence.pipeline_helpers import (
     aggregated_result_to_search_results,
     evaluate_output_depth,
     evaluate_research_quality,
+    extract_technical_claim_candidates,
     normalize_one_pager_content,
     normalize_one_pager_resources,
     normalize_timeline_dates,
     normalize_video_brief,
 )
-from intelligence.tools.rag_tools import add_to_knowledge_base, close_knowledge_base
+from intelligence.tools.rag_tools import add_to_knowledge_base
 from intelligence.tools.deep_content_enricher import enrich_search_results_deep
 from outputs import export_research_outputs
 from outputs.video_generator import BaseVideoGenerator, create_video_generator
@@ -414,6 +417,30 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _topic_session_id(topic: Any) -> str:
+    raw = str(topic or "").strip()
+    if not raw:
+        raw = "default"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_topic_for_cache_match(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s\-_]+", " ", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff ]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_cache_topic_compatible(*, planned_topic: str, candidate_topic: str) -> bool:
+    planned_norm = _normalize_topic_for_cache_match(planned_topic)
+    candidate_norm = _normalize_topic_for_cache_match(candidate_topic)
+    if not planned_norm or not candidate_norm:
+        return False
+    if planned_norm == candidate_norm:
+        return True
+    return planned_norm in candidate_norm or candidate_norm in planned_norm
+
+
 def _exception_text(exc: Exception) -> str:
     text = str(exc).strip()
     if text:
@@ -562,36 +589,53 @@ def _heuristic_facts_from_search_results(
             continue
 
         year = _year_from_metadata(metadata)
-        snippet = _first_sentence(content, max_len=180)
+        technical_candidates = extract_technical_claim_candidates(
+            content,
+            max_items=5,
+            max_len=500,
+        )
+        snippet = technical_candidates[0] if technical_candidates else _first_sentence(content, max_len=260)
         if source == "github":
             stars = metadata.get("stars")
             language = str(metadata.get("language", "")).strip()
             stars_text = f", {stars} stars" if stars not in (None, "") else ""
             language_text = f", language={language}" if language else ""
             base = title or "GitHub repository"
-            detail = snippet or _compact_text(content, max_len=160)
+            detail = snippet or _compact_text(content, max_len=500)
             claim = (
                 f"Repository {base}{stars_text}{language_text} provides implementation details: {detail}"
             )
         elif source in {"arxiv", "semantic_scholar"}:
             paper = title or "paper"
             year_text = f" ({year})" if year else ""
-            detail = snippet or _compact_text(content, max_len=180)
+            detail = snippet or _compact_text(content, max_len=500)
             claim = f"Paper {paper}{year_text} reports: {detail}"
         elif source == "stackoverflow":
-            claim = f"StackOverflow discussion '{title}' highlights: {snippet or _compact_text(content, max_len=170)}"
+            claim = (
+                f"StackOverflow discussion '{title}' highlights: "
+                f"{snippet or _compact_text(content, max_len=500)}"
+            )
         elif source == "hackernews":
-            claim = f"HackerNews thread '{title}' highlights: {snippet or _compact_text(content, max_len=170)}"
+            claim = (
+                f"HackerNews thread '{title}' highlights: "
+                f"{snippet or _compact_text(content, max_len=500)}"
+            )
         elif source == "huggingface":
             downloads = metadata.get("downloads")
             typ = metadata.get("type")
             d_text = f", downloads={downloads}" if downloads not in (None, "") else ""
             t_text = f", type={typ}" if typ else ""
-            claim = f"HuggingFace asset {title}{t_text}{d_text}: {snippet or _compact_text(content, max_len=170)}"
+            claim = (
+                f"HuggingFace asset {title}{t_text}{d_text}: "
+                f"{snippet or _compact_text(content, max_len=500)}"
+            )
         else:
             claim = f"{title}. {snippet}".strip(". ").strip()
 
-        claim = _compact_text(claim, max_len=280)
+        if len(technical_candidates) > 1:
+            claim = f"{claim} ; Evidence: {' | '.join(technical_candidates[1:3])}"
+
+        claim = _compact_text(claim, max_len=500)
         if not claim:
             continue
         key = claim.lower()
@@ -613,7 +657,7 @@ def _heuristic_facts_from_search_results(
         evidence_id = str(item.get("id", "")).strip()
         fact = {
             "id": f"heur_fact_{len(facts) + 1}",
-            "claim": claim[:280],
+            "claim": claim[:500],
             "evidence": [evidence_id] if evidence_id else [],
             "confidence": confidence,
             "source_type": source_type,
@@ -626,12 +670,12 @@ def _heuristic_facts_from_search_results(
 
 
 def _fact_claim_key(value: Any) -> str:
-    normalized = _compact_text(value, max_len=320).lower()
+    normalized = _compact_text(value, max_len=520).lower()
     return re.sub(r"[\W_]+", "", normalized)
 
 
 def _normalize_fact_dict(raw: Dict[str, Any], *, fallback_idx: int) -> Optional[Dict[str, Any]]:
-    claim = _compact_text(raw.get("claim", ""), max_len=280)
+    claim = _compact_text(raw.get("claim", ""), max_len=500)
     if not claim:
         return None
     evidence = [
@@ -965,11 +1009,22 @@ def _search_results_to_documents(search_results: List[Dict[str, Any]]) -> List[D
     return documents
 
 
-async def _warmup_knowledge_base_from_search_results(search_results: List[Dict[str, Any]]) -> None:
+async def _warmup_knowledge_base_from_search_results(
+    search_results: List[Dict[str, Any]],
+    *,
+    session_id: Optional[str] = None,
+) -> None:
     if not search_results:
+        logger.info("KB warmup skipped: no search results (session_id=%s)", session_id or "*")
         return
     documents = _search_results_to_documents(search_results)
-    await add_to_knowledge_base(documents)
+    chunks_added = await add_to_knowledge_base(documents, namespace=session_id)
+    logger.info(
+        "KB warmup completed: docs=%s chunks=%s session_id=%s",
+        len(documents),
+        chunks_added,
+        session_id or "*",
+    )
 
 
 def _load_video_flow(metadata_path: Path) -> Dict[str, Any]:
@@ -1136,6 +1191,7 @@ async def _run_analysis_stage(
     search_results: List[Dict[str, Any]],
     llm: BaseLLM,
     enable_knowledge_indexing: bool,
+    session_id: Optional[str],
     analysis_timeout_sec: int,
     progress_callback: Optional[Callable[[Dict[str, Any]], Any]],
 ) -> Dict[str, Any]:
@@ -1145,9 +1201,13 @@ async def _run_analysis_stage(
         topic=topic,
         search_results_count=len(search_results),
     )
+    async def _indexer(documents: List[Dict[str, Any]]) -> int:
+        return await add_to_knowledge_base(documents, namespace=session_id)
+
     analyst = AnalystAgent(
         llm=llm,
         enable_knowledge_indexing=enable_knowledge_indexing,
+        knowledge_indexer=_indexer,
     )
     try:
         analysis = await asyncio.wait_for(
@@ -1379,6 +1439,7 @@ async def run_research_from_search_results(
     *,
     topic: str,
     search_results: List[Dict[str, Any]],
+    session_id: Optional[str] = None,
     llm: Optional[BaseLLM] = None,
     out_dir: Optional[Path] = None,
     generate_video: bool = False,
@@ -1396,6 +1457,7 @@ async def run_research_from_search_results(
     """
     owns_llm = llm is None
     llm = llm or get_llm()
+    resolved_session_id = str(session_id or _topic_session_id(topic)).strip()
 
     try:
         analysis = await _run_analysis_stage(
@@ -1403,6 +1465,7 @@ async def run_research_from_search_results(
             search_results=search_results,
             llm=llm,
             enable_knowledge_indexing=enable_knowledge_indexing,
+            session_id=resolved_session_id,
             analysis_timeout_sec=analysis_timeout_sec,
             progress_callback=progress_callback,
         )
@@ -1476,6 +1539,7 @@ async def run_research_from_search_results(
 
         result_payload = {
             "topic": topic,
+            "session_id": resolved_session_id,
             "search_results_count": len(search_results),
             "search_results": search_results,
             "facts": facts,
@@ -1503,8 +1567,6 @@ async def run_research_from_search_results(
         )
         return result_payload
     finally:
-        if enable_knowledge_indexing:
-            close_knowledge_base()
         if owns_llm:
             try:
                 await llm.aclose()
@@ -1648,6 +1710,7 @@ async def _run_planner_stage(
 async def _attempt_cache_reuse(
     *,
     planned_topic: str,
+    session_id: str,
     input_topic: str,
     planner_output: Dict[str, Any],
     cache_cfg: Any,
@@ -1674,6 +1737,14 @@ async def _attempt_cache_reuse(
             top_k=max(1, int(cache_cfg.top_k)),
         )
         for candidate in candidates:
+            candidate_score = _safe_float(candidate.get("score"), 0.0)
+            candidate_topic = str(candidate.get("topic", "")).strip()
+            topic_compatible = _is_cache_topic_compatible(
+                planned_topic=planned_topic,
+                candidate_topic=candidate_topic,
+            )
+            if not topic_compatible and candidate_score < 0.95:
+                continue
             if str(candidate.get("artifact_schema_version", "")).strip() != _ARTIFACT_SCHEMA_VERSION:
                 continue
             if _safe_float(candidate.get("quality_score"), 0.0) < cache_min_quality:
@@ -1685,7 +1756,10 @@ async def _attempt_cache_reuse(
                 and _safe_int(candidate.get("search_results_count"), 0) <= 0
             ):
                 continue
-            snapshot_path = Path(str(candidate.get("snapshot_path", "")).strip())
+            snapshot_path_text = str(candidate.get("snapshot_path", "")).strip()
+            if not snapshot_path_text or not os.path.exists(snapshot_path_text):
+                continue
+            snapshot_path = Path(snapshot_path_text)
             if not snapshot_path.exists():
                 continue
 
@@ -1747,10 +1821,12 @@ async def _attempt_cache_reuse(
 
             cached["input_topic"] = input_topic
             cached["topic"] = cached.get("topic") or planned_topic
+            cached["session_id"] = session_id
             cached["planner"] = planner_output
             cached["cache_hit"] = True
-            cached["cache_score"] = _safe_float(candidate.get("score"), 0.0)
+            cached["cache_score"] = candidate_score
             cached["cache_matched_topic"] = str(candidate.get("topic", "")).strip() or cached["topic"]
+            cached["cache_topic_compatible"] = topic_compatible
             cached["search_strategy"] = "cache_reuse"
             cached.setdefault("search_trace", [])
             cached.setdefault("search_coverage", {})
@@ -1764,11 +1840,12 @@ async def _attempt_cache_reuse(
             )
             if enable_knowledge_indexing:
                 try:
-                    await _warmup_knowledge_base_from_search_results(cached_results)
+                    await _warmup_knowledge_base_from_search_results(
+                        cached_results,
+                        session_id=session_id,
+                    )
                 except Exception as exc:
                     logger.warning(f"Cache hit KB warmup skipped: {exc}")
-                finally:
-                    close_knowledge_base()
             await _emit_progress(
                 progress_callback,
                 event="research_finished",
@@ -2111,6 +2188,7 @@ async def run_research_end_to_end(
     if not resolved_sources:
         resolved_sources = _sources_from_aggregator_kwargs(aggregator_kwargs)
 
+    session_id = _topic_session_id(topic)
     planned_topic, planner_output, blocked_payload = await _run_planner_stage(
         topic=topic,
         user_query=user_query,
@@ -2120,7 +2198,9 @@ async def run_research_end_to_end(
         critic_threshold=critic_threshold,
         progress_callback=progress_callback,
     )
+    session_id = _topic_session_id(planned_topic)
     if blocked_payload is not None:
+        blocked_payload["session_id"] = session_id
         await _close_owned_llm()
         return blocked_payload
 
@@ -2134,6 +2214,7 @@ async def run_research_end_to_end(
     if cache_enabled and allow_cache_hit:
         cached = await _attempt_cache_reuse(
             planned_topic=planned_topic,
+            session_id=session_id,
             input_topic=topic,
             planner_output=planner_output,
             cache_cfg=cache_cfg,
@@ -2192,6 +2273,7 @@ async def run_research_end_to_end(
     result = await run_research_from_search_results(
         topic=planned_topic,
         search_results=search_results,
+        session_id=session_id,
         llm=llm,
         out_dir=out_dir,
         generate_video=generate_video,
@@ -2205,6 +2287,7 @@ async def run_research_end_to_end(
         progress_callback=progress_callback,
     )
     result["input_topic"] = topic
+    result["session_id"] = session_id
     result["search_results"] = search_results
     result["planner"] = planner_output
     result["aggregated_summary"] = aggregated_summary
@@ -2263,6 +2346,8 @@ async def run_research_end_to_end(
 async def chat_over_knowledge_base(
     *,
     question: str,
+    topic: Optional[str] = None,
+    session_id: Optional[str] = None,
     llm: Optional[BaseLLM] = None,
     top_k: int = 6,
     sources: Optional[List[str]] = None,
@@ -2272,22 +2357,29 @@ async def chat_over_knowledge_base(
     """
     基于向量知识库进行对话问答。
     """
-    try:
-        chat_agent = ChatAgent(llm=llm or get_llm(), default_top_k=top_k)
-        return await chat_agent.ask(
-            question=question,
-            top_k=top_k,
-            sources=sources,
-            year_filter=year_filter,
-            use_hybrid=use_hybrid,
-        )
-    finally:
-        close_knowledge_base()
+    resolved_session_id = str(session_id or "").strip()
+    if not resolved_session_id and str(topic or "").strip():
+        resolved_session_id = _topic_session_id(topic)
+    resolved_namespace = resolved_session_id or None
+    chat_agent = ChatAgent(llm=llm or get_llm(), default_top_k=top_k)
+    result = await chat_agent.ask(
+        question=question,
+        top_k=top_k,
+        sources=sources,
+        year_filter=year_filter,
+        use_hybrid=use_hybrid,
+        namespace=resolved_namespace,
+        topic_hash=resolved_namespace,
+    )
+    result["session_id"] = resolved_session_id
+    return result
 
 
 async def chat_over_kb(
     *,
     question: str,
+    topic: Optional[str] = None,
+    session_id: Optional[str] = None,
     llm: Optional[BaseLLM] = None,
     top_k: int = 6,
     sources: Optional[List[str]] = None,
@@ -2297,6 +2389,8 @@ async def chat_over_kb(
     """chat_over_knowledge_base 的简写别名。"""
     return await chat_over_knowledge_base(
         question=question,
+        topic=topic,
+        session_id=session_id,
         llm=llm,
         top_k=top_k,
         sources=sources,

@@ -3,11 +3,9 @@ Base Scraper
 所有抓取器的抽象基类
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TypeVar, Generic
+from typing import Callable, Generic, List, Optional, TypeVar
 import asyncio
 import logging
-
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import get_settings
 from models import SourceType
@@ -16,6 +14,7 @@ from models import SourceType
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")  # 泛型返回类型
+R = TypeVar("R")
 
 
 class BaseScraper(ABC, Generic[T]):
@@ -87,6 +86,10 @@ class BaseScraper(ABC, Generic[T]):
         if self._session:
             await self._session.close()
             self._session = None
+
+    async def _run_blocking(self, func: Callable[..., R], *args, **kwargs) -> R:
+        """在线程池中执行阻塞函数，统一替代 run_in_executor 样板代码。"""
+        return await asyncio.to_thread(func, *args, **kwargs)
     
     def _log_search(self, query: str, count: int):
         """记录搜索日志"""

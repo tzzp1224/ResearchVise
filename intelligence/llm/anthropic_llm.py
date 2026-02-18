@@ -2,9 +2,9 @@
 Anthropic LLM
 支持 Claude 3.5 Sonnet, Claude 3 Opus 等模型
 """
-from typing import List, Optional, Dict, Any, AsyncGenerator
-import json
+from typing import List, Optional, Dict, AsyncGenerator
 import logging
+import inspect
 
 from .base import BaseLLM, Message, MessageRole, LLMResponse, ToolCall
 
@@ -168,3 +168,18 @@ class AnthropicLLM(BaseLLM):
         async with client.messages.stream(**request_params) as stream:
             async for text in stream.text_stream:
                 yield text
+
+    async def aclose(self) -> None:
+        for client_attr in ("_async_client", "_client"):
+            client = getattr(self, client_attr, None)
+            if client is None:
+                continue
+            try:
+                close_fn = getattr(client, "close", None)
+                if callable(close_fn):
+                    maybe_awaitable = close_fn()
+                    if inspect.isawaitable(maybe_awaitable):
+                        await maybe_awaitable
+            except Exception:
+                pass
+            setattr(self, client_attr, None)

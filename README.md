@@ -239,7 +239,17 @@ python demo_phase4.py --topic "manus" -n 5 --sources "arxiv,huggingface,github,s
 
 # 11. 命令行搜索 (Phase 1)
 python main.py --topic "DeepSeek" -n 20
+
+# 12. 运行 Phase 5 Web UI（三栏布局 + SSE 文档流）
+python demo_phase5.py --host 127.0.0.1 --port 8765
+# 浏览器打开 http://127.0.0.1:8765
 ```
+
+### Phase 5 UI 布局说明
+
+- 左栏（文档输出）：`one_pager.md / timeline.md / report.md / video_brief.md` 通过 SSE 分块流式显示
+- 中栏（Agent + Chat）：研究任务配置、执行流日志、基于 KB 的聊天问答
+- 右栏（视频输出）：视频生成进度、视频播放器、产物快捷链接
 
 ## 🔧 配置说明
 

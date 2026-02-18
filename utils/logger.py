@@ -6,7 +6,6 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
 
 from rich.logging import RichHandler
 from rich.console import Console

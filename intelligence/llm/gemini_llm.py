@@ -2,8 +2,7 @@
 Google Gemini LLM
 支持 Gemini 2.0, Gemini 1.5 Pro 等模型
 """
-from typing import List, Optional, Dict, Any, AsyncGenerator
-import json
+from typing import List, Optional, Dict, AsyncGenerator
 import logging
 
 from .base import BaseLLM, Message, MessageRole, LLMResponse, ToolCall
@@ -202,3 +201,6 @@ class GeminiLLM(BaseLLM):
         async for chunk in response:
             if chunk.text:
                 yield chunk.text
+
+    async def aclose(self) -> None:
+        self._client = None

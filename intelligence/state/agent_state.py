@@ -2,11 +2,9 @@
 Agent State
 全局状态定义 - 用于 LangGraph 状态管理
 """
-from typing import List, Optional, Dict, Any, Annotated
+from typing import List, Optional, Dict, Any, Annotated, TypedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime
-import operator
 
 from outputs.models import TimelineEvent, OnePager, VideoBrief
 
@@ -161,10 +159,6 @@ class AgentState:
             "messages": [],
             "errors": [],
         }
-
-
-# TypedDict 版本 (LangGraph 兼容)
-from typing import TypedDict
 
 
 class AgentStateDict(TypedDict, total=False):

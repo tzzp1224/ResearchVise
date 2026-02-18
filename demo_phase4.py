@@ -50,8 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slides-target-duration-sec",
         type=int,
-        default=420,
-        help="Target duration for slides video in seconds (default: 420)",
+        default=180,
+        help="Target duration for slides video in seconds (default: 180)",
     )
     parser.add_argument(
         "--slides-fps",
@@ -106,6 +106,53 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated sources. Available: "
             "arxiv,huggingface,twitter,reddit,github,semantic_scholar,stackoverflow,hackernews"
         ),
+    )
+    parser.add_argument(
+        "--search-max-iterations",
+        type=int,
+        default=2,
+        help="Max ReAct iterations (default: 2)",
+    )
+    parser.add_argument(
+        "--search-tool-timeout-sec",
+        type=int,
+        default=6,
+        help="Timeout per search tool call in seconds (default: 6)",
+    )
+    parser.add_argument(
+        "--react-thought-timeout-sec",
+        type=int,
+        default=5,
+        help="Timeout for each ReAct LLM thought in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--search-time-budget-sec",
+        type=int,
+        default=45,
+        help="Total search time budget in seconds (default: 45)",
+    )
+    parser.add_argument(
+        "--analysis-timeout-sec",
+        type=int,
+        default=60,
+        help="Timeout for analysis stage in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--content-timeout-sec",
+        type=int,
+        default=45,
+        help="Timeout for content generation stage in seconds (default: 45)",
+    )
+    parser.add_argument(
+        "--critic-timeout-sec",
+        type=int,
+        default=15,
+        help="Timeout for critic stage in seconds (default: 15)",
+    )
+    parser.add_argument(
+        "--enable-critic-gate",
+        action="store_true",
+        help="Enable critic quality gate (disabled by default for speed).",
     )
     return parser
 
@@ -167,6 +214,14 @@ async def async_main(args: argparse.Namespace) -> int:
         video_generator=video_generator,
         enable_knowledge_indexing=not args.disable_knowledge_indexing,
         aggregator_kwargs=aggregator_kwargs,
+        search_max_iterations=args.search_max_iterations,
+        search_tool_timeout_sec=args.search_tool_timeout_sec,
+        react_thought_timeout_sec=args.react_thought_timeout_sec,
+        search_time_budget_sec=args.search_time_budget_sec,
+        analysis_timeout_sec=args.analysis_timeout_sec,
+        content_timeout_sec=args.content_timeout_sec,
+        critic_timeout_sec=args.critic_timeout_sec,
+        enable_critic_gate=args.enable_critic_gate,
     )
 
     depth = result.get("depth_assessment", {})

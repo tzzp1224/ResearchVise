@@ -2,9 +2,7 @@
 Hugging Face Scraper
 从 Hugging Face Hub 抓取模型、数据集和论文
 """
-import asyncio
-from datetime import datetime
-from typing import List, Optional, Literal
+from typing import List, Optional
 import logging
 import inspect
 
@@ -12,7 +10,7 @@ from huggingface_hub import HfApi
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .base import BaseScraper
-from models import Paper, Model, Dataset, Author, SourceType
+from models import Paper, Model, Dataset, SourceType
 from config import get_settings
 
 
@@ -88,11 +86,8 @@ class HuggingFaceScraper(BaseScraper[Model]):
             max_results = self._hf_settings.max_results
         
         logger.info(f"[HuggingFace] Searching models: {query}")
-        
-        loop = asyncio.get_event_loop()
-        
-        results = await loop.run_in_executor(
-            None,
+
+        results = await self._run_blocking(
             self._sync_search_models,
             query,
             max_results,
@@ -153,11 +148,8 @@ class HuggingFaceScraper(BaseScraper[Model]):
             max_results = self._hf_settings.max_results
         
         logger.info(f"[HuggingFace] Searching datasets: {query}")
-        
-        loop = asyncio.get_event_loop()
-        
-        results = await loop.run_in_executor(
-            None,
+
+        results = await self._run_blocking(
             self._sync_search_datasets,
             query,
             max_results,
@@ -204,10 +196,7 @@ class HuggingFaceScraper(BaseScraper[Model]):
         logger.info(f"[HuggingFace] Searching papers related to: {query}")
         
         # 通过 HF API 获取有论文链接的模型
-        loop = asyncio.get_event_loop()
-        
-        results = await loop.run_in_executor(
-            None,
+        results = await self._run_blocking(
             self._sync_search_papers,
             query,
             max_results,
@@ -258,17 +247,14 @@ class HuggingFaceScraper(BaseScraper[Model]):
         Returns:
             模型详情
         """
-        loop = asyncio.get_event_loop()
-        
         try:
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._api.model_info,
                 model_id,
             )
             return self._convert_to_model(result)
-        except Exception as e:
-            self._log_error(f"Failed to get model {model_id}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get model {model_id}", exc)
             return None
     
     async def get_dataset_details(self, dataset_id: str) -> Optional[Dataset]:
@@ -281,17 +267,14 @@ class HuggingFaceScraper(BaseScraper[Model]):
         Returns:
             数据集详情
         """
-        loop = asyncio.get_event_loop()
-        
         try:
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._api.dataset_info,
                 dataset_id,
             )
             return self._convert_to_dataset(result)
-        except Exception as e:
-            self._log_error(f"Failed to get dataset {dataset_id}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get dataset {dataset_id}", exc)
             return None
     
     def _convert_to_model(self, model_info) -> Model:

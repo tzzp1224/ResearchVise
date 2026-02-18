@@ -5,7 +5,7 @@ Output Renderers
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -19,6 +19,30 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
+def _format_mmss(value: Any) -> str:
+    try:
+        total = max(0, int(float(value)))
+    except Exception:
+        total = 0
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _truncate_text(value: str, max_len: int = 80) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _sanitize_mermaid_label(value: str, max_len: int = 48) -> str:
+    text = str(value or "")
+    text = re.sub(r"[`|{}\[\]\"'()（）<>]", "", text)
+    text = re.sub(r"[:;,#]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _truncate_text(text, max_len=max_len) or "N/A"
+
+
 def _parse_iso_like_date(date_str: str) -> Tuple[int, int, int, str]:
     """
     把常见的 ISO-like 日期字符串解析为可排序 key。
@@ -29,13 +53,15 @@ def _parse_iso_like_date(date_str: str) -> Tuple[int, int, int, str]:
     if not s:
         return (9999, 12, 31, "")
 
-    m = re.match(r"^(\\d{4})(?:[-/.](\\d{1,2}))?(?:[-/.](\\d{1,2}))?", s)
+    m = re.match(r"^(\d{4})(?:[-/.](\d{1,2}))?(?:[-/.](\d{1,2}))?", s)
     if not m:
         return (9999, 12, 31, s)
 
     year = _safe_int(m.group(1), 9999)
     month = _safe_int(m.group(2), 12) if m.group(2) else 1
     day = _safe_int(m.group(3), 31) if m.group(3) else 1
+    month = max(1, min(12, month))
+    day = max(1, min(31, day))
     return (year, month, day, s)
 
 
@@ -64,7 +90,12 @@ def render_timeline_mermaid(timeline: Timeline) -> str:
     """
     渲染 Mermaid timeline 图（尽量兼容常见 Markdown 渲染器）。
     """
-    lines = ["```mermaid", "timeline", f"    title {timeline.topic}"]
+    lines = [
+        "```mermaid",
+        "%%{init: {'theme': 'base', 'themeVariables': {'primaryTextColor': '#1f2d36', 'lineColor': '#506877', 'fontSize': '15px'}}}%%",
+        "timeline",
+        f"    title {_sanitize_mermaid_label(timeline.topic, max_len=56)}",
+    ]
 
     events_sorted = sorted(
         timeline.events,
@@ -72,7 +103,7 @@ def render_timeline_mermaid(timeline: Timeline) -> str:
     )
     for e in events_sorted:
         date = (e.date or "").strip() or "Unknown"
-        title = (e.title or "").strip() or "Untitled"
+        title = _sanitize_mermaid_label((e.title or "").strip() or "Untitled")
         lines.append(f"    {date} : {title}")
 
     lines.append("```")
@@ -102,8 +133,8 @@ def render_timeline_markdown(
 
     parts.append("## Events")
     parts.append("")
-    parts.append("| Date | Importance | Title | Description | Sources |")
-    parts.append("| --- | ---: | --- | --- | --- |")
+    parts.append("| Date | Title | Description |")
+    parts.append("| --- | --- | --- |")
 
     events_sorted = sorted(
         tl.events,
@@ -111,11 +142,246 @@ def render_timeline_markdown(
     )
     for e in events_sorted:
         date = (e.date or "").strip()
-        importance = max(1, min(5, _safe_int(e.importance, 3)))
         title = (e.title or "").strip().replace("|", "\\|")
         desc = (e.description or "").strip().replace("\n", " ").replace("|", "\\|")
-        sources = ", ".join([str(s) for s in (e.source_refs or [])]) if e.source_refs else ""
-        parts.append(f"| {date} | {importance} | {title} | {desc} | {sources} |")
+        parts.append(f"| {date} | {title} | {desc} |")
+
+    return "\n".join(parts).strip() + "\n"
+
+
+def build_knowledge_tree(
+    topic: str,
+    *,
+    timeline: Optional[Union[Timeline, Sequence[Dict[str, Any]], Dict[str, Any]]] = None,
+    one_pager: Optional[Union[OnePager, Dict[str, Any]]] = None,
+    facts: Optional[Sequence[Dict[str, Any]]] = None,
+    search_results: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    tl = _normalize_timeline_events(timeline, topic=topic)
+    op = one_pager if isinstance(one_pager, OnePager) else OnePager.from_dict(one_pager or {}, default_title="")
+    facts_list = list(facts or [])
+    results = list(search_results or [])
+
+    topic_lower = str(topic or "").lower()
+    prerequisites: List[str] = []
+    if "mcp" in topic_lower or "model context protocol" in topic_lower:
+        prerequisites.extend(
+            [
+                "LLM Tool Calling 与函数调用协议",
+                "服务鉴权（OAuth2/JWT/API Key）与密钥管理",
+                "分布式系统可靠性（重试、幂等、超时、熔断）",
+                "可观测性（日志、指标、链路追踪）",
+                "生产部署（灰度发布、回滚、容量规划）",
+            ]
+        )
+    if "reinforcement learning" in topic_lower or "强化学习" in topic_lower:
+        prerequisites.extend(
+            [
+                "马尔可夫决策过程（MDP）",
+                "价值函数与策略梯度",
+                "探索-利用权衡",
+                "离线/在线评估与安全约束",
+            ]
+        )
+
+    category_to_prereq = {
+        "architecture": "系统架构设计与模块边界划分",
+        "training": "训练数据与优化目标定义",
+        "performance": "性能基准设计与指标口径",
+        "comparison": "替代方案对比与取舍分析",
+        "limitation": "风险建模与失效模式分析",
+        "deployment": "工程部署、监控与回滚策略",
+    }
+    for fact in facts_list:
+        category = str(fact.get("category", "")).strip().lower()
+        prereq = category_to_prereq.get(category)
+        if prereq:
+            prerequisites.append(prereq)
+
+    for item in (op.technical_deep_dive or [])[:4]:
+        cleaned = _truncate_text(item, max_len=52)
+        if cleaned:
+            prerequisites.append(cleaned)
+
+    milestones: List[Dict[str, str]] = []
+    events_sorted = sorted(tl.events, key=lambda e: _parse_iso_like_date(e.date))
+    for event in events_sorted[:8]:
+        milestones.append(
+            {
+                "date": str(event.date or "").strip(),
+                "title": _truncate_text(str(event.title or "").strip(), max_len=52),
+                "description": _truncate_text(str(event.description or "").strip(), max_len=110),
+            }
+        )
+
+    if not milestones:
+        for idx, fact in enumerate(facts_list[:6], start=1):
+            claim = _truncate_text(str(fact.get("claim", "")).strip(), max_len=90)
+            if not claim:
+                continue
+            milestones.append(
+                {
+                    "date": f"Step {idx}",
+                    "title": claim,
+                    "description": claim,
+                }
+            )
+
+    evidence_priority = {"arxiv": 0, "semantic_scholar": 1, "github": 2, "huggingface": 3}
+    results_sorted = sorted(
+        results,
+        key=lambda item: (
+            evidence_priority.get(str(item.get("source", "")).strip(), 9),
+            -float(item.get("score", 0) or 0),
+        ),
+    )
+    key_resources: List[Dict[str, str]] = []
+    seen_urls = set()
+    for item in results_sorted:
+        source = str(item.get("source", "")).strip()
+        if source not in evidence_priority:
+            continue
+        url = str(item.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        key_resources.append(
+            {
+                "title": _truncate_text(str(item.get("title", "")).strip() or "Untitled", max_len=70),
+                "url": url,
+                "source": source,
+            }
+        )
+        if len(key_resources) >= 10:
+            break
+
+    if len(key_resources) < 3:
+        for resource in list(op.resources or [])[:10]:
+            if not isinstance(resource, dict):
+                continue
+            url = str(resource.get("url", "")).strip()
+            if not re.match(r"^https?://", url) or url in seen_urls:
+                continue
+            title = _truncate_text(str(resource.get("title", "")).strip() or "Resource", max_len=70)
+            seen_urls.add(url)
+            key_resources.append({"title": title, "url": url, "source": "one_pager"})
+            if len(key_resources) >= 10:
+                break
+
+    current_focus: List[str] = []
+    current_focus.extend([_truncate_text(x, max_len=72) for x in (op.key_findings or [])[:6] if str(x).strip()])
+    current_focus.extend([_truncate_text(x, max_len=72) for x in (op.implementation_notes or [])[:4] if str(x).strip()])
+    if not current_focus:
+        current_focus.extend([_truncate_text(str(f.get("claim", "")).strip(), max_len=72) for f in facts_list[:6]])
+
+    deduped_prereq: List[str] = []
+    seen_pre = set()
+    for item in prerequisites:
+        key = str(item or "").strip()
+        if not key or key in seen_pre:
+            continue
+        seen_pre.add(key)
+        deduped_prereq.append(key)
+
+    deduped_focus: List[str] = []
+    seen_focus = set()
+    for item in current_focus:
+        key = str(item or "").strip()
+        if not key or key in seen_focus:
+            continue
+        seen_focus.add(key)
+        deduped_focus.append(key)
+
+    return {
+        "topic": topic,
+        "prerequisites": deduped_prereq[:10],
+        "milestones": milestones[:10],
+        "key_resources": key_resources,
+        "current_focus": deduped_focus[:10],
+    }
+
+
+def render_knowledge_tree_markdown(
+    topic: str,
+    *,
+    timeline: Optional[Union[Timeline, Sequence[Dict[str, Any]], Dict[str, Any]]] = None,
+    one_pager: Optional[Union[OnePager, Dict[str, Any]]] = None,
+    facts: Optional[Sequence[Dict[str, Any]]] = None,
+    search_results: Optional[Sequence[Dict[str, Any]]] = None,
+    knowledge_tree: Optional[Dict[str, Any]] = None,
+) -> str:
+    tree = knowledge_tree or build_knowledge_tree(
+        topic=topic,
+        timeline=timeline,
+        one_pager=one_pager,
+        facts=facts,
+        search_results=search_results,
+    )
+
+    prerequisites = list(tree.get("prerequisites") or [])
+    milestones = list(tree.get("milestones") or [])
+    resources = list(tree.get("key_resources") or [])
+    focus = list(tree.get("current_focus") or [])
+
+    parts: List[str] = [f"# {topic} Knowledge Tree", ""]
+    parts.append("```mermaid")
+    parts.append(
+        "%%{init: {'theme': 'base', 'themeVariables': {'primaryTextColor': '#1f2d36', 'lineColor': '#506877', 'fontSize': '15px'}}}%%"
+    )
+    parts.append("mindmap")
+    parts.append(f"  root(({_sanitize_mermaid_label(topic, max_len=52)}))")
+    parts.append("    前置知识")
+    for item in prerequisites[:6]:
+        parts.append(f"      {_sanitize_mermaid_label(item)}")
+    parts.append("    演进路径")
+    for item in milestones[:6]:
+        date = str(item.get("date", "")).strip()
+        title = str(item.get("title", "")).strip()
+        label = f"{date} {title}".strip()
+        parts.append(f"      {_sanitize_mermaid_label(label)}")
+    parts.append("    当前焦点")
+    for item in focus[:5]:
+        parts.append(f"      {_sanitize_mermaid_label(item)}")
+    parts.append("```")
+    parts.append("")
+
+    parts.append("## 前置知识")
+    parts.append("")
+    for item in prerequisites or ["当前检索结果尚未覆盖稳定前置知识，请补充高置信来源后重试。"]:
+        parts.append(f"- {item}")
+    parts.append("")
+
+    parts.append("## 演进路径（通向当前技术）")
+    parts.append("")
+    if milestones:
+        for idx, item in enumerate(milestones, start=1):
+            date = str(item.get("date", "")).strip()
+            title = str(item.get("title", "")).strip()
+            description = str(item.get("description", "")).strip()
+            parts.append(f"{idx}. **{date or 'Unknown'} · {title or 'Untitled'}**")
+            if description:
+                parts.append(f"   {description}")
+    else:
+        parts.append("1. 暂无可用里程碑数据。")
+    parts.append("")
+
+    parts.append("## 关键论文与工程实现")
+    parts.append("")
+    if resources:
+        for item in resources:
+            title = str(item.get("title", "")).strip() or "Untitled"
+            url = str(item.get("url", "")).strip()
+            source = str(item.get("source", "")).strip() or "unknown"
+            parts.append(f"- [{title}]({url})（{source}）")
+    else:
+        parts.append("- 当前检索结果未提供可验证的公开资源链接。")
+    parts.append("")
+
+    parts.append("## 当前技术焦点")
+    parts.append("")
+    for item in focus or ["当前检索结果尚未形成稳定技术焦点，请优先补充核心证据。"]:
+        parts.append(f"- {item}")
+    parts.append("")
 
     return "\n".join(parts).strip() + "\n"
 
@@ -240,15 +506,18 @@ def render_video_brief_markdown(
             seg_content = str(seg.get("content", "")).strip()
             points = seg.get("talking_points") or []
             duration = seg.get("duration_sec")
+            start_sec = seg.get("start_sec")
             visual_prompt = str(seg.get("visual_prompt", "")).strip()
 
             parts.append(f"### {i}. {seg_title}")
             parts.append("")
+            if start_sec is not None:
+                parts.append(f"- Start: {_format_mmss(start_sec)}")
             if duration:
                 parts.append(f"- Duration: {duration}s")
             if visual_prompt:
                 parts.append(f"- Visual prompt: {visual_prompt}")
-            if duration or visual_prompt:
+            if start_sec is not None or duration or visual_prompt:
                 parts.append("")
             if seg_content:
                 parts.append(seg_content)
@@ -280,6 +549,8 @@ def render_research_report_markdown(
     timeline: Optional[Union[Timeline, Sequence[Dict[str, Any]], Dict[str, Any]]] = None,
     one_pager: Optional[Union[OnePager, Dict[str, Any]]] = None,
     video_brief: Optional[Union[VideoBrief, Dict[str, Any]]] = None,
+    facts: Optional[Sequence[Dict[str, Any]]] = None,
+    search_results: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """
     组合渲染：将三种输出整合为一份 Markdown 报告。
@@ -287,7 +558,7 @@ def render_research_report_markdown(
     parts = [
         f"# Research Report: {topic}",
         "",
-        f"_Generated at: {datetime.now().isoformat(timespec='seconds')}_",
+        f"_Generated at (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}_",
         "",
         "---",
         "",
@@ -300,6 +571,16 @@ def render_research_report_markdown(
         "---",
         "",
         render_video_brief_markdown(video_brief, default_title=f"{topic} Video Brief").strip(),
+        "",
+        "---",
+        "",
+        render_knowledge_tree_markdown(
+            topic,
+            timeline=timeline,
+            one_pager=one_pager,
+            facts=facts,
+            search_results=search_results,
+        ).strip(),
         "",
     ]
     return "\n".join(parts).strip() + "\n"

@@ -2,9 +2,10 @@
 DeepSeek LLM
 支持 DeepSeek-V3, DeepSeek-R1 等模型
 """
-from typing import List, Optional, Dict, Any, AsyncGenerator
+from typing import List, Optional, Dict, AsyncGenerator
 import json
 import logging
+import inspect
 
 from .base import BaseLLM, Message, LLMResponse, ToolCall
 
@@ -139,3 +140,17 @@ class DeepSeekLLM(BaseLLM):
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
+    async def aclose(self) -> None:
+        client = self._async_client
+        if client is None:
+            return
+        try:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                maybe_awaitable = close_fn()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+        except Exception:
+            pass
+        self._async_client = None

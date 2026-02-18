@@ -11,13 +11,22 @@ from intelligence.tools import rag_tools
 async def test_hybrid_search_uses_in_filter_for_multi_sources(monkeypatch):
     calls = []
 
-    async def _fake_vector_search(query, top_k=5, filter=None, score_threshold=0.3):
+    async def _fake_vector_search(
+        query,
+        top_k=5,
+        filter=None,
+        score_threshold=0.3,
+        namespace=None,
+        topic_hash=None,
+    ):
         calls.append(
             {
                 "query": query,
                 "top_k": top_k,
                 "filter": filter,
                 "score_threshold": score_threshold,
+                "namespace": namespace,
+                "topic_hash": topic_hash,
             }
         )
         return [{"id": "doc-1", "content": "x", "metadata": {"source": "arxiv"}, "score": 0.9}]
@@ -43,8 +52,23 @@ async def test_hybrid_search_uses_in_filter_for_multi_sources(monkeypatch):
 async def test_hybrid_search_falls_back_to_fanout_and_dedupes(monkeypatch):
     calls = []
 
-    async def _fake_vector_search(query, top_k=5, filter=None, score_threshold=0.3):
-        calls.append({"query": query, "top_k": top_k, "filter": filter})
+    async def _fake_vector_search(
+        query,
+        top_k=5,
+        filter=None,
+        score_threshold=0.3,
+        namespace=None,
+        topic_hash=None,
+    ):
+        calls.append(
+            {
+                "query": query,
+                "top_k": top_k,
+                "filter": filter,
+                "namespace": namespace,
+                "topic_hash": topic_hash,
+            }
+        )
         source_filter = (filter or {}).get("source")
         if isinstance(source_filter, dict):
             raise RuntimeError("IN filter unsupported")

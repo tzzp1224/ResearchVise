@@ -14,31 +14,78 @@ from processing import clean_text, chunk_document
 logger = logging.getLogger(__name__)
 
 
-# 全局向量存储实例 (延迟初始化)
-_vector_store: Optional[QdrantVectorStore] = None
+_KB_COLLECTION_NAME = "research_knowledge"
+_NAMESPACE_FIELD = "kb_namespace"
 
 
-def get_knowledge_base() -> QdrantVectorStore:
-    """获取知识库实例"""
-    global _vector_store
-    if _vector_store is None:
-        _vector_store = get_vector_store(collection_name="research_knowledge")
-    return _vector_store
+def _normalize_namespace(
+    *,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
+) -> Optional[str]:
+    raw = str(namespace or topic_hash or "").strip().lower()
+    if not raw:
+        return None
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in raw)
+    cleaned = cleaned.strip("_-")
+    if not cleaned:
+        return None
+    if len(cleaned) > 64:
+        return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:32]
+    return cleaned
 
 
-def close_knowledge_base() -> None:
-    """关闭并重置全局知识库实例，避免解释器退出时的析构噪音。"""
-    global _vector_store
-    if _vector_store is None:
+def get_knowledge_base(
+    *,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
+) -> QdrantVectorStore:
+    """获取知识库实例（按需实例化，无全局单例）。"""
+    _ = _normalize_namespace(namespace=namespace, topic_hash=topic_hash)
+    return get_vector_store(collection_name=_KB_COLLECTION_NAME)
+
+
+def close_knowledge_base(
+    *,
+    store: Optional[QdrantVectorStore] = None,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
+) -> None:
+    """
+    兼容保留的关闭接口。
+    无全局实例可清理，仅关闭显式传入的当前会话 store。
+    """
+    _ = _normalize_namespace(namespace=namespace, topic_hash=topic_hash)
+    if store is None:
         return
     try:
-        close_fn = getattr(_vector_store, "close", None)
+        close_fn = getattr(store, "close", None)
         if callable(close_fn):
             close_fn()
     except Exception as e:
         logger.debug(f"Failed to close knowledge base: {e}")
-    finally:
-        _vector_store = None
+
+
+def _close_store_instance(store: Optional[QdrantVectorStore]) -> None:
+    if store is None:
+        return
+    try:
+        close_fn = getattr(store, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception as e:
+        logger.debug(f"Failed to close knowledge base store: {e}")
+
+
+def _merge_namespace_filter(
+    *,
+    filter: Optional[Dict[str, Any]],
+    namespace: Optional[str],
+) -> Dict[str, Any]:
+    merged = dict(filter or {})
+    if namespace:
+        merged[_NAMESPACE_FIELD] = namespace
+    return merged
 
 
 def _normalize_source_list(sources: Optional[List[str]]) -> List[str]:
@@ -73,7 +120,9 @@ async def vector_search(
     query: str,
     top_k: int = 5,
     filter: Optional[Dict[str, Any]] = None,
-    score_threshold: float = 0.3,
+    score_threshold: float = 0.15,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     向量相似度搜索
@@ -87,29 +136,51 @@ async def vector_search(
     Returns:
         相似文档列表
     """
-    store = get_knowledge_base()
+    resolved_namespace = _normalize_namespace(namespace=namespace, topic_hash=topic_hash)
+    store = get_knowledge_base(namespace=resolved_namespace)
+    results = []
+    try:
+        filter_with_namespace = _merge_namespace_filter(filter=filter, namespace=resolved_namespace)
+        results = store.search(query, top_k=top_k, filter=filter_with_namespace)
+    finally:
+        _close_store_instance(store)
     
-    results = store.search(query, top_k=top_k, filter=filter)
-    
-    # 过滤低分结果
-    filtered = [
+    transformed = [
         {
             "id": r.id,
             "content": r.content,
             "metadata": r.metadata,
-            "score": r.score,
+            "score": float(getattr(r, "score", 0.0) or 0.0),
         }
         for r in results
-        if r.score >= score_threshold
     ]
-    
-    logger.info(f"Vector search '{query[:50]}...': {len(filtered)} results (threshold={score_threshold})")
+    max_score = max((float(item.get("score", 0.0) or 0.0) for item in transformed), default=0.0)
+    if score_threshold <= 0:
+        filtered = transformed
+    else:
+        filtered = [item for item in transformed if float(item.get("score", 0.0) or 0.0) >= score_threshold]
+
+    if not filtered and transformed:
+        # Fallback: avoid empty recall caused by overly strict threshold.
+        filtered = transformed[: max(1, int(top_k))]
+
+    logger.info(
+        "Vector search '%s...': raw=%s filtered=%s max_score=%.4f threshold=%s namespace=%s",
+        query[:50],
+        len(transformed),
+        len(filtered),
+        max_score,
+        score_threshold,
+        resolved_namespace or "*",
+    )
     return filtered
 
 
 async def add_to_knowledge_base(
     documents: List[Dict[str, Any]],
     chunk_size: int = 500,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
 ) -> int:
     """
     添加文档到知识库
@@ -121,31 +192,64 @@ async def add_to_knowledge_base(
     Returns:
         添加的块数
     """
-    store = get_knowledge_base()
+    resolved_namespace = _normalize_namespace(namespace=namespace, topic_hash=topic_hash)
+    store = get_knowledge_base(namespace=resolved_namespace)
     
     all_chunks = []
-    for doc in documents:
-        content = clean_text(doc.get("content", ""))
-        metadata = doc.get("metadata", {})
-        doc_id = doc.get("id", "")
-        doc_type = doc.get("type", "unknown")
-        
-        # 分块
-        chunks = chunk_document(
-            content=content,
-            doc_id=doc_id,
-            doc_type=doc_type,
-            metadata=metadata,
-            chunk_size=chunk_size,
-        )
-        
-        all_chunks.extend(chunks)
-    
-    if all_chunks:
-        store.add_chunks(all_chunks)
-        logger.info(f"Added {len(all_chunks)} chunks to knowledge base")
-    
-    return len(all_chunks)
+    docs_count = len(documents or [])
+    before_count: Optional[int] = None
+    try:
+        try:
+            before_count = int(store.count() or 0)
+        except Exception:
+            before_count = None
+        for doc in documents:
+            content = clean_text(doc.get("content", ""))
+            metadata = dict(doc.get("metadata", {}) or {})
+            if resolved_namespace:
+                metadata[_NAMESPACE_FIELD] = resolved_namespace
+            doc_id = doc.get("id", "")
+            doc_type = doc.get("type", "unknown")
+
+            # 分块
+            chunks = chunk_document(
+                content=content,
+                doc_id=doc_id,
+                doc_type=doc_type,
+                metadata=metadata,
+                chunk_size=chunk_size,
+            )
+
+            all_chunks.extend(chunks)
+
+        if all_chunks:
+            store.add_chunks(all_chunks)
+            persist_fn = getattr(store, "persist", None)
+            if callable(persist_fn):
+                persist_fn()
+            after_count: Optional[int]
+            try:
+                after_count = int(store.count() or 0)
+            except Exception:
+                after_count = None
+            logger.info(
+                "Knowledge base write completed: docs=%s chunks=%s namespace=%s collection=%s before=%s after=%s",
+                docs_count,
+                len(all_chunks),
+                resolved_namespace or "*",
+                getattr(store, "collection_name", "unknown"),
+                before_count if before_count is not None else "n/a",
+                after_count if after_count is not None else "n/a",
+            )
+        else:
+            logger.info(
+                "Knowledge base write skipped: docs=%s chunks=0 namespace=%s",
+                docs_count,
+                resolved_namespace or "*",
+            )
+        return len(all_chunks)
+    finally:
+        _close_store_instance(store)
 
 
 async def hybrid_search(
@@ -153,6 +257,9 @@ async def hybrid_search(
     sources: Optional[List[str]] = None,
     year_filter: Optional[int] = None,
     top_k: int = 10,
+    score_threshold: float = 0.15,
+    namespace: Optional[str] = None,
+    topic_hash: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     混合搜索 - 结合元数据过滤
@@ -176,17 +283,34 @@ async def hybrid_search(
             query=query,
             top_k=top_k,
             filter=base_filter if base_filter else None,
+            score_threshold=score_threshold,
+            namespace=namespace,
+            topic_hash=topic_hash,
         )
 
     if len(source_list) == 1:
         single_filter = dict(base_filter)
         single_filter["source"] = source_list[0]
-        return await vector_search(query=query, top_k=top_k, filter=single_filter)
+        return await vector_search(
+            query=query,
+            top_k=top_k,
+            filter=single_filter,
+            score_threshold=score_threshold,
+            namespace=namespace,
+            topic_hash=topic_hash,
+        )
 
     in_filter = dict(base_filter)
     in_filter["source"] = {"$in": source_list}
     try:
-        return await vector_search(query=query, top_k=top_k, filter=in_filter)
+        return await vector_search(
+            query=query,
+            top_k=top_k,
+            filter=in_filter,
+            score_threshold=score_threshold,
+            namespace=namespace,
+            topic_hash=topic_hash,
+        )
     except Exception as exc:
         logger.warning(
             "Hybrid search IN filter failed; falling back to per-source fan-out: %s",
@@ -197,7 +321,14 @@ async def hybrid_search(
     async def _search_by_source(source: str):
         source_filter = dict(base_filter)
         source_filter["source"] = source
-        return await vector_search(query=query, top_k=top_k, filter=source_filter)
+        return await vector_search(
+            query=query,
+            top_k=top_k,
+            filter=source_filter,
+            score_threshold=score_threshold,
+            namespace=namespace,
+            topic_hash=topic_hash,
+        )
 
     fanout_results = await asyncio.gather(
         *[_search_by_source(source) for source in source_list],

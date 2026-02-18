@@ -1,7 +1,7 @@
 """
 Tests for Scrapers
 """
-import asyncio
+import os
 import pytest
 import sys
 from pathlib import Path
@@ -9,11 +9,23 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+RUN_LIVE_SCRAPER_TESTS = os.getenv("RUN_LIVE_SCRAPER_TESTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not RUN_LIVE_SCRAPER_TESTS,
+        reason="需要外网和第三方 API，设置 RUN_LIVE_SCRAPER_TESTS=1 启用",
+    ),
+]
+
 from scrapers import (
     ArxivScraper,
     HuggingFaceScraper,
-    TwitterScraper,
-    RedditScraper,
     GitHubScraper,
 )
 from aggregator import DataAggregator
@@ -153,40 +165,3 @@ class TestDataAggregator:
             assert "papers" in summary
             assert "models" in summary
             assert "total" in summary
-
-
-# Quick test runner
-async def run_quick_test():
-    """Run a quick test without pytest"""
-    print("🧪 Running quick tests...\n")
-    
-    # Test ArXiv
-    print("1. Testing ArXiv...")
-    async with ArxivScraper() as scraper:
-        papers = await scraper.search("DeepSeek", max_results=3)
-        print(f"   ✅ Found {len(papers)} papers")
-        if papers:
-            print(f"   📄 First: {papers[0].title[:60]}...")
-    
-    # Test HuggingFace
-    print("\n2. Testing HuggingFace...")
-    async with HuggingFaceScraper() as scraper:
-        models = await scraper.search_models("DeepSeek", max_results=3)
-        print(f"   ✅ Found {len(models)} models")
-        if models:
-            print(f"   🤗 First: {models[0].id}")
-    
-    # Test GitHub
-    print("\n3. Testing GitHub...")
-    async with GitHubScraper() as scraper:
-        repos = await scraper.search_repos("DeepSeek", max_results=3)
-        print(f"   ✅ Found {len(repos)} repos")
-        if repos:
-            print(f"   🐙 First: {repos[0].full_name} (⭐ {repos[0].stars})")
-    
-    print("\n✅ All quick tests passed!")
-
-
-if __name__ == "__main__":
-    # Run quick test without pytest
-    asyncio.run(run_quick_test())

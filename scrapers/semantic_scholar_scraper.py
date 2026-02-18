@@ -7,6 +7,8 @@ import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging
+import threading
+import time
 
 import aiohttp
 
@@ -25,7 +27,7 @@ class SemanticScholarScraper(RateLimitedScraper[Paper]):
     - 学术论文搜索
     - 引用关系 (引用/被引用)
     - 作者信息
-    - 未认证: 1 req/s, 认证后: 10 req/s
+    - 全局限流（默认 0.8 req/s，可配置，且不会超过 1 req/s）
     """
     
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
@@ -47,15 +49,23 @@ class SemanticScholarScraper(RateLimitedScraper[Paper]):
         "venue",
         "externalIds",
     ]
+
+    # Semantic Scholar 的限制是“所有 endpoint 合计 1 req/s”，使用进程级锁做全局节流。
+    _global_rate_lock = threading.Lock()
+    _global_last_request_time = 0.0
     
     def __init__(self):
-        # 未认证用户限制 1 req/s
-        super().__init__(requests_per_second=1.0)
+        super().__init__(requests_per_second=0.8)
+        requested_rps = 0.8
+        try:
+            requested_rps = float(
+                getattr(self.settings.semantic_scholar, "requests_per_second", 0.8)
+            )
+        except Exception:
+            requested_rps = 0.8
+        # 不管是否有 key，都严格遵守 <= 1 req/s
+        self._rate_limit = max(0.1, min(requested_rps, 1.0))
         self._api_key = self.settings.semantic_scholar.api_key if hasattr(self.settings, 'semantic_scholar') else None
-        
-        # 有 API Key 可以提升到 10 req/s
-        if self._api_key:
-            self._rate_limit = 10.0
     
     @property
     def source_type(self) -> SourceType:
@@ -75,8 +85,25 @@ class SemanticScholarScraper(RateLimitedScraper[Paper]):
             "Accept": "application/json",
         }
         if self._api_key:
+            # 官方要求通过 x-api-key 传递 key。
             headers["x-api-key"] = self._api_key
         return headers
+
+    async def _wait_for_rate_limit(self):
+        """
+        覆盖基类限流：对 Semantic Scholar 使用“全局累计”限流。
+        这样即使存在多个 scraper 实例，也不会超过 1 req/s。
+        """
+        min_interval = 1.0 / max(0.1, float(self._rate_limit))
+        while True:
+            with self._global_rate_lock:
+                now = time.monotonic()
+                elapsed = now - self.__class__._global_last_request_time
+                if elapsed >= min_interval:
+                    self.__class__._global_last_request_time = now
+                    return
+                wait_sec = min_interval - elapsed
+            await asyncio.sleep(wait_sec)
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 HTTP 会话"""

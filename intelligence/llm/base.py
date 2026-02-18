@@ -3,13 +3,9 @@ Base LLM
 LLM 抽象基类
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any, AsyncGenerator, Union
+from typing import List, Optional, Dict, Any, AsyncGenerator
 from dataclasses import dataclass, field
 from enum import Enum
-import logging
-
-
-logger = logging.getLogger(__name__)
 
 
 class MessageRole(str, Enum):
@@ -176,6 +172,13 @@ class BaseLLM(ABC):
         
         response = await self.acomplete(messages)
         return response.content
+
+    async def aclose(self) -> None:
+        """
+        关闭底层客户端资源（默认 no-op）。
+        子类可覆盖以释放 HTTP 连接池，避免事件循环关闭时的析构警告。
+        """
+        return None
     
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(model={self.model}, provider={self.provider})"

@@ -1,7 +1,7 @@
 """
 Tests for Processing and Storage modules
 """
-import asyncio
+import importlib.util
 import os
 import pytest
 import sys
@@ -9,6 +9,8 @@ from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+HAS_SENTENCE_TRANSFORMERS = importlib.util.find_spec("sentence_transformers") is not None
 
 
 class TestCleaner:
@@ -191,6 +193,10 @@ class TestEmbedder:
     """Embedder 测试"""
     
     @pytest.mark.slow
+    @pytest.mark.skipif(
+        not HAS_SENTENCE_TRANSFORMERS,
+        reason="需要 sentence_transformers 依赖",
+    )
     def test_sentence_transformer_embedder(self):
         from processing import SentenceTransformerEmbedder
         
@@ -207,6 +213,10 @@ class TestEmbedder:
         assert embeddings.shape == (2, 384)
     
     @pytest.mark.slow
+    @pytest.mark.skipif(
+        not HAS_SENTENCE_TRANSFORMERS,
+        reason="需要 sentence_transformers 依赖",
+    )
     def test_embedder_factory(self):
         from processing import get_embedder
         
@@ -312,72 +322,3 @@ class TestIntegration:
         
         # 清理
         store.clear()
-        print("✅ Integration test passed!")
-
-
-# Quick test runner
-async def run_quick_test():
-    """Run quick tests without pytest"""
-    print("🧪 Running Phase 2 quick tests...\n")
-    
-    # Test 1: Cleaner
-    print("1. Testing DataCleaner...")
-    from processing import clean_text, DataCleaner
-    
-    text = "Check https://example.com for more &amp; info"
-    cleaned = clean_text(text)
-    assert "https://" not in cleaned
-    print(f"   ✅ Cleaned: '{cleaned}'")
-    
-    # Test 2: Chunker
-    print("\n2. Testing TextChunker...")
-    from processing import chunk_text
-    
-    long_text = "This is a sentence. " * 50
-    chunks = chunk_text(long_text, chunk_size=200)
-    print(f"   ✅ Created {len(chunks)} chunks from {len(long_text)} chars")
-    
-    # Test 3: Cache
-    print("\n3. Testing Cache...")
-    from storage import MemoryCache, DiskCache
-    
-    cache = MemoryCache()
-    cache.set("test", {"value": 123})
-    result = cache.get("test")
-    assert result["value"] == 123
-    print(f"   ✅ Cache working: {result}")
-    
-    # Test 4: Embedder (slow, skip if needed)
-    print("\n4. Testing Embedder...")
-    try:
-        from processing import get_embedder
-        embedder = get_embedder()
-        embedding = embedder.embed("test text")
-        print(f"   ✅ Embedding shape: {embedding.shape}")
-    except Exception as e:
-        print(f"   ⚠️ Embedder test skipped: {e}")
-    
-    # Test 5: Vector Store
-    print("\n5. Testing VectorStore...")
-    try:
-        from storage import QdrantVectorStore
-        
-        store = QdrantVectorStore(collection_name="quick_test")
-        
-        store.add(
-            documents=["AI is amazing", "Machine learning is cool"],
-            metadatas=[{"type": "ai"}, {"type": "ml"}],
-        )
-        
-        results = store.search("artificial intelligence", top_k=1)
-        print(f"   ✅ Search result: '{results[0].content}' (score: {results[0].score:.3f})")
-        
-        store.clear()
-    except Exception as e:
-        print(f"   ⚠️ VectorStore test skipped: {e}")
-    
-    print("\n✅ All Phase 2 quick tests passed!")
-
-
-if __name__ == "__main__":
-    asyncio.run(run_quick_test())

@@ -3,7 +3,6 @@
 Phase 2 Demo - Processing & Storage Pipeline
 演示完整的处理+存储流程
 """
-import asyncio
 import os
 import sys
 from pathlib import Path
@@ -38,7 +37,7 @@ def demo_cleaner():
     """演示数据清洗"""
     console.print("\n[bold green]📝 1. 数据清洗 (DataCleaner)[/bold green]\n")
     
-    from processing import DataCleaner, clean_text
+    from processing import clean_text
     
     # 模拟脏数据
     dirty_text = """
@@ -227,7 +226,7 @@ def demo_cache():
     """演示缓存"""
     console.print("\n[bold green]💨 5. 缓存 (Cache)[/bold green]\n")
     
-    from storage import MemoryCache, DiskCache
+    from storage import MemoryCache
     
     # 内存缓存
     cache = MemoryCache(ttl=60)

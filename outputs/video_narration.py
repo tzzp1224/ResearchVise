@@ -13,6 +13,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -65,7 +66,7 @@ class NarrationPipeline:
 
         self.tts_provider = "auto"
         self.tts_voice = ""
-        self.tts_speed = 1.2
+        self.tts_speed = 1.25
         self.narration_model = "deepseek-chat"
         self._tts_disabled_providers: set[str] = set()
         self.update_runtime(
@@ -99,25 +100,25 @@ class NarrationPipeline:
 
         cjk_mode = self._contains_cjk(title + " " + " ".join(bullets))
         if cjk_mode:
-            lines: List[str] = [f"这一页重点讲 {title}。"]
-            if bullets:
-                lines.append("核心信息有三个层次。")
+            lines: List[str] = [f"这一页我们聚焦 {title}。"]
             for idx, bullet in enumerate(bullets[:4], start=1):
-                lines.append(f"第{idx}点，{bullet}。")
+                lines.append(f"先看第{idx}个要点：{bullet}。")
             if notes:
-                lines.append(f"补充说明：{notes}。")
-            if bullets:
-                lines.append("这些要点共同决定了方案的性能边界和工程可行性。")
+                lines.append(f"工程上需要注意：{notes}。")
+            if any(re.search(r"\d", item) for item in bullets):
+                lines.append("请特别关注这些数字背后的测试口径和适用边界。")
+            else:
+                lines.append("落地时建议把这些要点映射到监控指标和回滚阈值。")
         else:
             lines = [f"This slide focuses on {title}."]
-            if bullets:
-                lines.append("There are three practical takeaways.")
             for idx, bullet in enumerate(bullets[:4], start=1):
-                lines.append(f"Point {idx}: {bullet}.")
+                lines.append(f"Key point {idx}: {bullet}.")
             if notes:
-                lines.append(f"Additional context: {notes}.")
-            if bullets:
-                lines.append("Together these points define both performance limits and operational trade-offs.")
+                lines.append(f"Implementation note: {notes}.")
+            if any(re.search(r"\d", item) for item in bullets):
+                lines.append("Pay attention to metric definitions and benchmark conditions.")
+            else:
+                lines.append("Map these points to observable signals before rollout.")
 
         text = " ".join(lines).strip()
         return text or title
@@ -152,13 +153,68 @@ class NarrationPipeline:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    def _fit_script_to_duration(self, text: str, duration_sec: int) -> str:
+        cleaned = self._sanitize_text(text)
+        if not cleaned:
+            return cleaned
+        target = max(6, int(duration_sec))
+        is_cjk = self._contains_cjk(cleaned)
+        # Keep script density high enough for ~3min brief while avoiding overlong sentences.
+        units_per_second = (5.9 if is_cjk else 10.0) * max(0.8, min(1.5, self.tts_speed))
+        max_chars = int(max(75, target * units_per_second))
+        min_chars = int(max(55, max_chars * (0.62 if target >= 24 else 0.5)))
+        max_sentences = 6 if target >= 42 else 5 if target >= 28 else 4 if target >= 18 else 3
+
+        sentences = [self._sanitize_text(s) for s in self._split_sentences(cleaned) if self._sanitize_text(s)]
+        if not sentences:
+            return _clean_whitespace(cleaned)[:max_chars]
+
+        selected: List[str] = []
+        total_chars = 0
+        for sentence in sentences:
+            if len(selected) >= max_sentences:
+                break
+            proposed = total_chars + len(sentence)
+            if selected and proposed > max_chars:
+                break
+            selected.append(sentence)
+            total_chars = proposed
+
+        if not selected:
+            selected = [sentences[0][:max_chars]]
+        script = _clean_whitespace(" ".join(selected))
+        if len(script) >= min_chars:
+            return script
+
+        anchors = [sentence for sentence in sentences if len(sentence) >= 8][:4]
+        extra_lines: List[str] = []
+        for anchor in anchors:
+            if is_cjk:
+                extra_lines.append(f"{anchor}，落地时要明确输入输出边界与监控口径。")
+                extra_lines.append(f"建议围绕 {anchor} 设计压测与回滚阈值，并记录异常样本。")
+            else:
+                extra_lines.append(
+                    f"For {anchor}, define concrete input-output boundaries and monitoring signals."
+                )
+                extra_lines.append(
+                    f"Validate {anchor} with stress tests, rollback thresholds, and failure-case logs."
+                )
+
+        for line in extra_lines:
+            candidate = _clean_whitespace(f"{script} {line}") if script else _clean_whitespace(line)
+            if len(candidate) > max_chars:
+                break
+            script = candidate
+            if len(script) >= min_chars:
+                break
+        return script[:max_chars]
+
     def rewrite_narration_with_small_model(self, specs: List[NarrationSpec]) -> List[NarrationSpec]:
-        deepseek_key = os.getenv("VIDEO_NARRATION_DEEPSEEK_API_KEY") or os.getenv("LLM_DEEPSEEK_API_KEY")
-        if not deepseek_key:
+        if not specs:
             return specs
 
         try:
-            from openai import OpenAI
+            from intelligence.llm import Message, get_llm
         except Exception:
             return specs
 
@@ -175,42 +231,49 @@ class NarrationPipeline:
         prompt = (
             "请把每一页 seed_script 改写为“自然讲解口播稿”，不要逐字念 PPT。"
             "要求：\n"
-            "1) 保留关键技术信息和因果逻辑；\n"
-            "2) 语气自然、有情绪起伏，语速偏快，避免机械朗读；\n"
-            "3) 每页输出 2-5 句完整句子，不要只保留一句；\n"
-            "4) 不要添加与页面无关的新事实；\n"
-            "5) 返回 JSON：{\"slides\":[{\"slide_index\":1,\"script\":\"...\"}]}。\n\n"
+            "1) 保留关键技术信息和因果逻辑，优先解释“为什么这样设计”；\n"
+            "2) 语气自然、有节奏变化，避免机械朗读、口号化和比喻堆砌；\n"
+            "3) 每页输出 3-6 句完整句子，不要只保留一句；\n"
+            "4) 每页必须包含至少一个具体实现点（组件/流程/参数/约束）；\n"
+            "5) 每页至少包含一条可执行工程建议或验证动作；\n"
+            "6) 不要添加与页面无关的新事实；\n"
+            "7) 返回 JSON：{\"slides\":[{\"slide_index\":1,\"script\":\"...\"}]}。\n\n"
             f"输入数据：\n{json.dumps(payload, ensure_ascii=False)}"
         )
         messages = [
-            {"role": "system", "content": "You are an expert technical script writer for spoken narration."},
-            {"role": "user", "content": prompt},
+            Message.system("You are an expert technical script writer for spoken narration."),
+            Message.user(prompt),
         ]
 
         try:
-            client = OpenAI(
-                api_key=deepseek_key,
-                base_url=os.getenv("VIDEO_NARRATION_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+            model = (
+                self._sanitize_text(os.getenv("VIDEO_NARRATION_MODEL") or self.narration_model)
+                or self.narration_model
             )
-            model = self._sanitize_text(os.getenv("VIDEO_NARRATION_DEEPSEEK_MODEL") or self.narration_model) or "deepseek-chat"
-
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    temperature=0.25,
-                    response_format={"type": "json_object"},
-                    messages=messages,
-                )
-            except Exception:
-                response = client.chat.completions.create(
-                    model=model,
-                    temperature=0.25,
-                    messages=messages,
-                )
-            content = response.choices[0].message.content or ""
+            llm = get_llm(model=model)
+            response = llm.complete(
+                messages,
+                temperature=0.25,
+                max_tokens=min(2600, 450 + len(specs) * 260),
+            )
+            content = response.content or ""
         except Exception as e:
             logger.warning("Narration rewrite skipped: %s", e)
             return specs
+        finally:
+            try:
+                close_fn = getattr(locals().get("llm"), "aclose", None)
+                if callable(close_fn):
+                    try:
+                        asyncio.run(close_fn())
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        try:
+                            loop.run_until_complete(close_fn())
+                        finally:
+                            loop.close()
+            except Exception:
+                pass
 
         parsed = self._extract_json_object(content)
         candidates = parsed.get("slides", []) if isinstance(parsed, dict) else []
@@ -444,6 +507,24 @@ class NarrationPipeline:
             return None
         return value if value > 0 else None
 
+    def _retime_audio_to_target(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        target_duration_sec: int,
+        ffmpeg_bin: str,
+    ) -> Optional[float]:
+        # Keep natural speaking pace. Timeline should follow actual TTS duration.
+        _ = max(1, int(target_duration_sec))
+        _ = ffmpeg_bin
+        current = self._probe_media_duration(source_path)
+        if not current or current <= 0:
+            shutil.copy2(source_path, output_path)
+            return self._probe_media_duration(output_path)
+        shutil.copy2(source_path, output_path)
+        return self._probe_media_duration(output_path)
+
     def _normalize_audio_track(self, *, source_path: Path, output_path: Path, ffmpeg_bin: str) -> None:
         cmd = [
             ffmpeg_bin,
@@ -464,8 +545,16 @@ class NarrationPipeline:
         self._run_subprocess(cmd, context="ffmpeg narration normalize")
 
     def render_narration_segments(self, *, slides: List[Any], out_dir: Path, ffmpeg_bin: str) -> Dict[str, Any]:
-        specs = self.rewrite_narration_with_small_model(self.build_narration_specs(slides))
-        script_path = self.write_narration_script(specs, out_dir)
+        raw_specs = self.rewrite_narration_with_small_model(self.build_narration_specs(slides))
+        specs = [
+            NarrationSpec(
+                slide_index=item.slide_index,
+                slide_title=item.slide_title,
+                duration_sec=item.duration_sec,
+                text=self._fit_script_to_duration(item.text, item.duration_sec),
+            )
+            for item in raw_specs
+        ]
 
         narration_dir = out_dir / "video_audio_segments"
         narration_dir.mkdir(parents=True, exist_ok=True)
@@ -478,15 +567,29 @@ class NarrationPipeline:
         providers_used: List[str] = []
         for spec in specs:
             raw_path = narration_dir / f"raw_{spec.slide_index:03d}.wav"
-            normalized_path = narration_dir / f"segment_{spec.slide_index:03d}.m4a"
+            segment_path = narration_dir / f"segment_{spec.slide_index:03d}.m4a"
             provider = self.synthesize_speech(text=spec.text, output_path=raw_path)
             if provider not in providers_used:
                 providers_used.append(provider)
-            self._normalize_audio_track(source_path=raw_path, output_path=normalized_path, ffmpeg_bin=ffmpeg_bin)
+            self._normalize_audio_track(source_path=raw_path, output_path=segment_path, ffmpeg_bin=ffmpeg_bin)
             raw_path.unlink(missing_ok=True)
-            segment_paths.append(normalized_path)
-            duration = self._probe_media_duration(normalized_path)
-            segment_durations.append(duration if duration and duration > 0 else float(spec.duration_sec))
+            segment_paths.append(segment_path)
+            measured = self._probe_media_duration(segment_path)
+            final_duration = measured if measured and measured > 0 else float(spec.duration_sec)
+            segment_durations.append(final_duration)
+
+        final_specs: List[NarrationSpec] = []
+        for idx, spec in enumerate(specs):
+            duration = segment_durations[idx] if idx < len(segment_durations) else float(spec.duration_sec)
+            final_specs.append(
+                NarrationSpec(
+                    slide_index=spec.slide_index,
+                    slide_title=spec.slide_title,
+                    duration_sec=max(1, int(math.ceil(duration))),
+                    text=spec.text,
+                )
+            )
+        script_path = self.write_narration_script(final_specs, out_dir)
 
         return {
             "script_path": script_path,
@@ -494,7 +597,7 @@ class NarrationPipeline:
             "segment_durations": segment_durations,
             "providers_used": providers_used,
             "narration_dir": narration_dir,
-            "narration_specs": specs,
+            "narration_specs": final_specs,
         }
 
     def concat_audio_segments(self, audio_paths: List[Path], output_path: Path, ffmpeg_bin: str) -> None:
@@ -526,3 +629,7 @@ class NarrationPipeline:
             str(output_path),
         ]
         self._run_subprocess(cmd, context="ffmpeg audio concat")
+
+
+def _clean_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()

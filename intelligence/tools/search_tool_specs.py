@@ -127,6 +127,36 @@ SEARCH_TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             },
         },
     ),
+    "openreview_search": _tool_definition(
+        name="openreview_search",
+        description="搜索 OpenReview 评审与预印本。用于捕捉评审阶段和更前沿的研究动态。",
+        properties={
+            "query": {
+                "type": "string",
+                "description": "搜索关键词",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "最大返回结果数",
+                "default": 10,
+            },
+        },
+    ),
+    "arxiv_rss_search": _tool_definition(
+        name="arxiv_rss_search",
+        description="搜索 ArXiv Daily RSS 最近更新。用于补充最新发布/更新论文信号。",
+        properties={
+            "query": {
+                "type": "string",
+                "description": "搜索关键词",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "最大返回结果数",
+                "default": 10,
+            },
+        },
+    ),
     "stackoverflow_search": _tool_definition(
         name="stackoverflow_search",
         description="搜索 Stack Overflow 技术问答。用于获取工程实践问题与解决方案。",

@@ -25,6 +25,9 @@ def test_render_timeline_markdown_sorted_by_date():
 
     # 2017 的事件应该在 2018 之前出现
     assert md.index("2017-06") < md.index("2018-10")
+    assert "| Date | Title | Description |" in md
+    assert "Importance" not in md
+    assert "Sources" not in md
 
 
 def test_render_one_pager_markdown_sections():
@@ -76,10 +79,33 @@ def test_export_research_outputs_writes_files(tmp_path):
     assert (tmp_path / "one_pager.json").exists()
     assert (tmp_path / "video_brief.md").exists()
     assert (tmp_path / "video_brief.json").exists()
+    assert (tmp_path / "knowledge_tree.md").exists()
+    assert (tmp_path / "knowledge_tree.json").exists()
     assert (tmp_path / "report.md").exists()
     assert (tmp_path / "manifest.json").exists()
 
     assert "manifest_json" in written
+
+
+def test_render_knowledge_tree_markdown_contains_sections():
+    from outputs import render_knowledge_tree_markdown
+
+    md = render_knowledge_tree_markdown(
+        "MCP production deployment",
+        facts=[
+            {"category": "architecture", "claim": "Gateway + worker execution model"},
+            {"category": "deployment", "claim": "Canary release with rollback"},
+        ],
+        search_results=[
+            {"source": "arxiv", "title": "MCP Paper", "url": "https://arxiv.org/abs/1234.5678"},
+            {"source": "github", "title": "MCP Runtime", "url": "https://github.com/example/mcp-runtime"},
+        ],
+    )
+
+    assert "# MCP production deployment Knowledge Tree" in md
+    assert "## 前置知识" in md
+    assert "## 演进路径（通向当前技术）" in md
+    assert "## 关键论文与工程实现" in md
 
 
 def test_render_video_brief_markdown_segment_metadata():
@@ -103,3 +129,45 @@ def test_render_video_brief_markdown_segment_metadata():
 
     assert "- Duration: 42s" in md
     assert "- Visual prompt: cinematic benchmark overlay" in md
+
+
+def test_render_video_brief_markdown_with_start_timestamp():
+    from outputs import render_video_brief_markdown
+
+    md = render_video_brief_markdown(
+        {
+            "title": "VB",
+            "segments": [
+                {
+                    "title": "S1",
+                    "content": "C1",
+                    "duration_sec": 40,
+                    "start_sec": 15,
+                }
+            ],
+        }
+    )
+
+    assert "- Start: 00:15" in md
+
+
+def test_render_research_report_includes_knowledge_tree_resources():
+    from outputs import render_research_report_markdown
+
+    report = render_research_report_markdown(
+        "MCP",
+        one_pager={"title": "OP", "executive_summary": "ES"},
+        facts=[{"category": "architecture", "claim": "Gateway + worker"}],
+        search_results=[
+            {
+                "id": "arxiv_1",
+                "source": "arxiv",
+                "title": "MCP Paper",
+                "url": "https://arxiv.org/abs/1234.5678",
+                "metadata": {"published_date": "2024-01-02"},
+            }
+        ],
+    )
+
+    assert "## 关键论文与工程实现" in report
+    assert "https://arxiv.org/abs/1234.5678" in report

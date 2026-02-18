@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 
 from config import get_settings
-from aggregator import DataAggregator, aggregate_research
+from aggregator import DataAggregator
 from models import AggregatedResult
 
 

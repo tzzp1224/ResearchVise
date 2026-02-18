@@ -2,8 +2,6 @@
 ArXiv Scraper
 从 ArXiv 抓取学术论文
 """
-import asyncio
-from datetime import datetime
 from typing import List, Optional
 import logging
 
@@ -86,10 +84,7 @@ class ArxivScraper(BaseScraper[Paper]):
         
         logger.info(f"[ArXiv] Searching: {search_query}")
         
-        # 使用线程池执行同步的 arxiv 搜索
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None,
+        results = await self._run_blocking(
             self._sync_search,
             search_query,
             max_results,
@@ -132,11 +127,8 @@ class ArxivScraper(BaseScraper[Paper]):
         Returns:
             论文详情
         """
-        loop = asyncio.get_event_loop()
-        
         try:
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._sync_get_paper,
                 paper_id,
             )
@@ -145,8 +137,8 @@ class ArxivScraper(BaseScraper[Paper]):
                 return self._convert_to_paper(result)
             return None
             
-        except Exception as e:
-            self._log_error(f"Failed to get paper {paper_id}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get paper {paper_id}", exc)
             return None
     
     def _sync_get_paper(self, paper_id: str) -> Optional[arxiv.Result]:

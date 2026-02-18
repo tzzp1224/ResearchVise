@@ -2,7 +2,6 @@
 GitHub Scraper
 从 GitHub 抓取代码仓库和讨论
 """
-import asyncio
 from datetime import datetime
 from typing import List, Optional
 import logging
@@ -46,12 +45,20 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
         if self._github is None:
             try:
                 from github import Github
-                
+                kwargs = {"timeout": 12, "retry": 0}
+
                 if self._github_settings.token:
-                    self._github = Github(self._github_settings.token)
-                else:
-                    self._github = Github()  # 未认证，速率限制更严格
-                    
+                    token = str(self._github_settings.token).strip()
+                    try:
+                        from github import Auth
+
+                        kwargs["auth"] = Auth.Token(token)
+                    except Exception:
+                        # 兼容旧版 PyGithub（无 Auth 对象）
+                        kwargs["login_or_token"] = token
+
+                # 未认证时速率限制更严格，禁用长重试避免阻塞全流程
+                self._github = Github(**kwargs)
             except ImportError:
                 raise ImportError("Please install PyGithub: pip install PyGithub")
         return self._github
@@ -109,12 +116,9 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
         logger.info(f"[GitHub] Searching repos: {search_query}")
         
         await self._wait_for_rate_limit()
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_search_repos,
                 search_query,
                 max_results,
@@ -127,8 +131,8 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
             
             return repos
             
-        except Exception as e:
-            self._log_error(f"Search failed for '{query}'", e)
+        except Exception as exc:
+            self._log_error(f"Search failed for '{query}'", exc)
             return []
     
     def _sync_search_repos(
@@ -178,12 +182,9 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
         logger.info(f"[GitHub] Searching code: {search_query}")
         
         await self._wait_for_rate_limit()
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_search_code,
                 search_query,
                 max_results,
@@ -191,8 +192,8 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
             
             return results
             
-        except Exception as e:
-            self._log_error(f"Code search failed for '{query}'", e)
+        except Exception as exc:
+            self._log_error(f"Code search failed for '{query}'", exc)
             return []
     
     def _sync_search_code(self, query: str, max_results: int) -> list:
@@ -233,12 +234,9 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
         logger.info(f"[GitHub] Searching issues/discussions: {query}")
         
         await self._wait_for_rate_limit()
-        
-        loop = asyncio.get_event_loop()
-        
+
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await self._run_blocking(
                 self._sync_search_issues,
                 query,
                 max_results,
@@ -249,15 +247,19 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
             
             return posts
             
-        except Exception as e:
-            self._log_error(f"Issue search failed for '{query}'", e)
+        except Exception as exc:
+            self._log_error(f"Issue search failed for '{query}'", exc)
             return []
     
     def _sync_search_issues(self, query: str, max_results: int) -> list:
         """同步搜索 Issues"""
         github = self._get_github()
-        
-        issues = github.search_issues(query=query)
+
+        normalized_query = str(query or "").strip()
+        if "is:issue" not in normalized_query and "is:pull-request" not in normalized_query:
+            normalized_query = f"{normalized_query} is:issue".strip()
+
+        issues = github.search_issues(query=normalized_query)
 
         return list(islice(issues, max_results))
     
@@ -271,13 +273,10 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
         Returns:
             仓库详情
         """
-        loop = asyncio.get_event_loop()
-        
         try:
             await self._wait_for_rate_limit()
             
-            result = await loop.run_in_executor(
-                None,
+            result = await self._run_blocking(
                 self._sync_get_repo,
                 repo_full_name,
             )
@@ -286,8 +285,8 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
                 return self._convert_to_repo(result)
             return None
             
-        except Exception as e:
-            self._log_error(f"Failed to get repo {repo_full_name}", e)
+        except Exception as exc:
+            self._log_error(f"Failed to get repo {repo_full_name}", exc)
             return None
     
     def _sync_get_repo(self, repo_full_name: str):
@@ -330,28 +329,48 @@ class GitHubScraper(RateLimitedScraper[GitHubRepo]):
     
     def _convert_to_repo(self, repo) -> GitHubRepo:
         """将 GitHub Repository 转换为 GitHubRepo"""
+        # 避免触发额外 API 请求：search 结果对象可能是懒加载，访问某些字段会导致二次网络调用。
+        # 这里仅保留稳定可用的核心字段，保证在限流场景下快速返回。
+        try:
+            owner_login = repo.owner.login if getattr(repo, "owner", None) else ""
+        except Exception:
+            owner_login = ""
+
+        try:
+            language = repo.language
+        except Exception:
+            language = None
+
+        topics: List[str] = []
+        if hasattr(repo, "topics"):
+            try:
+                raw_topics = getattr(repo, "topics") or []
+                if isinstance(raw_topics, list):
+                    topics = [str(item) for item in raw_topics if str(item).strip()]
+            except Exception:
+                topics = []
+
+        extra = {
+            "is_fork": bool(getattr(repo, "fork", False)),
+            "archived": bool(getattr(repo, "archived", False)),
+        }
+
         return GitHubRepo(
             id=str(repo.id),
             name=repo.name,
             full_name=repo.full_name,
             description=repo.description,
-            owner=repo.owner.login,
+            owner=owner_login,
             url=repo.html_url,
             stars=repo.stargazers_count,
             forks=repo.forks_count,
             watchers=repo.watchers_count,
-            language=repo.language,
-            topics=list(repo.get_topics()) if hasattr(repo, 'get_topics') else [],
+            language=language,
+            topics=topics,
             created_at=repo.created_at,
             updated_at=repo.updated_at,
             source=SourceType.GITHUB,
-            extra={
-                "default_branch": repo.default_branch,
-                "open_issues": repo.open_issues_count,
-                "license": repo.license.name if repo.license else None,
-                "is_fork": repo.fork,
-                "archived": repo.archived,
-            }
+            extra=extra,
         )
     
     def _convert_issue_to_post(self, issue) -> SocialPost:

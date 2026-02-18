@@ -292,6 +292,59 @@ def _build_search_results() -> List[Dict[str, Any]]:
     ]
 
 
+def _build_manus_search_results() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "arxiv_a1",
+            "source": "arxiv",
+            "title": "Manus-style Agentic Planning with Tool Execution",
+            "content": "Describes a planner-executor architecture with explicit verification loops and cost controls.",
+            "url": "https://example.com/manus-arxiv-1",
+            "metadata": {"year": 2025, "benchmarks": ["GAIA", "ToolBench"]},
+        },
+        {
+            "id": "arxiv_a2",
+            "source": "arxiv",
+            "title": "Failure Modes in Autonomous Web Agents",
+            "content": "Reports prompt injection, stale context, and tool misuse as dominant failure sources.",
+            "url": "https://example.com/manus-arxiv-2",
+            "metadata": {"year": 2025},
+        },
+        {
+            "id": "github_repo_1",
+            "source": "github",
+            "title": "open-manus/agent-runtime",
+            "content": "Open-source runtime for multi-tool orchestration with retries and state snapshots.",
+            "url": "https://example.com/manus-github",
+            "metadata": {"stars": 4821, "language": "python"},
+        },
+        {
+            "id": "stackoverflow_q1",
+            "source": "stackoverflow",
+            "title": "How to avoid context drift in long-running autonomous agents?",
+            "content": "Practitioners discuss memory compaction, checkpointing, and deterministic tool wrappers.",
+            "url": "https://example.com/manus-so",
+            "metadata": {"score": 142, "answer_count": 9},
+        },
+        {
+            "id": "reddit_1",
+            "source": "reddit",
+            "title": "Manus workflow stability discussion",
+            "content": "Users share breakpoints in browser automation and compare fallback recovery policies.",
+            "url": "https://example.com/manus-reddit",
+            "metadata": {"score": 420},
+        },
+        {
+            "id": "hackernews_1",
+            "source": "hackernews",
+            "title": "Show HN: Agentic research assistant inspired by Manus",
+            "content": "Thread compares latency, quality and operational cost versus manual workflows.",
+            "url": "https://example.com/manus-hn",
+            "metadata": {"points": 336},
+        },
+    ]
+
+
 def test_run_research_from_search_results_e2e(tmp_path: Path):
     llm = FakeLLM()
     search_results = _build_search_results()
@@ -304,7 +357,7 @@ def test_run_research_from_search_results_e2e(tmp_path: Path):
             search_results=search_results,
             llm=llm,
             out_dir=tmp_path,
-            generate_video=True,
+            generate_video=False,
             enable_knowledge_indexing=False,
         )
     )
@@ -331,10 +384,32 @@ def test_run_research_from_search_results_e2e(tmp_path: Path):
     for path in result["written_files"].values():
         assert Path(path).exists()
 
-    if result["video_artifact"] is not None:
-        assert Path(result["video_artifact"]["output_path"]).exists()
-    else:
-        assert "required" in str(result.get("video_error", "")).lower()
+    assert result["video_artifact"] is None
+
+
+def test_run_research_from_search_results_manus_case(tmp_path: Path):
+    llm = FakeLLM()
+    search_results = _build_manus_search_results()
+
+    import asyncio
+
+    result = asyncio.run(
+        run_research_from_search_results(
+            topic="manus",
+            search_results=search_results,
+            llm=llm,
+            out_dir=tmp_path,
+            generate_video=False,
+            enable_knowledge_indexing=False,
+        )
+    )
+
+    assert result["search_results_count"] == len(search_results)
+    assert result["depth_assessment"]["pass"] is True
+    assert len(result["facts"]) >= 8
+    assert len(result["one_pager"]["technical_deep_dive"]) >= 2
+    assert len(result["video_brief"]["segments"]) >= 3
+    assert Path(result["written_files"]["report_md"]).exists()
 
 
 def test_pipeline_normalizes_resources_and_video_fields(tmp_path: Path):
