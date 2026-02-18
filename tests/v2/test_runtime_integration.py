@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from core import PromptSpec, RawItem, RunMode, RunRequest
@@ -171,6 +172,17 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert "srt" in artifact_types
     assert "zip" in artifact_types
     assert "mp4" not in artifact_types
+
+    run_dir = Path(result.output_dir)
+    script_payload = json.loads((run_dir / "script.json").read_text(encoding="utf-8"))
+    assert "structure" in script_payload
+    assert len(script_payload["structure"]["key_points"]) == 3
+
+    materials_payload = json.loads((run_dir / "materials.json").read_text(encoding="utf-8"))
+    assert materials_payload["screenshot_plan"]
+    assert materials_payload["icon_keyword_suggestions"]
+    assert materials_payload["broll_categories"]
+    assert "quality_metrics" in materials_payload
 
     render_status = runtime.process_next_render()
     assert render_status is not None

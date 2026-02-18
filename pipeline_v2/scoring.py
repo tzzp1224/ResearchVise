@@ -5,13 +5,36 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 import re
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from core import NormalizedItem, RankedItem
 
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _quality_metrics(item: NormalizedItem) -> Tuple[int, int, Optional[float], int]:
+    metadata = dict(item.metadata or {})
+    body_len = int(_to_float(metadata.get("body_len"), len(str(item.body_md or ""))))
+    citation_count = int(_to_float(metadata.get("citation_count"), len(item.citations)))
+    raw_recency = metadata.get("published_recency")
+    published_recency: Optional[float]
+    if raw_recency in (None, "", "unknown"):
+        published_recency = None
+    else:
+        published_recency = _to_float(raw_recency)
+    link_count = int(_to_float(metadata.get("link_count"), 0.0))
+    return body_len, citation_count, published_recency, link_count
 
 
 def score_novelty(item: NormalizedItem) -> float:
@@ -136,12 +159,17 @@ def rank_items(
     ordered = top + deferred_tier_b
     ranked: List[RankedItem] = []
     for idx, (item, scores, total) in enumerate(ordered, start=1):
+        body_len, citation_count, published_recency, link_count = _quality_metrics(item)
         reasons = [
             f"novelty={scores['novelty']:.2f}",
             f"talkability={scores['talkability']:.2f}",
             f"credibility={scores['credibility']:.2f}",
             f"visual_assets={scores['visual_assets']:.2f}",
             f"tier={item.tier}",
+            f"quality.body_len={body_len}",
+            f"quality.citation_count={citation_count}",
+            f"quality.published_recency_days={published_recency if published_recency is not None else 'unknown'}",
+            f"quality.link_count={link_count}",
         ]
         if item.tier == "B" and idx <= 3 and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             reasons.append("tier_b_top3_override=talkability")

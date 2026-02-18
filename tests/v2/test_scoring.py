@@ -71,6 +71,10 @@ def test_rank_items_tier_b_not_in_top3_by_default() -> None:
     ranked = rank_items([tier_b_low_talk] + tier_a_items)
     top3_tiers = [row.item.tier for row in ranked[:3]]
     assert top3_tiers == ["A", "A", "A"]
+    assert any(reason.startswith("quality.body_len=") for reason in ranked[0].reasons)
+    assert any(reason.startswith("quality.citation_count=") for reason in ranked[0].reasons)
+    assert any(reason.startswith("quality.published_recency_days=") for reason in ranked[0].reasons)
+    assert any(reason.startswith("quality.link_count=") for reason in ranked[0].reasons)
 
 
 def test_rank_items_allows_tier_b_top3_when_talkability_is_high() -> None:

@@ -215,19 +215,7 @@ class RunPipelineRuntime:
         )
         materials_path = self._write_json(
             out_dir / "materials.json",
-            {
-                "run_id": run_id,
-                "item_id": primary.id,
-                "sources": [
-                    {
-                        "title": citation.title,
-                        "url": citation.url,
-                        "source": citation.source,
-                    }
-                    for citation in primary.citations
-                ],
-                "top_item_ids": [entry.item.id for entry in picks],
-            },
+            self._build_materials_manifest(run_id=run_id, primary=primary, picks=picks),
         )
         self._record_artifact(
             run_id,
@@ -389,6 +377,69 @@ class RunPipelineRuntime:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
+
+    @staticmethod
+    def _build_materials_manifest(*, run_id: str, primary: Any, picks: Sequence[Any]) -> Dict[str, Any]:
+        top_items = [entry.item for entry in list(picks or [])]
+        screenshot_plan = []
+        icon_keywords = set()
+        source_urls = set()
+        for idx, item in enumerate(top_items[:8], start=1):
+            item_url = str(item.url or "").strip()
+            if item_url:
+                source_urls.add(item_url)
+                screenshot_plan.append(
+                    {
+                        "idx": idx,
+                        "url": item_url,
+                        "purpose": "hero" if idx == 1 else "supporting evidence",
+                        "shot_hint": f"shot_{idx:02d}",
+                        "title": item.title,
+                    }
+                )
+            for token in [item.source, item.tier, *str(item.title).lower().replace("/", " ").split()[:6]]:
+                text = str(token or "").strip().lower()
+                if len(text) >= 3 and text.isascii():
+                    icon_keywords.add(text)
+
+        citation_sources = []
+        for citation in list(primary.citations or [])[:12]:
+            url = str(citation.url or "").strip()
+            if url:
+                source_urls.add(url)
+            citation_sources.append(
+                {
+                    "title": citation.title,
+                    "url": url,
+                    "source": citation.source,
+                    "snippet": citation.snippet,
+                }
+            )
+
+        broll_categories = [
+            "engineering_team_collaboration",
+            "code_editor_terminal_closeup",
+            "dashboard_metrics_animation",
+            "cloud_infrastructure_datacenter",
+            "product_demo_ui_scroll",
+        ]
+
+        return {
+            "run_id": run_id,
+            "item_id": primary.id,
+            "top_item_ids": [item.id for item in top_items],
+            "source_urls": sorted(source_urls),
+            "screenshot_plan": screenshot_plan,
+            "icon_keyword_suggestions": sorted(icon_keywords)[:16],
+            "broll_categories": broll_categories,
+            "citations": citation_sources,
+            "quality_metrics": {
+                "body_len": int(float(primary.metadata.get("body_len", len(str(primary.body_md or ""))) or 0)),
+                "citation_count": int(float(primary.metadata.get("citation_count", len(primary.citations)) or 0)),
+                "published_recency": primary.metadata.get("published_recency"),
+                "link_count": int(float(primary.metadata.get("link_count", 0) or 0)),
+            },
+        }
 
     def _record_artifact(self, run_id: str, artifact: Artifact) -> None:
         self._orchestrator.add_artifact(run_id, artifact)

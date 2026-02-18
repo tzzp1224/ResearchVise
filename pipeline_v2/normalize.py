@@ -45,6 +45,25 @@ def _compact_text(value: Any, max_len: int = 300) -> str:
     return text if len(text) <= max_len else text[: max_len - 3].rstrip() + "..."
 
 
+def _count_links(body: str, url: str) -> int:
+    links = set()
+    for link in re.findall(r"https?://[^\s)\]>]+", str(body or "")):
+        token = str(link).strip().rstrip(".,;:")
+        if token:
+            links.add(token)
+    if str(url or "").strip():
+        links.add(str(url).strip())
+    return len(links)
+
+
+def _published_recency_days(published: Optional[datetime]) -> Optional[float]:
+    if not published:
+        return None
+    dt = published if published.tzinfo else published.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
+    return round(age_days, 2)
+
+
 def _to_raw_item(raw: Any) -> RawItem:
     if isinstance(raw, RawItem):
         return raw
@@ -176,6 +195,11 @@ def normalize(raw: Any) -> NormalizedItem:
     published = _parse_datetime(item.published_at)
 
     metadata: Dict[str, Any] = dict(item.metadata or {})
+    body_text = str(item.body or "").strip()
+    body_len = len(re.sub(r"\s+", " ", body_text))
+    link_count = _count_links(body_text, str(item.url or ""))
+    published_recency = _published_recency_days(published)
+
     metadata["credibility"] = _infer_credibility(
         tier=tier,
         source=item.source,
@@ -185,6 +209,15 @@ def normalize(raw: Any) -> NormalizedItem:
     )
     metadata["source_channel"] = "tier_a" if tier == "A" else "tier_b"
     metadata["citation_count"] = len(citations)
+    metadata["body_len"] = body_len
+    metadata["link_count"] = link_count
+    metadata["published_recency"] = published_recency
+    metadata["quality_metrics"] = {
+        "body_len": body_len,
+        "citation_count": len(citations),
+        "published_recency": published_recency,
+        "link_count": link_count,
+    }
 
     return NormalizedItem(
         id=str(item.id).strip(),
@@ -193,7 +226,7 @@ def normalize(raw: Any) -> NormalizedItem:
         url=str(item.url or "").strip(),
         author=str(item.author).strip() if item.author else None,
         published_at=published,
-        body_md=str(item.body or "").strip(),
+        body_md=body_text,
         citations=citations,
         tier=tier,  # type: ignore[arg-type]
         lang=str(metadata.get("lang") or "en").strip() or "en",

@@ -29,8 +29,13 @@ def test_generate_script_and_variants() -> None:
     script = generate_script(_sample_item(), duration_sec=36, platform="reels", tone="professional")
 
     assert script["duration_sec"] == 36
-    assert len(list(script["lines"])) >= 4
+    assert len(list(script["lines"])) >= 6
     assert float(script["lines"][0]["start_sec"]) == 0.0
+    assert script["lines"][0]["section"] == "hook"
+    assert float(script["lines"][0]["end_sec"]) <= 3.1
+    assert "main_thesis" in script["structure"]
+    assert len(list(script["structure"]["key_points"])) == 3
+    assert "placeholder" not in str(script).lower()
 
     variants = generate_variants(script, ["reels", "youtube"])
     assert "reels" in variants

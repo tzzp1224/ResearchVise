@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 from typing import Iterable, List, Sequence
+from urllib.parse import urlparse
 import zipfile
 
 from core import Artifact, ArtifactType, Citation, NormalizedItem, RankedItem
@@ -48,13 +49,49 @@ def _extract_citations(items: Sequence[object], citations: Sequence[Citation] | 
     return merged
 
 
+def _summary_paragraphs(body: str) -> List[str]:
+    text = re.sub(r"\s+", " ", str(body or "")).strip()
+    chunks = [piece.strip() for piece in re.split(r"(?<=[.!?。！？])\s+", text) if piece.strip()]
+    if not chunks:
+        return ["暂无可用正文摘要。"]
+    if len(chunks) == 1:
+        return [chunks[0]]
+    first = " ".join(chunks[:2]).strip()
+    second = " ".join(chunks[2:4]).strip() if len(chunks) > 2 else ""
+    return [first] + ([second] if second else [])
+
+
+def _domain(url: str) -> str:
+    host = str(urlparse(str(url or "")).netloc or "").strip().lower()
+    return host or "unknown"
+
+
+def _quality_metrics(item: NormalizedItem) -> dict:
+    metadata = dict(item.metadata or {})
+    return {
+        "body_len": int(float(metadata.get("body_len", len(item.body_md or "")) or 0)),
+        "citation_count": int(float(metadata.get("citation_count", len(item.citations)) or 0)),
+        "published_recency": metadata.get("published_recency"),
+        "link_count": int(float(metadata.get("link_count", 0) or 0)),
+    }
+
+
+def _rank_reasons(item: object) -> str:
+    if isinstance(item, RankedItem):
+        reasons = [str(reason) for reason in list(item.reasons or [])[:6] if str(reason).strip()]
+        if reasons:
+            return " | ".join(reasons)
+    return "无"
+
+
 def generate_onepager(items: Sequence[object], citations: Sequence[Citation], out_dir: str | Path) -> str:
     """Generate one-page markdown report with item ranking and evidence."""
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "onepager.md"
 
-    ranked_items = [_extract_item(item) for item in list(items or [])]
+    ranked_items = list(items or [])
+    normalized_items = [_extract_item(item) for item in ranked_items]
     citation_list = _extract_citations(items, citations)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -62,23 +99,48 @@ def generate_onepager(items: Sequence[object], citations: Sequence[Citation], ou
         "# One Pager",
         "",
         f"- GeneratedAt(UTC): `{generated_at}`",
-        f"- CandidateCount: `{len(ranked_items)}`",
+        f"- CandidateCount: `{len(normalized_items)}`",
         f"- CitationCount: `{len(citation_list)}`",
         "",
         "## Top Picks",
         "",
     ]
 
-    for idx, item in enumerate(ranked_items, start=1):
+    for idx, item in enumerate(normalized_items, start=1):
+        payload = ranked_items[idx - 1]
         credibility = str((item.metadata or {}).get("credibility") or "unknown")
+        metrics = _quality_metrics(item)
+        paragraphs = _summary_paragraphs(item.body_md)
+        citation = item.citations[0] if item.citations else None
+        citation_line = "无引用"
+        if citation:
+            citation_snippet = str(citation.snippet or citation.title or "").strip() or "无引用"
+            citation_line = f"{citation_snippet} ({citation.url})"
+
         lines.extend(
             [
                 f"### {idx}. {item.title}",
-                f"- Source: `{item.source}`",
-                f"- Tier: `{item.tier}`",
-                f"- Credibility: `{credibility}`",
-                f"- URL: {item.url or 'N/A'}",
-                f"- Summary: {str(item.body_md or '').strip()[:280] or 'N/A'}",
+                f"- Source URL: {item.url or 'N/A'}",
+                f"- Source Domain: `{_domain(item.url)}`",
+                f"- Tier/Credibility: `{item.tier}` / `{credibility}`",
+                (
+                    "- Quality Metrics: "
+                    f"body_len={metrics['body_len']}, "
+                    f"citation_count={metrics['citation_count']}, "
+                    f"published_recency={metrics['published_recency']}, "
+                    f"link_count={metrics['link_count']}"
+                ),
+                f"- Ranking Reasons: `{_rank_reasons(payload)}`",
+                "",
+            ]
+        )
+        for paragraph in paragraphs[:2]:
+            lines.append(paragraph)
+            lines.append("")
+
+        lines.extend(
+            [
+                f"- Citation: {citation_line}",
                 "",
             ]
         )

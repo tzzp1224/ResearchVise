@@ -1,6 +1,33 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Content Realization & Quality Metrics (Commit 2)
+- 本次目标：
+  - 将 `script/onepager/materials` 从占位描述升级为可审阅内容。
+  - 落盘抓取质量指标，并写入排序解释 reasons。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - 脚本结构固定为 `hook(前3秒)/main_thesis/3个要点/cta`，并为每段输出时间轴与 section。
+    - 移除旧的 `evidence-backed detail` 占位文案生成路径。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`：
+    - 新增并落盘质量指标：`body_len/citation_count/published_recency/link_count`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - 在 `RankedItem.reasons` 中新增质量指标解释字段。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - `onepager.md` 每条 Top pick 增加来源域名、两段摘要、citation 或 `无引用`、质量指标、排序原因。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - `materials.json` 增加 `screenshot_plan/icon_keyword_suggestions/broll_categories/quality_metrics`。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/normalize.py`, `pipeline_v2/scoring.py`, `pipeline_v2/script_generator.py`, `pipeline_v2/report_export.py`, `pipeline_v2/runtime.py`, 对应测试文件。
+- 如何验证：
+  - `pytest -q tests/v2/test_normalize.py tests/v2/test_scoring.py tests/v2/test_script_storyboard_prompt.py tests/v2/test_report_export_notification.py tests/v2/test_runtime_integration.py`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_c2 > /tmp/ara_v2_smoke_c2/result.json`
+  - `python scripts/validate_artifacts_v2.py --run-dir /tmp/ara_v2_smoke_c2/runs/<run_id> --render-dir /tmp/ara_v2_smoke_c2/render_jobs/<render_job_id>`
+- 已知风险与回滚：
+  - 风险：当真实抓取正文极短时，脚本会退化到规则化句式，后续需结合 LLM/模板库进一步提升文案自然度。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Audit & De-placeholder Entry Cleanup (Commit 1)
 - 本次目标：
   - 记录当前可复现实测证据（smoke 与点播链路）。

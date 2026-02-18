@@ -36,6 +36,11 @@ def test_normalize_assigns_tier_b_credibility_and_hash() -> None:
     item = normalize(raw)
     assert item.tier == "B"
     assert item.metadata.get("credibility") in {"low", "medium"}
+    assert item.metadata.get("body_len", 0) > 0
+    assert item.metadata.get("citation_count", 0) >= 1
+    assert "published_recency" in item.metadata
+    assert item.metadata.get("link_count", 0) >= 1
+    assert isinstance(item.metadata.get("quality_metrics"), dict)
     assert item.hash
 
 
