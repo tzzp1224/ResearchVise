@@ -691,14 +691,19 @@ class RunPipelineRuntime:
         ref_map = {normalize_url(str(key)): str(value) for key, value in dict(materials.get("reference_asset_map") or {}).items()}
         local_assets = [str(path) for path in list(materials.get("local_assets") or []) if str(path).strip()]
         for idx, shot in enumerate(list(board.shots or []), start=1):
+            local_pref = local_assets[(idx - 1) % len(local_assets)] if local_assets else ""
             refs: List[str] = []
+            if local_pref and idx <= 3:
+                refs.append(local_pref)
             for raw_ref in list(shot.reference_assets or []):
                 normalized = normalize_url(str(raw_ref or ""))
                 mapped = ref_map.get(normalized)
                 if mapped:
-                    refs.append(mapped)
+                    if mapped not in refs:
+                        refs.append(mapped)
                 elif normalized and is_allowed_citation_url(normalized):
-                    refs.append(normalized)
+                    if normalized not in refs:
+                        refs.append(normalized)
             if not refs and local_assets:
                 refs = [local_assets[(idx - 1) % len(local_assets)]]
             shot.reference_assets = refs

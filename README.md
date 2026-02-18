@@ -1,6 +1,31 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: P1 Facts Cleanup + Local Asset-Driven Shots (New)
+- 本次目标：
+  - 消除 facts/script/storyboard 中的 URL 碎片与 quote 残留，提升口播与分镜可读性。
+  - 打通本地素材引用链路，让前置镜头稳定使用 `run_dir/assets/*` 而不是仅在线 URL。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - 新增 URL/path fragment 清洗规则（例如 `com/s/...`、markdown quote 前缀 `>`）。
+    - `build_facts` 增加 `metrics` 且 `proof_links` 去重；`how_it_works/proof` 过滤 URL 残片样式句子。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - `_attach_reference_assets` 调整为优先注入本地素材（前 3 个镜头强制带本地 asset），同时保留有效 evidence URL。
+  - 测试更新：
+    - `tests/v2/test_script_storyboard_prompt.py` 新增 facts 去碎片回归。
+    - `tests/v2/test_runtime_integration.py` 要求至少 2 个镜头引用本地 assets。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/{script_generator.py,runtime.py}`, `tests/v2/{test_script_storyboard_prompt.py,test_runtime_integration.py}`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知风险与回滚：
+  - 风险：更激进的清洗可能删除少量边界信息（但可读性会显著提升）。
+  - 风险：本地素材优先会增加镜头视觉一致性，可能减少部分在线证据链接的直接可见度。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: P0 Onepager Gate + Evidence Scope + Link Hygiene (New)
 - 本次目标：
   - 修复 live 场景下 Top picks 数量门禁“假通过”问题。

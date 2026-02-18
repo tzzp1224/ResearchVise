@@ -268,7 +268,12 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert "quality_metrics" in materials_payload
     assert materials_payload["data_mode"] == "live"
     board_payload = json.loads((run_dir / "storyboard.json").read_text(encoding="utf-8"))
-    assert any(str((shot or {}).get("reference_assets", [""])[0]).startswith(str(run_dir / "assets")) for shot in board_payload["shots"])
+    local_ref_shots = 0
+    for shot in list(board_payload.get("shots") or []):
+        refs = [str(value) for value in list((shot or {}).get("reference_assets") or []) if str(value).strip()]
+        if any(ref.startswith(str(run_dir / "assets")) for ref in refs):
+            local_ref_shots += 1
+    assert local_ref_shots >= 2
 
     onepager_text = (run_dir / "onepager.md").read_text(encoding="utf-8")
     assert "DataMode: `live`" in onepager_text

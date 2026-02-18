@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from core import Citation, NormalizedItem, Shot, Storyboard
 from pipeline_v2.prompt_compiler import compile_shot_prompt, compile_storyboard, consistency_pack
-from pipeline_v2.script_generator import generate_script, generate_variants
+from pipeline_v2.script_generator import build_facts, generate_script, generate_variants
 from pipeline_v2.storyboard_generator import auto_fix_storyboard, overlay_compact, script_to_storyboard, validate_storyboard
 
 
@@ -142,3 +142,20 @@ def test_script_and_prompt_references_exclude_tooling_links() -> None:
     prompts = compile_storyboard(board, style_profile={"style_id": "style_neo", "character_id": "host_01"})
     all_refs = [str(ref) for prompt in prompts for ref in list(prompt.references or [])]
     assert all("api.openai.com" not in ref for ref in all_refs)
+
+
+def test_build_facts_strips_url_fragments_and_quote_tokens() -> None:
+    item = _sample_item()
+    item.body_md = (
+        "> com/s/rkQ28abc quote fragment should not survive.\n"
+        "This release introduces agent orchestration checkpoints for safer rollback.\n"
+        "See docs at example.com/s/path-that-should-be-cleaned and keep only natural language."
+    )
+    facts = build_facts(item, topic="AI agent")
+    joined = " ".join(
+        [str(facts.get("what_it_is") or "")]
+        + [str(p) for p in list(facts.get("how_it_works") or [])]
+        + [str(p) for p in list(facts.get("proof") or [])]
+    ).lower()
+    assert "com/s/" not in joined
+    assert ">" not in joined

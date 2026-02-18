@@ -13,6 +13,8 @@ from pipeline_v2.sanitize import canonicalize_url, classify_link, is_allowed_cit
 _FORBIDDEN_TOKENS = re.compile(r"\b(placeholder|dummy|lorem|todo|testsrc|colorbars)\b", re.IGNORECASE)
 _HTML_TAGS = re.compile(r"<[^>]+>")
 _MARKDOWN_NOISE = re.compile(r"^\s*[*#>\-|`]+\s*$")
+_URL_FRAGMENT = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s]+", re.IGNORECASE)
+_PATH_FRAGMENT = re.compile(r"^(?:[a-z0-9._-]+/){1,4}[a-z0-9._%-]+$", re.IGNORECASE)
 _FACT_NOISE_PATTERNS = (
     re.compile(r"\bstars?\s*:\s*\d+", re.IGNORECASE),
     re.compile(r"\bforks?\s*:\s*\d+", re.IGNORECASE),
@@ -30,9 +32,11 @@ def _compact_text(value: str, max_len: int) -> str:
 
 def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = str(text or "")
+    value = re.sub(r"^\s*>+\s*", "", value)
     value = _HTML_TAGS.sub(" ", value)
     value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", value)
     value = re.sub(r"https?://[^\s)\]>]+", "", value)
+    value = _URL_FRAGMENT.sub(" ", value)
     value = re.sub(r"[*_`]{1,3}", " ", value)
     value = re.sub(r"\s*[-]{2,}\s*", " ", value)
     value = re.sub(r"\s+", " ", value).strip(" -:;,.")
@@ -70,6 +74,21 @@ def _is_fact_noise(sentence: str) -> bool:
     if lowered in {"---", "*", "-"}:
         return True
     if any(pattern.search(text) for pattern in _FACT_NOISE_PATTERNS):
+        return True
+    return False
+
+
+def _looks_like_fragment(text: str) -> bool:
+    value = str(text or "").strip().lower()
+    if not value:
+        return True
+    if value.startswith(("http://", "https://", "www.")):
+        return True
+    if _URL_FRAGMENT.search(value):
+        return True
+    if _PATH_FRAGMENT.match(value):
+        return True
+    if value.startswith(("com/", "org/", "net/", "io/")):
         return True
     return False
 
@@ -191,6 +210,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         point = _clean_fact_point(sentence, max_len=80)
         if not point:
             continue
+        if _looks_like_fragment(point):
+            continue
         how_it_works.append(point)
         if len(how_it_works) >= 3:
             break
@@ -229,6 +250,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         if not is_allowed_citation_url(citation_url):
             continue
         snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
+        if _looks_like_fragment(snippet):
+            continue
         if snippet and snippet not in proof:
             proof.append(snippet)
             proof_links.append(citation_url)
@@ -251,6 +274,17 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
     )
     cta = "Save this brief, review the cited sources, and use the checklist before your next rollout."
 
+    dedup_proof_links: List[str] = []
+    seen_links = set()
+    for link in proof_links[:4]:
+        token = canonicalize_url(link)
+        if not token or token in seen_links:
+            continue
+        seen_links.add(token)
+        dedup_proof_links.append(token)
+        if len(dedup_proof_links) >= 2:
+            break
+
     return {
         "topic": topic_text or None,
         "hook": _clean_sentence(hook, max_len=170),
@@ -258,7 +292,7 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         "why_now": _clean_sentence(_why_now(item), max_len=190),
         "how_it_works": [_clean_fact_point(point, max_len=80) for point in how_it_works[:3]],
         "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],
-        "proof_links": [canonicalize_url(link) for link in proof_links[:2]],
+        "proof_links": dedup_proof_links,
         "metrics": metrics,
         "links": links,
         "cta": _clean_sentence(cta, max_len=170),
