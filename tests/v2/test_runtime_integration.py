@@ -177,12 +177,20 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     script_payload = json.loads((run_dir / "script.json").read_text(encoding="utf-8"))
     assert "structure" in script_payload
     assert len(script_payload["structure"]["key_points"]) == 3
+    run_context_payload = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    assert run_context_payload["data_mode"] == "live"
+    assert "connector_stats" in run_context_payload
+    assert "extraction_stats" in run_context_payload
 
     materials_payload = json.loads((run_dir / "materials.json").read_text(encoding="utf-8"))
     assert materials_payload["screenshot_plan"]
     assert materials_payload["icon_keyword_suggestions"]
     assert materials_payload["broll_categories"]
     assert "quality_metrics" in materials_payload
+    assert materials_payload["data_mode"] == "live"
+
+    onepager_text = (run_dir / "onepager.md").read_text(encoding="utf-8")
+    assert "DataMode: `live`" in onepager_text
 
     render_status = runtime.process_next_render()
     assert render_status is not None

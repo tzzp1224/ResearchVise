@@ -14,6 +14,10 @@ from typing import Dict, List, Optional, Tuple
 BLOCKLIST = {"placeholder", "dummy", "lorem", "todo", "testsrc", "colorbars"}
 MIN_SCRIPT_LEN = 260
 MIN_MP4_DURATION_SEC = 10.0
+FIXTURE_HN_IDS = {"1000001", "123456", "999999"}
+PLACEHOLDER_REPO_PATTERNS = [
+    re.compile(r"https?://github\.com/org/repo(?:[-_/][^\s)]*)?$", flags=re.IGNORECASE),
+]
 
 
 def _load_json(path: Path) -> Dict:
@@ -205,6 +209,9 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["details"]["onepager_top_pick_count"] = len(top_pick_headings)
         if block_hits:
             report["errors"].append("onepager_blocklist:" + ",".join(block_hits))
+        mode_match = re.search(r"^- DataMode:\s*`?(live|smoke)`?\s*$", onepager, flags=re.IGNORECASE | re.MULTILINE)
+        if mode_match:
+            report["details"]["data_mode"] = str(mode_match.group(1)).lower()
 
     if storyboard_path.exists():
         storyboard = _load_json(storyboard_path)
@@ -245,6 +252,52 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
     else:
         report["checks"]["render_status_seedance_flag_present"] = False
         report["errors"].append(f"missing:render_status:{render_status_path}")
+
+    run_context_path = run_dir / "run_context.json"
+    if run_context_path.exists():
+        try:
+            run_context = _load_json(run_context_path)
+            report["checks"]["run_context_exists"] = True
+            report["details"]["data_mode"] = str(run_context.get("data_mode") or report["details"].get("data_mode") or "")
+            report["details"]["connector_stats"] = run_context.get("connector_stats")
+            report["details"]["extraction_stats"] = run_context.get("extraction_stats")
+        except Exception as exc:
+            report["checks"]["run_context_exists"] = False
+            report["errors"].append(f"run_context_parse:{exc}")
+    else:
+        report["checks"]["run_context_exists"] = False
+        report["errors"].append(f"missing:run_context:{run_context_path}")
+
+    data_mode = str(report["details"].get("data_mode") or "").strip().lower()
+    report["checks"]["data_mode_present"] = data_mode in {"live", "smoke"}
+    if not report["checks"]["data_mode_present"]:
+        report["errors"].append("data_mode_missing")
+
+    if data_mode == "live":
+        texts = []
+        for path in [script_path, onepager_path, storyboard_path, run_dir / "materials.json"]:
+            if path.exists():
+                texts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        merged = "\n".join(texts)
+
+        smoke_hits = re.findall(r"(?i)[a-z0-9._/-]*-smoke[a-z0-9._/-]*", merged)
+        report["checks"]["live_has_no_smoke_tokens"] = len(smoke_hits) == 0
+        if smoke_hits:
+            report["errors"].append("live_smoke_tokens:" + ",".join(sorted(set(smoke_hits))[:8]))
+
+        fixture_hits = sorted({fixture for fixture in FIXTURE_HN_IDS if fixture in merged})
+        report["checks"]["live_has_no_fixture_hn_ids"] = len(fixture_hits) == 0
+        if fixture_hits:
+            report["errors"].append("live_fixture_hn_ids:" + ",".join(fixture_hits))
+
+        placeholder_repo_hits = []
+        for pattern in PLACEHOLDER_REPO_PATTERNS:
+            placeholder_repo_hits.extend(pattern.findall(merged))
+        report["checks"]["live_has_no_placeholder_org_repo"] = len(placeholder_repo_hits) == 0
+        if placeholder_repo_hits:
+            report["errors"].append("live_placeholder_repo_url")
+    elif data_mode == "smoke":
+        report["checks"]["smoke_mode_detected"] = True
 
     report["ok"] = len(report["errors"]) == 0 and all(bool(v) for v in report["checks"].values())
     return report

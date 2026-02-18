@@ -10,10 +10,12 @@ import inspect
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
 from core import Artifact, ArtifactType, RawItem, RenderStatus, RunMode, RunRequest
 from orchestrator import RunOrchestrator
+from pipeline_v2.data_mode import resolve_data_mode, should_allow_smoke
 from pipeline_v2.dedup_cluster import cluster, dedup_exact, embed, merge_cluster
 from pipeline_v2.normalize import normalize
 from pipeline_v2.notification import notify_user, post_to_web, send_email
@@ -54,6 +56,7 @@ class RunExecutionResult:
     output_dir: str
     top_item_ids: List[str]
     render_job_id: Optional[str]
+    data_mode: str
 
 
 class RunPipelineRuntime:
@@ -156,9 +159,24 @@ class RunPipelineRuntime:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._orchestrator.append_event(run_id, "run_started", f"output_dir={out_dir}")
 
-        raw_items = await self._collect_raw_items(request)
+        data_mode = resolve_data_mode(budget=dict(request.budget or {}))
+        if data_mode == "smoke" and not should_allow_smoke(budget=dict(request.budget or {})):
+            data_mode = "live"
+            self._orchestrator.append_event(run_id, "data_mode_forced_live", "smoke mode requires explicit request")
+
+        raw_items = await self._collect_raw_items(request, data_mode=data_mode)
+        run_context = self._build_run_context(
+            data_mode=data_mode,
+            raw_items=raw_items,
+            run_id=run_id,
+        )
+        run_context_path = self._write_json(out_dir / "run_context.json", run_context)
         self._orchestrator.mark_run_progress(run_id, 0.18)
-        self._orchestrator.append_event(run_id, "ingest_done", f"raw_items={len(raw_items)}")
+        self._orchestrator.append_event(
+            run_id,
+            "ingest_done",
+            f"raw_items={len(raw_items)} data_mode={data_mode} connector_sources={len(run_context.get('connector_stats', {}))}",
+        )
         self._ensure_not_canceled(run_id)
 
         normalized = [normalize(item) for item in raw_items]
@@ -215,7 +233,7 @@ class RunPipelineRuntime:
         )
         materials_path = self._write_json(
             out_dir / "materials.json",
-            self._build_materials_manifest(run_id=run_id, primary=primary, picks=picks),
+            self._build_materials_manifest(run_id=run_id, primary=primary, picks=picks, run_context=run_context),
         )
         self._record_artifact(
             run_id,
@@ -233,7 +251,7 @@ class RunPipelineRuntime:
         self._orchestrator.append_event(run_id, "script_stage_done", f"duration={duration}s shots={len(board.shots)}")
         self._ensure_not_canceled(run_id)
 
-        onepager_path = generate_onepager(picks, primary.citations, out_dir=out_dir)
+        onepager_path = generate_onepager(picks, primary.citations, out_dir=out_dir, run_context=run_context)
         thumbnail_path = generate_thumbnail(
             primary.title,
             [entry.item.title for entry in picks[1:4]],
@@ -245,7 +263,13 @@ class RunPipelineRuntime:
             Artifact(
                 type=ArtifactType.ONEPAGER,
                 path=onepager_path,
-                metadata={"top_count": len(picks), "prompt_bundle_path": prompt_bundle_path, "materials_path": materials_path},
+                metadata={
+                    "top_count": len(picks),
+                    "prompt_bundle_path": prompt_bundle_path,
+                    "materials_path": materials_path,
+                    "run_context_path": run_context_path,
+                    "data_mode": data_mode,
+                },
             ),
         )
         self._record_artifact(run_id, Artifact(type=ArtifactType.THUMBNAIL, path=thumbnail_path, metadata={}))
@@ -298,9 +322,10 @@ class RunPipelineRuntime:
             output_dir=str(out_dir),
             top_item_ids=[entry.item.id for entry in picks],
             render_job_id=render_job_id,
+            data_mode=data_mode,
         )
 
-    async def _collect_raw_items(self, request: RunRequest) -> List[RawItem]:
+    async def _collect_raw_items(self, request: RunRequest, *, data_mode: str) -> List[RawItem]:
         tasks: List[Awaitable[List[RawItem]]] = [
             self._invoke_connector("fetch_github_trending", max_results=12),
             self._invoke_connector("fetch_huggingface_trending", max_results=12),
@@ -346,6 +371,9 @@ class RunPipelineRuntime:
                 except Exception:
                     pass
 
+        if not raw_items and data_mode == "live":
+            raise RuntimeError("no live items fetched from connectors")
+
         if not raw_items:
             raw_items.append(self._synthetic_item(request))
         return raw_items
@@ -379,7 +407,13 @@ class RunPipelineRuntime:
         return str(path)
 
     @staticmethod
-    def _build_materials_manifest(*, run_id: str, primary: Any, picks: Sequence[Any]) -> Dict[str, Any]:
+    def _build_materials_manifest(
+        *,
+        run_id: str,
+        primary: Any,
+        picks: Sequence[Any],
+        run_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
         top_items = [entry.item for entry in list(picks or [])]
         screenshot_plan = []
         icon_keywords = set()
@@ -427,6 +461,9 @@ class RunPipelineRuntime:
         return {
             "run_id": run_id,
             "item_id": primary.id,
+            "data_mode": str(run_context.get("data_mode") or "live"),
+            "connector_stats": dict(run_context.get("connector_stats") or {}),
+            "extraction_stats": dict(run_context.get("extraction_stats") or {}),
             "top_item_ids": [item.id for item in top_items],
             "source_urls": sorted(source_urls),
             "screenshot_plan": screenshot_plan,
@@ -439,6 +476,44 @@ class RunPipelineRuntime:
                 "published_recency": primary.metadata.get("published_recency"),
                 "link_count": int(float(primary.metadata.get("link_count", 0) or 0)),
             },
+        }
+
+    @staticmethod
+    def _build_run_context(*, data_mode: str, raw_items: Sequence[RawItem], run_id: str) -> Dict[str, Any]:
+        now = _utcnow().isoformat(timespec="seconds")
+        connector_stats: Dict[str, Dict[str, Any]] = {}
+        extraction_methods: Dict[str, int] = {}
+        extraction_failures = 0
+        total_body_len = 0
+        count = 0
+
+        for item in list(raw_items or []):
+            source = str(item.source or "unknown")
+            if source not in connector_stats:
+                connector_stats[source] = {"count": 0, "fetched_at": now}
+            connector_stats[source]["count"] = int(connector_stats[source]["count"]) + 1
+
+            metadata = dict(item.metadata or {})
+            method = str(metadata.get("extraction_method") or "fallback").strip().lower()
+            extraction_methods[method] = int(extraction_methods.get(method, 0)) + 1
+            if bool(metadata.get("extraction_failed")):
+                extraction_failures += 1
+
+            body_len = len(re.sub(r"\s+", " ", str(item.body or "").strip()))
+            total_body_len += body_len
+            count += 1
+
+        avg_body_len = round(float(total_body_len) / float(max(1, count)), 2)
+        return {
+            "run_id": run_id,
+            "data_mode": str(data_mode or "live"),
+            "connector_stats": connector_stats,
+            "extraction_stats": {
+                "methods": extraction_methods,
+                "avg_body_len": avg_body_len,
+                "failures": int(extraction_failures),
+            },
+            "fetched_at": now,
         }
 
     def _record_artifact(self, run_id: str, artifact: Artifact) -> None:

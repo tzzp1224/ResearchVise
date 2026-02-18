@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
 
 from core import RunMode, RunRequest
+from pipeline_v2.data_mode import resolve_data_mode
+from scripts.validate_artifacts_v2 import validate as validate_artifacts
 from webapp.runtime import get_orchestrator, get_runtime
 
 
@@ -15,6 +19,10 @@ def _json(text: str):
     if not raw:
         return {}
     return json.loads(raw)
+
+
+def _default_mode() -> str:
+    return resolve_data_mode(explicit=str(os.getenv("ARA_DATA_MODE", "live")))
 
 
 def main() -> None:
@@ -26,8 +34,19 @@ def main() -> None:
     ond.add_argument("--topic", required=True)
     ond.add_argument("--time-window", default="24h")
     ond.add_argument("--tz", default="UTC")
+    ond.add_argument("--mode", choices=["live", "smoke"], default=_default_mode())
     ond.add_argument("--budget-json", default="{}")
     ond.add_argument("--targets", default="web,mp4")
+
+    run_once = sub.add_parser("run-once")
+    run_once.add_argument("--user-id", default="local_user")
+    run_once.add_argument("--mode", choices=["live", "smoke"], default=_default_mode())
+    run_once.add_argument("--topic", required=True)
+    run_once.add_argument("--time-window", "--time_window", dest="time_window", default="today")
+    run_once.add_argument("--tz", default="UTC")
+    run_once.add_argument("--targets", default="web,mp4")
+    run_once.add_argument("--top-k", type=int, default=3)
+    run_once.add_argument("--budget-json", default="{}")
 
     daily = sub.add_parser("daily-subscribe")
     daily.add_argument("--user-id", required=True)
@@ -60,6 +79,7 @@ def main() -> None:
 
     if args.command == "ondemand":
         budget = _json(args.budget_json)
+        budget["data_mode"] = str(args.mode).strip().lower()
         targets = [item.strip() for item in str(args.targets).split(",") if item.strip()]
         req = RunRequest(
             user_id=args.user_id,
@@ -73,6 +93,63 @@ def main() -> None:
         idem = f"ondemand:{args.user_id}:{args.topic}:{args.time_window}:{args.tz}"
         run_id = orchestrator.enqueue_run(req, idempotency_key=idem)
         print(json.dumps({"run_id": run_id}, ensure_ascii=False))
+        return
+
+    if args.command == "run-once":
+        budget = _json(args.budget_json)
+        budget["data_mode"] = str(args.mode).strip().lower()
+        budget["top_k"] = int(args.top_k)
+        targets = [item.strip() for item in str(args.targets).split(",") if item.strip()]
+        req = RunRequest(
+            user_id=args.user_id,
+            mode=RunMode.ONDEMAND,
+            topic=args.topic,
+            time_window=args.time_window,
+            tz=args.tz,
+            budget=budget,
+            output_targets=targets,
+        )
+        run_id = orchestrator.enqueue_run(req)
+
+        run_result = runtime.run_next()
+        if not run_result:
+            print(json.dumps({"run_id": run_id, "processed": False, "error": "run worker did not process request"}, ensure_ascii=False))
+            return
+
+        render_status = None
+        if "mp4" in [item.lower() for item in targets]:
+            render_status = runtime.process_next_render()
+
+        bundle = runtime.get_run_bundle(run_id)
+        run_dir = Path(str(run_result.output_dir)).resolve()
+        render_dir = None
+        if render_status and str(render_status.output_path or "").strip():
+            render_dir = Path(str(render_status.output_path)).resolve().parent
+        elif bundle.get("render_status") and bundle["render_status"].get("output_path"):
+            render_dir = Path(str(bundle["render_status"]["output_path"])).resolve().parent
+
+        validator_payload = None
+        validator_ok = None
+        if render_dir and run_dir.exists() and render_dir.exists():
+            validator_payload = validate_artifacts(run_dir=run_dir, render_dir=render_dir)
+            validator_ok = bool(validator_payload.get("ok"))
+
+        print(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "render_job_id": bundle.get("render_job_id"),
+                    "data_mode": budget.get("data_mode"),
+                    "run_dir": str(run_dir),
+                    "render_dir": str(render_dir) if render_dir else None,
+                    "artifacts": bundle.get("artifacts", []),
+                    "validator_ok": validator_ok,
+                    "validator": validator_payload,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
         return
 
     if args.command == "daily-subscribe":

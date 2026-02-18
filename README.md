@@ -1,6 +1,36 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Live/Smoke Mode Isolation & Run Context (New)
+- 本次目标：
+  - 将 `live` 与 `smoke` 运行模式解耦，避免 smoke fixture 污染线上输出。
+  - 在产物中落盘并展示 `DataMode/ConnectorStats/ExtractionStats`。
+- 实际改动：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/data_mode.py`：
+    - 提供 `resolve_data_mode/should_allow_smoke`，默认 `live`，`smoke` 需显式请求。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - 执行时解析 data mode，写入 `run_context.json`。
+    - `materials.json` 与 `onepager.md` 注入 run context（connector/extraction 统计）。
+    - `live` 模式下无抓取结果时直接失败，不再静默回退 synthetic。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager 顶部新增 `DataMode/ConnectorStats/ExtractionStats`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 增加 `data_mode` 读取与 live fixture 检查（`-smoke`、HN fixture id、`org/repo` 占位 URL）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/main.py`：
+    - `ondemand` 新增 `--mode live|smoke`。
+    - 新增同进程命令 `run-once`（执行 run+render+validator 并输出结果）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/e2e_smoke_v2.py`：
+    - 显式注入 `data_mode=smoke`。
+- 新增/删除文件：
+  - 新增：`pipeline_v2/data_mode.py`
+  - 修改：`main.py`, `pipeline_v2/runtime.py`, `pipeline_v2/report_export.py`, `scripts/validate_artifacts_v2.py`, `scripts/e2e_smoke_v2.py`, `tests/v2/test_runtime_integration.py`, `tests/v2/test_data_mode.py`
+- 如何验证：
+  - `pytest -q tests/v2/test_data_mode.py tests/v2/test_runtime_integration.py tests/v2/test_validate_artifacts_v2.py tests/v2/test_e2e_smoke_command.py`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_mode_check > /tmp/ara_v2_smoke_mode_check/result.json`
+- 已知风险与回滚：
+  - 风险：`live` 模式在网络不可达时将直接失败，便于暴露抓取问题但会降低离线容错。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Acceptance Gates & Placeholder Cleanup (Commit 6)
 - 本次目标：
   - 完成自动化验收门禁（artifact 质量、视频有效性、占位逻辑清理）。

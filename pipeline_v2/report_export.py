@@ -84,7 +84,13 @@ def _rank_reasons(item: object) -> str:
     return "无"
 
 
-def generate_onepager(items: Sequence[object], citations: Sequence[Citation], out_dir: str | Path) -> str:
+def generate_onepager(
+    items: Sequence[object],
+    citations: Sequence[Citation],
+    out_dir: str | Path,
+    *,
+    run_context: dict | None = None,
+) -> str:
     """Generate one-page markdown report with item ranking and evidence."""
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -94,10 +100,19 @@ def generate_onepager(items: Sequence[object], citations: Sequence[Citation], ou
     normalized_items = [_extract_item(item) for item in ranked_items]
     citation_list = _extract_citations(items, citations)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    context = dict(run_context or {})
+    data_mode = str(context.get("data_mode") or "live").strip().lower() or "live"
+    connector_stats = dict(context.get("connector_stats") or {})
+    extraction_stats = dict(context.get("extraction_stats") or {})
+    connector_stats_line = json.dumps(connector_stats, ensure_ascii=False, sort_keys=True)
+    extraction_stats_line = json.dumps(extraction_stats, ensure_ascii=False, sort_keys=True)
 
     lines: List[str] = [
         "# One Pager",
         "",
+        f"- DataMode: `{data_mode}`",
+        f"- ConnectorStats: `{connector_stats_line}`",
+        f"- ExtractionStats: `{extraction_stats_line}`",
         f"- GeneratedAt(UTC): `{generated_at}`",
         f"- CandidateCount: `{len(normalized_items)}`",
         f"- CitationCount: `{len(citation_list)}`",

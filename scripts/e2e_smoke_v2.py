@@ -102,6 +102,7 @@ def _connector_overrides() -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run v2 smoke flow and emit artifacts")
     parser.add_argument("--out-dir", default="data/outputs/v2_smoke")
+    parser.add_argument("--mode", choices=["smoke"], default="smoke")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -124,7 +125,7 @@ def main() -> None:
             topic="smoke test topic",
             time_window="24h",
             tz="UTC",
-            budget={"duration_sec": 34, "max_total_cost": 5.0, "max_retries": 1},
+            budget={"duration_sec": 34, "max_total_cost": 5.0, "max_retries": 1, "data_mode": str(args.mode)},
             output_targets=["web", "mp4"],
         )
     )
