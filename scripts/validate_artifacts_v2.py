@@ -21,6 +21,8 @@ from pipeline_v2.sanitize import contains_html_like_tokens, is_allowed_citation_
 BLOCKLIST = {"placeholder", "dummy", "lorem", "todo", "testsrc", "colorbars"}
 MIN_SCRIPT_LEN = 260
 MIN_MP4_DURATION_SEC = 10.0
+MAX_ONEPAGER_BULLET_BYTES = 90
+MAX_ONEPAGER_BULLETS_PER_PICK = 6
 FIXTURE_HN_IDS = {"1000001", "123456", "999999"}
 PLACEHOLDER_REPO_PATTERNS = [
     re.compile(r"https?://github\.com/org/repo(?:[-_/][^\s)]*)?$", flags=re.IGNORECASE),
@@ -38,6 +40,32 @@ def _contains_blocklist(text: str) -> List[str]:
 
 def _extract_urls(text: str) -> List[str]:
     return [str(url).strip().rstrip(".,;:") for url in re.findall(r"https?://[^\s)]+", str(text or ""))]
+
+
+def _compact_bullet_issues(onepager: str) -> List[str]:
+    issues: List[str] = []
+    parts = re.split(r"^###\s+\d+\.\s+", str(onepager or ""), flags=re.MULTILINE)
+    if len(parts) <= 1:
+        return ["no_pick_sections"]
+
+    required_labels = ("WHAT｜", "WHY NOW｜", "HOW｜", "PROOF｜")
+    for idx, section in enumerate(parts[1:], start=1):
+        compact = re.search(r"#### Compact Brief\s*(.*?)(?:\n#### |\n### |\Z)", section, flags=re.DOTALL)
+        if not compact:
+            issues.append(f"pick_{idx}:missing_compact_brief")
+            continue
+        block = compact.group(1)
+        bullets = [line.strip() for line in re.findall(r"^- (.+)$", block, flags=re.MULTILINE) if line.strip()]
+        if len(bullets) > MAX_ONEPAGER_BULLETS_PER_PICK:
+            issues.append(f"pick_{idx}:too_many_bullets:{len(bullets)}")
+        for bullet in bullets:
+            if len(bullet.encode("utf-8")) > MAX_ONEPAGER_BULLET_BYTES:
+                issues.append(f"pick_{idx}:bullet_too_long:{len(bullet.encode('utf-8'))}")
+                break
+        for label in required_labels:
+            if not any(bullet.startswith(label) for bullet in bullets):
+                issues.append(f"pick_{idx}:missing_{label.rstrip('｜').lower().replace(' ', '_')}")
+    return issues
 
 
 def _ffprobe_info(path: Path) -> Tuple[bool, Dict, str]:
@@ -165,6 +193,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 
     required = {
         "script": run_dir / "script.json",
+        "facts": run_dir / "facts.json",
         "onepager": run_dir / "onepager.md",
         "storyboard": run_dir / "storyboard.json",
         "prompt_bundle": run_dir / "prompt_bundle.json",
@@ -179,6 +208,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 
     script_path = required["script"]
     onepager_path = required["onepager"]
+    facts_path = required["facts"]
     storyboard_path = required["storyboard"]
     prompt_bundle_path = required["prompt_bundle"]
     mp4_path = required["mp4"]
@@ -240,6 +270,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         mode_match = re.search(r"^- DataMode:\s*`?(live|smoke)`?\s*$", onepager, flags=re.IGNORECASE | re.MULTILINE)
         if mode_match:
             report["details"]["data_mode"] = str(mode_match.group(1)).lower()
+        report["details"]["onepager_compact_issues"] = _compact_bullet_issues(onepager)
+
+    if facts_path.exists():
+        facts_payload = _load_json(facts_path)
+        has_why = bool(str(facts_payload.get("why_now") or "").strip())
+        proof_list = [str(item).strip() for item in list(facts_payload.get("proof") or []) if str(item).strip()]
+        report["checks"]["facts_has_why_now_and_proof"] = bool(has_why and proof_list)
+        if not report["checks"]["facts_has_why_now_and_proof"]:
+            report["errors"].append("facts_missing_why_now_or_proof")
 
     if storyboard_path.exists():
         storyboard = _load_json(storyboard_path)
@@ -334,8 +373,21 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["live_has_no_placeholder_org_repo"] = len(placeholder_repo_hits) == 0
         if placeholder_repo_hits:
             report["errors"].append("live_placeholder_repo_url")
+
+        compact_issues = list(report["details"].get("onepager_compact_issues") or [])
+        report["checks"]["onepager_bullets_compact_ok"] = len(compact_issues) == 0
+        if compact_issues:
+            report["errors"].append("onepager_compact_issues:" + ",".join(compact_issues[:6]))
+
+        if facts_path.exists():
+            report["checks"]["facts_has_why_now_and_proof"] = bool(report["checks"].get("facts_has_why_now_and_proof"))
+        else:
+            report["checks"]["facts_has_why_now_and_proof"] = False
+            report["errors"].append(f"missing:facts:{facts_path}")
     elif data_mode == "smoke":
         report["checks"]["smoke_mode_detected"] = True
+        report["checks"]["onepager_bullets_compact_ok"] = True
+        report["checks"]["facts_has_why_now_and_proof"] = True
 
     topic_value = ""
     ranking_stats = {}
@@ -360,6 +412,27 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("topic_relevance_below_threshold")
     else:
         report["checks"]["topic_relevance_ok"] = True
+
+    if data_mode == "live":
+        quality_signals = list(ranking_stats.get("top_quality_signals") or [])
+        top_signals = quality_signals[:2]
+        has_update_signal = False
+        for signal in top_signals:
+            payload = dict(signal or {})
+            if str(payload.get("publish_or_update_time") or "").strip():
+                has_update_signal = True
+                break
+            if payload.get("update_recency_days") not in (None, "", "unknown"):
+                has_update_signal = True
+                break
+            if int(float(payload.get("evidence_links_quality", 0) or 0)) > 0:
+                has_update_signal = True
+                break
+        report["checks"]["ranked_items_have_update_signal"] = has_update_signal
+        if not has_update_signal:
+            report["errors"].append("ranked_items_missing_update_signal")
+    else:
+        report["checks"]["ranked_items_have_update_signal"] = True
 
     report["ok"] = len(report["errors"]) == 0 and all(bool(v) for v in report["checks"].values())
     return report

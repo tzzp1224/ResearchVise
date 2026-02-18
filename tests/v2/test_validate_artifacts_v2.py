@@ -37,6 +37,9 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["script_no_html_tokens"] is True
     assert report["checks"]["onepager_no_html_tokens"] is True
     assert report["checks"]["topic_relevance_ok"] is True
+    assert report["checks"]["onepager_bullets_compact_ok"] is True
+    assert report["checks"]["facts_has_why_now_and_proof"] is True
+    assert report["checks"]["ranked_items_have_update_signal"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:

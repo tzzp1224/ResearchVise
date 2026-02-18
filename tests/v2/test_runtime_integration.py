@@ -186,6 +186,7 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert "ranking_stats" in run_context_payload
     assert "drop_reason_samples" in run_context_payload["ranking_stats"]
     assert "top_quality_signals" in run_context_payload["ranking_stats"]
+    assert "top_why_ranked" in run_context_payload["ranking_stats"]
     assert "connector_stats" in run_context_payload
     assert "extraction_stats" in run_context_payload
 

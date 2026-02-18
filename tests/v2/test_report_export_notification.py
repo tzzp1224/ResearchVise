@@ -29,7 +29,24 @@ def _item() -> NormalizedItem:
         tier="A",
         lang="en",
         hash="abc123",
-        metadata={"credibility": "high"},
+        metadata={
+            "credibility": "high",
+            "quality_signals": {
+                "content_density": 0.42,
+                "has_quickstart": True,
+                "has_results_or_bench": True,
+                "has_images_non_badge": True,
+                "publish_or_update_time": "2026-02-17T12:00:00+00:00",
+                "update_recency_days": 1.2,
+                "evidence_links_quality": 2,
+            },
+            "facts": {
+                "what_it_is": "MCP 路由层升级，主打多代理工具编排。",
+                "why_now": "最近 2 天更新，社区讨论集中在生产可用性。",
+                "how_it_works": ["把上下文路由拆成可观测阶段。", "提供可回滚发布策略。"],
+                "proof": ["HN 讨论持续升温。"],
+            },
+        },
     )
 
 
@@ -42,9 +59,17 @@ def test_generate_onepager_thumbnail_and_export_package(tmp_path: Path) -> None:
     content = Path(onepager).read_text(encoding="utf-8")
     assert "Top Picks" in content
     assert "Source Domain" in content
-    assert "#### Facts" in content
+    assert "#### Compact Brief" in content
     assert "#### Citations" in content
     assert "Quality Metrics" in content
+    assert "WHAT｜" in content
+    assert "WHY NOW｜" in content
+    assert "HOW｜" in content
+    assert "PROOF｜" in content
+
+    compact_bullets = [line[2:] for line in content.splitlines() if line.startswith("- WHAT｜") or line.startswith("- WHY NOW｜") or line.startswith("- HOW｜") or line.startswith("- PROOF｜") or line.startswith("- CTA｜")]
+    assert len(compact_bullets) <= 6
+    assert all(len(line.encode("utf-8")) <= 90 for line in compact_bullets)
 
     thumbnail = generate_thumbnail(item.title, ["mcp", "agent"], {"fg": "#000", "bg": "#fff"}, out_dir=tmp_path)
     assert thumbnail.endswith(".svg")

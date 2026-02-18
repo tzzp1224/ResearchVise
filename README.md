@@ -1,6 +1,32 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-18)
+### Commit: Compact Onepager Compiler & Live Quality Gates (New)
+- 本次目标：
+  - 将 onepager 从“报告式长句”压缩为“可发布短句”（短、狠、可口播）。
+  - 给 live 模式新增验收门禁：compact bullets / facts 完整性 / update signal。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - Top pick 文案改为 `Compact Brief`（固定结构：`WHAT/WHY NOW/HOW/PROOF/CTA`）。
+    - 约束：每个 pick 最多 6 条 bullet，单条 <= 90 bytes（UTF-8）。
+    - 新增 `Why Ranked` 短行：`relevance + 更新信号/证据链/Quickstart`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - live 新门禁：`onepager_bullets_compact_ok`、`facts_has_why_now_and_proof`、`ranked_items_have_update_signal`。
+    - 失败报错包含 pick 序号与具体原因（缺少标签/超长等）。
+  - 修改测试：
+    - `tests/v2/test_report_export_notification.py` 验证 compact bullets 结构与长度。
+    - `tests/v2/test_validate_artifacts_v2.py` 验证新增门禁存在且通过。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`pipeline_v2/report_export.py`, `scripts/validate_artifacts_v2.py`, `tests/v2/test_report_export_notification.py`, `tests/v2/test_validate_artifacts_v2.py`, `tests/v2/test_runtime_integration.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT=\"/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)\"; mkdir -p \"$OUT\"; python main.py run-once --mode live --topic \"AI agent\" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > \"$OUT/result.json\"`
+  - `python - <<'PY'\nimport json, pathlib, subprocess\np=pathlib.Path('$OUT/result.json')\nd=json.loads(p.read_text())\nrun_dir=d.get('run_dir'); render_dir=d.get('render_dir')\nprint(subprocess.run(['python','scripts/validate_artifacts_v2.py','--run-dir',run_dir,'--render-dir',render_dir],capture_output=True,text=True).stdout)\nPY`
+- 已知风险与回滚：
+  - 风险：bullet 压缩会牺牲部分上下文细节（换来更强发布可读性）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Deep Extraction Signals & Ranking Stability (New)
 - 本次目标：
   - 把 live 候选的“正文密度/更新时间/证据质量”做成结构化信号。
