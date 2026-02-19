@@ -245,6 +245,32 @@ def test_cross_source_corroboration_bonus_improves_ranking_order() -> None:
     assert any("cross_source.corroboration_bonus=0.05" in reason for reason in list(ranked[0].reasons or []))
 
 
+def test_recent_topic_repeat_penalty_reduces_ranking_priority() -> None:
+    repeated = _item(
+        "repeated_pick",
+        tier="A",
+        source="github",
+        title="Agent orchestration runtime",
+        metadata={
+            "credibility": "high",
+            "citation_count": 2,
+            "recent_topic_repeat_penalty": 0.12,
+            "recent_topic_pick_count": 3,
+        },
+    )
+    fresh = _item(
+        "fresh_pick",
+        tier="A",
+        source="github",
+        title="Agent orchestration runtime",
+        metadata={"credibility": "high", "citation_count": 2},
+    )
+    ranked = rank_items([repeated, fresh], topic="AI agent", relevance_threshold=0.55)
+    assert ranked[0].item.id == "fresh_pick"
+    repeated_row = next(row for row in ranked if row.item.id == "repeated_pick")
+    assert any("penalty.recent_topic_repeat=0.12" in reason for reason in list(repeated_row.reasons or []))
+
+
 def test_agent_item_without_engagement_signal_is_capped_below_one() -> None:
     item = _item(
         "agent_low_engagement",

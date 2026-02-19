@@ -209,6 +209,7 @@ class RunPipelineRuntime:
         best_selected: Optional[Dict[str, Any]] = None
         best_priority = float("-inf")
         quality_triggered_any = False
+        recent_topic_entity_counts = self._recent_topic_entity_counts(topic=topic_value, data_mode=data_mode)
 
         for idx, profile in enumerate(recall_profiles, start=1):
             self._ensure_not_canceled(run_id)
@@ -234,6 +235,10 @@ class RunPipelineRuntime:
             grouped = cluster(unique_items, embeddings)
             merged = [merge_cluster(group) for group in grouped]
             merged = self._annotate_cross_source_corroboration(merged)
+            merged = self._annotate_recent_topic_repeat_penalty(
+                merged,
+                recent_entity_counts=recent_topic_entity_counts,
+            )
             rank_pack = self._rank_with_relevance_gate(
                 merged=merged,
                 topic=request.topic,
@@ -519,6 +524,9 @@ class RunPipelineRuntime:
             evidence_links = int(float(signals.get("evidence_links_quality", 0) or 0))
             if evidence_links > 0:
                 chunks.append(f"evidence={evidence_links}")
+            repeat_penalty = float(metadata.get("recent_topic_repeat_penalty", 0.0) or 0.0)
+            if repeat_penalty > 0:
+                chunks.append(f"repeat_penalty={repeat_penalty:.2f}")
             if bool(signals.get("has_quickstart")):
                 chunks.append("quickstart")
             return " | ".join(chunks[:4])
@@ -541,6 +549,8 @@ class RunPipelineRuntime:
                     "forks": int(float(metadata.get("forks", 0) or 0)),
                     "hn_points": int(float(metadata.get("points", 0) or 0)),
                     "hn_comments": int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0)),
+                    "recent_topic_pick_count": int(float(metadata.get("recent_topic_pick_count", 0) or 0)),
+                    "recent_topic_repeat_penalty": float(metadata.get("recent_topic_repeat_penalty", 0.0) or 0.0),
                     "relevance_score": round(float(getattr(row, "relevance_score", 0.0)), 4),
                     "total_score": round(float(getattr(row, "total_score", 0.0)), 4),
                     "hard_match_pass": bool(metadata.get("topic_hard_match_pass")),
@@ -1482,6 +1492,102 @@ class RunPipelineRuntime:
                 item.metadata = metadata
         return out
 
+    @staticmethod
+    def _topic_key(topic: str) -> str:
+        return re.sub(r"\s+", " ", str(topic or "").strip().lower())
+
+    def _recent_topic_entity_counts(self, *, topic: str, data_mode: str) -> Dict[str, int]:
+        if str(data_mode or "").strip().lower() != "live":
+            return {}
+        topic_key = self._topic_key(topic)
+        if not topic_key:
+            return {}
+
+        try:
+            horizon_hours = max(1, int(float(os.getenv("ARA_V2_RECENT_REPEAT_HOURS", "18"))))
+        except Exception:
+            horizon_hours = 18
+        try:
+            max_runs = max(1, int(float(os.getenv("ARA_V2_RECENT_REPEAT_RUNS", "24"))))
+        except Exception:
+            max_runs = 24
+
+        now = _utcnow()
+        counts: Dict[str, int] = {}
+        scanned = 0
+        run_dirs = sorted(
+            [path for path in self._output_root.iterdir() if path.is_dir() and path.name.startswith("run_")],
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        for run_dir in run_dirs:
+            if scanned >= max_runs:
+                break
+            context_path = run_dir / "run_context.json"
+            diagnosis_path = run_dir / "retrieval_diagnosis.json"
+            if not context_path.exists() or not diagnosis_path.exists():
+                continue
+            try:
+                context = json.loads(context_path.read_text(encoding="utf-8"))
+                diagnosis = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            if self._topic_key(str(context.get("topic") or "")) != topic_key:
+                continue
+            if str(context.get("data_mode") or "live").strip().lower() != "live":
+                continue
+
+            fetched_at = str(context.get("fetched_at") or "").strip()
+            fetched_dt = None
+            if fetched_at:
+                try:
+                    fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+                except Exception:
+                    fetched_dt = None
+            if fetched_dt is not None:
+                age_hours = max(0.0, (now - fetched_dt).total_seconds() / 3600.0)
+                if age_hours > float(horizon_hours):
+                    continue
+
+            ranking_stats = dict(context.get("ranking_stats") or {})
+            top_ids = [str(value).strip() for value in list(ranking_stats.get("top_item_ids") or []) if str(value).strip()]
+            if not top_ids:
+                continue
+            rows = {
+                str(row.get("item_id") or "").strip(): row
+                for row in list(diagnosis.get("candidate_rows") or [])
+                if str(row.get("item_id") or "").strip()
+            }
+            for item_id in top_ids:
+                row = dict(rows.get(item_id) or {})
+                key = self._entity_key_from_url(str(row.get("url") or "").strip())
+                if not key:
+                    continue
+                counts[key] = int(counts.get(key, 0)) + 1
+            scanned += 1
+        return counts
+
+    def _annotate_recent_topic_repeat_penalty(
+        self,
+        items: Sequence[Any],
+        *,
+        recent_entity_counts: Mapping[str, int],
+    ) -> List[Any]:
+        out: List[Any] = [item for item in list(items or [])]
+        counts = dict(recent_entity_counts or {})
+        for item in out:
+            metadata = dict((getattr(item, "metadata", None) or {}) if item else {})
+            entity_key = self._corroboration_key(item) or self._entity_key_from_url(str(getattr(item, "url", "") or ""))
+            repeat_count = int(counts.get(entity_key, 0) or 0) if entity_key else 0
+            repeat_penalty = round(min(0.16, 0.04 * float(max(0, repeat_count))), 4)
+            metadata["recent_topic_repeat_key"] = entity_key
+            metadata["recent_topic_pick_count"] = int(repeat_count)
+            metadata["recent_topic_repeat_penalty"] = float(repeat_penalty)
+            if item is not None:
+                item.metadata = metadata
+        return out
+
     def _resolve_research_planner(self, request: RunRequest) -> ResearchPlanner:
         budget = dict(request.budget or {})
         if bool(budget.get("use_llm_planner")):
@@ -1559,6 +1665,7 @@ class RunPipelineRuntime:
             requested_top_k=int(max(1, top_count)),
             min_pass_ratio=_float("min_pass_ratio", "ARA_V2_MIN_PASS_RATIO", 0.30),
             min_evidence_quality=_float("min_evidence_quality", "ARA_V2_MIN_EVIDENCE_QUALITY", 2.0),
+            min_top_relevance=_float("min_top_relevance", "ARA_V2_MIN_TOP_RELEVANCE", 0.75),
             min_bucket_coverage=max(1, min_bucket),
             min_source_coverage=max(1, _int("min_source_coverage", "ARA_V2_MIN_SOURCE_COVERAGE", 2)),
             diversity_score_gap=_float("diversity_score_gap", "ARA_V2_DIVERSITY_SCORE_GAP", 0.12),

@@ -64,6 +64,27 @@ def test_extract_citations_uses_contextual_snippets_per_url() -> None:
     assert len(set(snippets)) >= 2
 
 
+def test_extract_citations_strips_html_anchor_snippets() -> None:
+    raw = RawItem(
+        id="raw_html_ctx",
+        source="github",
+        title="acme/agent-html",
+        url="https://github.com/acme/agent-html",
+        body=(
+            '<a href="https://platform.example.com/docs/faq/contact-us" target="_blank" style="font-size:17px;">'
+            "Contact docs</a>\n"
+            "Learn more about MCP runtime [guide](https://platform.example.com/docs/agent-runtime)\n"
+        ),
+        metadata={},
+    )
+    citations = extract_citations(raw)
+    by_url = {str(item.url or ""): str(item.snippet or "") for item in citations}
+    faq_snippet = by_url.get("https://platform.example.com/docs/faq/contact-us", "")
+    assert "href=" not in faq_snippet.lower()
+    assert "<a" not in faq_snippet.lower()
+    assert faq_snippet.strip() != ""
+
+
 def test_extract_citations_excludes_tooling_links_and_canonicalizes_noise() -> None:
     raw = RawItem(
         id="raw_tool",

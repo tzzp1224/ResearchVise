@@ -485,3 +485,52 @@ def test_controller_does_not_pick_low_score_bucket_outlier() -> None:
     assert "low_bucket" not in selected_ids
     assert selected_ids[0] == "top_a"
     assert set(selected_ids) == {"top_a", "top_b", "top_c"}
+
+
+def test_controller_triggers_expansion_when_selection_underfills_topk() -> None:
+    from types import SimpleNamespace
+
+    def _row(item_id: str, *, total: float, relevance: float):
+        item = SimpleNamespace(
+            id=item_id,
+            source="github",
+            metadata={"bucket_hits": ["Frameworks"], "body_len": 1200, "topic_hard_match_pass": True},
+            body_md="agent orchestration runtime",
+        )
+        return SimpleNamespace(item=item, total_score=total, relevance_score=relevance)
+
+    rows = [
+        _row("p1", total=1.0, relevance=0.93),
+        _row("p2", total=0.95, relevance=0.92),
+        _row("p3", total=0.60, relevance=0.78),
+    ]
+    records = [
+        AuditRecord(
+            item_id=str(getattr(row.item, "id", "")),
+            title=str(getattr(row.item, "id", "")),
+            source="github",
+            rank=idx,
+            verdict="pass",
+            reasons=[],
+            used_evidence_urls=["https://docs.acme.dev/agent-runtime"],
+            evidence_domains=["docs.acme.dev"],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=3,
+            body_len=1200,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "pass", "reason_code": "ok", "human_reason": "ok"},
+        )
+        for idx, row in enumerate(rows, start=1)
+    ]
+    controller = SelectionController(requested_top_k=3, min_bucket_coverage=1, diversity_score_gap=0.12)
+    outcome = controller.evaluate(
+        ranked_rows=rows,
+        audit_records=records,
+        allow_downgrade_fill=False,
+        min_relevance_for_selection=0.55,
+    )
+    assert len(list(outcome.selected_rows or [])) == 2
+    decision = controller.expansion_decision(outcome=outcome)
+    assert decision.should_expand is True
+    assert any("selected_lt_3" in reason for reason in list(decision.reasons or []))

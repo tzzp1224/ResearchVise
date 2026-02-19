@@ -16,6 +16,12 @@ _MARKDOWN_NOISE = re.compile(r"^\s*[*#>\-|`]+\s*$")
 _URL_FRAGMENT = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s]+", re.IGNORECASE)
 _PATH_FRAGMENT = re.compile(r"^(?:[a-z0-9._-]+[\\/]){1,4}[a-z0-9._%-]+$", re.IGNORECASE)
 _STRUCTURE_GLYPH = re.compile(r"[│├┤┬┴┼└┘┌┐]")
+_NAVIGATION_HINT = re.compile(
+    r"\b(learn more|read more|full quickstart guide|quickstart guide|documentation|docs)\b",
+    re.IGNORECASE,
+)
+_SETUP_PREFIX = re.compile(r"^(get started|quickstart|installation|install)\b", re.IGNORECASE)
+_CODE_FRAGMENT = re.compile(r"(\{\s*\"|=>|::|^\s*(import|from|def)\b|\(\{)", re.IGNORECASE)
 _FACT_NOISE_PATTERNS = (
     re.compile(r"\bstars?\s*:\s*\d+", re.IGNORECASE),
     re.compile(r"\bforks?\s*:\s*\d+", re.IGNORECASE),
@@ -145,6 +151,8 @@ def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = _URL_FRAGMENT.sub(" ", value)
     value = re.sub(r"[*_`]{1,3}", " ", value)
     value = re.sub(r"\s*[-]{2,}\s*", " ", value)
+    value = re.sub(r"\s*→\s*", " ", value)
+    value = value.replace("##", " ")
     value = re.sub(r"\s+", " ", value).strip(" -:;,.")
     if re.search(
         r"\b(?:python\s+-m\s+venv|pip\s+install|npm\s+i|npm\s+install|activate)\b",
@@ -289,6 +297,10 @@ def _is_fact_noise(sentence: str) -> bool:
     lowered = text.lower()
     if lowered in {"---", "*", "-"}:
         return True
+    if _NAVIGATION_HINT.search(text) and "http" not in lowered and not _COMMAND_PATTERN.search(lowered):
+        return True
+    if "##" in text:
+        return True
     if any(pattern.search(text) for pattern in _FACT_NOISE_PATTERNS):
         return True
     return False
@@ -330,7 +342,11 @@ def _looks_like_low_context_clause(text: str) -> bool:
     if _STRUCTURE_GLYPH.search(value):
         return True
     lowered = value.lower()
+    if _CODE_FRAGMENT.search(value):
+        return True
     if re.search(r"\s[|/]\s", lowered) and not _has_verifiable_signal(value):
+        return True
+    if _NAVIGATION_HINT.search(value) and not _COMMAND_PATTERN.search(lowered):
         return True
     words = re.findall(r"[a-zA-Z0-9]+", lowered)
     if len(words) < 5 and not _COMMAND_PATTERN.search(lowered):
@@ -349,6 +365,26 @@ def _domain(url: str) -> str:
     parsed = urlparse(str(url or ""))
     host = str(parsed.netloc or "").strip().lower()
     return host or "source"
+
+
+def _proof_statement_from_url(url: str) -> str:
+    token = canonicalize_url(str(url or "").strip())
+    if not token:
+        return ""
+    parsed = urlparse(token)
+    host = str(parsed.netloc or "").strip().lower()
+    path = str(parsed.path or "").strip().lower()
+    if host.endswith("github.com") and "/releases/" in path:
+        return "GitHub release notes document concrete shipped changes and rollout checkpoints."
+    if host.endswith("github.com") and path.count("/") >= 2:
+        return "The source repository is public, with implementation details available for verification."
+    if "docs" in host or "/docs" in path or "/guide" in path:
+        return "Official documentation provides setup and runtime behavior details."
+    if host in {"arxiv.org", "openreview.net"}:
+        return "A research publication provides methodology and evaluation details."
+    if host == "news.ycombinator.com":
+        return "The Hacker News thread provides community review and operator feedback."
+    return ""
 
 
 def _platform_hint(platform: str) -> Dict[str, str]:
@@ -513,6 +549,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         cleaned = _clean_fact_point(sentence, max_len=150)
         if not cleaned or cleaned.lower().startswith(("we believe", "our vision", "the most")):
             continue
+        if _SETUP_PREFIX.search(cleaned) and _COMMAND_PATTERN.search(cleaned):
+            continue
         if not _has_verifiable_signal(cleaned):
             continue
         if not fallback_what:
@@ -534,6 +572,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         cleaned = _clean_fact_point(sentence, max_len=88)
         token = cleaned.lower()
         if not cleaned or token in seen:
+            continue
+        if _SETUP_PREFIX.search(cleaned) and _COMMAND_PATTERN.search(cleaned):
             continue
         if not _has_verifiable_signal(cleaned):
             continue
@@ -590,13 +630,30 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
             continue
         if _looks_like_low_context_clause(snippet):
             continue
-        if not _has_verifiable_signal(snippet):
+        statement = snippet if _has_verifiable_signal(snippet) else _proof_statement_from_url(citation_url)
+        cleaned_statement = _clean_fact_point(statement, max_len=120)
+        if not cleaned_statement or _is_fact_noise(cleaned_statement) or _looks_like_low_context_clause(cleaned_statement):
             continue
-        proof.append(snippet)
+        proof.append(cleaned_statement)
         proof_links.append(citation_url)
         used_pairs.add(pair)
         if len(proof) >= 2:
             break
+
+    if len(proof) < 2:
+        for url in links:
+            token = canonicalize_url(url)
+            pair = (_domain(token), str(urlparse(token).path or ""))
+            if not token or pair in used_pairs:
+                continue
+            statement = _clean_fact_point(_proof_statement_from_url(token), max_len=120)
+            if not statement:
+                continue
+            proof.append(statement)
+            proof_links.append(token)
+            used_pairs.add(pair)
+            if len(proof) >= 2:
+                break
 
     if len(proof) < 2 and metrics["publish_or_update_time"]:
         proof.append(f"Latest publish/update time: {metrics['publish_or_update_time']}.")
@@ -645,14 +702,22 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         else f"{item.title} has practical implementation details worth checking now."
     )
     cta = "Review the cited links, run quickstart commands, and validate before rollout."
+    cleaned_how = [_clean_fact_point(point, max_len=88) for point in how_it_works[:3]]
+    cleaned_how = [point for point in cleaned_how if point]
+    while len(cleaned_how) < 3:
+        cleaned_how.append("Quickstart includes reproducible setup and execution steps.")
+    cleaned_proof = [_clean_fact_point(point, max_len=120) for point in proof[:2]]
+    cleaned_proof = [point for point in cleaned_proof if point]
+    while len(cleaned_proof) < 2:
+        cleaned_proof.append("Evidence is limited; verify with release notes or docs before publishing.")
 
     return {
         "topic": topic_text or None,
         "hook": _clean_sentence(hook, max_len=170),
         "what_it_is": _clean_fact_point(what_it_is, max_len=150),
         "why_now": _clean_sentence(_why_now(item), max_len=190),
-        "how_it_works": [_clean_fact_point(point, max_len=88) for point in how_it_works[:3]],
-        "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],
+        "how_it_works": cleaned_how[:3],
+        "proof": cleaned_proof[:2],
         "proof_links": dedup_proof_links,
         "metrics": metrics,
         "links": unique_links[:4],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import html as html_lib
 import hashlib
 import re
 from typing import Any, Dict, List, Optional
@@ -58,6 +59,25 @@ def _compact_text(value: Any, max_len: int = 300) -> str:
     return text if len(text) <= max_len else text[: max_len - 3].rstrip() + "..."
 
 
+def _clean_snippet_text(value: str, *, max_len: int = 220) -> str:
+    text = html_lib.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", text)
+    text = re.sub(r"https?://[^\s)\]>]+", "", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"[*_`]", " ", text)
+    text = re.sub(r"\s*→\s*", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -:|")
+    lowered = text.lower()
+    if not text:
+        return ""
+    if any(token in lowered for token in ("href=", "target=", "style=")):
+        return ""
+    if re.match(r"^(learn more|full quickstart guide|quickstart guide|read more)\b", lowered):
+        return ""
+    return _compact_text(text, max_len=max_len)
+
+
 def _url_context_snippet(body: str, url: str, *, max_len: int = 220) -> str:
     raw_body = str(body or "")
     target = canonicalize_url(str(url or "").strip())
@@ -75,9 +95,7 @@ def _url_context_snippet(body: str, url: str, *, max_len: int = 220) -> str:
             continue
         if not any(token and token in lowered for token in url_variants):
             continue
-        snippet = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", lowered)
-        snippet = re.sub(r"https?://[^\s)\]>]+", "", snippet)
-        snippet = re.sub(r"\s+", " ", snippet).strip(" -:|")
+        snippet = _clean_snippet_text(lowered, max_len=max_len)
         if len(snippet) >= 18:
             return _compact_text(snippet, max_len=max_len)
     return ""
@@ -88,9 +106,10 @@ def _fallback_url_snippet(clean_text: str, url: str, *, max_len: int = 220) -> s
     if not text:
         return ""
     chunks = [re.sub(r"\s+", " ", token).strip() for token in re.split(r"[.!?;\n]+", text)]
-    candidates = [token for token in chunks if len(token) >= 24]
+    candidates = [_clean_snippet_text(token, max_len=max_len) for token in chunks]
+    candidates = [token for token in candidates if len(token) >= 24]
     if not candidates:
-        return _compact_text(text, max_len=max_len)
+        return _clean_snippet_text(text, max_len=max_len)
     seed = int(hashlib.sha1(str(url or "").encode("utf-8")).hexdigest()[:8], 16)
     return _compact_text(candidates[seed % len(candidates)], max_len=max_len)
 

@@ -437,6 +437,16 @@ class EvidenceAuditor:
         cross_source_corroborated = bool(metadata.get("cross_source_corroborated")) or cross_source_count >= 2
         min_body_len = _source_min_body_len(item.source)
         evidence_links_quality = int(float(signals.get("evidence_links_quality", 0) or 0))
+        if source_key == "hackernews":
+            hn_points_seed = int(float(metadata.get("points", 0) or 0))
+            hn_comments_seed = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
+            if hn_points_seed >= max(40, self._hn_min_points * 8) or hn_comments_seed >= max(16, self._hn_min_comments * 8):
+                evidence_links_quality = max(1, evidence_links_quality)
+        effective_min_evidence = int(self._min_evidence_links_quality)
+        if source_key == "hackernews":
+            effective_min_evidence = 1
+        elif source_key == "huggingface" and self._is_agent_topic():
+            effective_min_evidence = max(1, int(self._min_evidence_links_quality) - 1)
         publish_or_update_time = str(signals.get("publish_or_update_time") or metadata.get("publish_or_update_time") or "").strip()
         age_hours = _item_age_hours(item, publish_or_update_time=publish_or_update_time)
         duplicate_ratio = _citation_duplicate_ratio(item)
@@ -478,7 +488,7 @@ class EvidenceAuditor:
                 reason=f"body_len_lt_min:{body_len}<{min_body_len}",
             )
 
-        if evidence_links_quality < self._min_evidence_links_quality:
+        if evidence_links_quality < effective_min_evidence:
             if evidence_links_quality <= 0:
                 target = VERDICT_REJECT
             else:
@@ -487,12 +497,12 @@ class EvidenceAuditor:
                 verdict=verdict,
                 reasons=reasons,
                 target=target,
-                reason=f"evidence_links_quality_lt_min:{evidence_links_quality}<{self._min_evidence_links_quality}",
+                reason=f"evidence_links_quality_lt_min:{evidence_links_quality}<{effective_min_evidence}",
             )
 
         if duplicate_ratio > self._duplicate_ratio_threshold:
             duplicate_target = VERDICT_REJECT
-            if len(domains) >= 2 and evidence_links_quality >= self._min_evidence_links_quality:
+            if len(domains) >= 2 and evidence_links_quality >= effective_min_evidence:
                 duplicate_target = VERDICT_DOWNGRADE
             verdict = self._apply_rule(
                 verdict=verdict,
@@ -506,7 +516,7 @@ class EvidenceAuditor:
                 source_key == "huggingface"
                 and bool(metadata.get("deep_fetch_applied"))
                 and body_len >= min_body_len
-                and evidence_links_quality >= max(1, self._min_evidence_links_quality - 1)
+                and evidence_links_quality >= max(1, effective_min_evidence - 1)
             )
             if not hf_acceptable_missing_time:
                 verdict = self._apply_rule(
@@ -526,7 +536,7 @@ class EvidenceAuditor:
                 reason="marketing_declaration_without_verifiable_points",
             )
 
-        if _repo_self_only(urls):
+        if source_key != "hackernews" and _repo_self_only(urls):
             verdict = self._apply_rule(
                 verdict=verdict,
                 reasons=reasons,
@@ -544,12 +554,17 @@ class EvidenceAuditor:
             points = int(float(metadata.get("points", 0) or 0))
             comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
             low_engagement = points < self._hn_min_points and comments < self._hn_min_comments
+            high_discussion = bool(
+                points >= max(40, self._hn_min_points * 8)
+                or comments >= max(16, self._hn_min_comments * 8)
+            )
             has_external_high_trust = bool(
                 _has_high_trust_technical_evidence(urls)
                 and any(str(domain).strip().lower() != "news.ycombinator.com" for domain in list(domains or []))
             )
             has_strong_signal = bool(
                 (has_multi_domain_evidence and (has_quickstart or has_results or evidence_links_quality >= 3))
+                or high_discussion
                 or cross_source_corroborated
             )
             if low_engagement and not has_strong_signal:
@@ -569,6 +584,19 @@ class EvidenceAuditor:
                         target=VERDICT_REJECT,
                         reason=f"hn_low_engagement:{points}/{comments}",
                     )
+            if (
+                verdict == VERDICT_PASS
+                and evidence_links_quality < self._min_evidence_links_quality
+                and not high_discussion
+                and not has_external_high_trust
+                and not cross_source_corroborated
+            ):
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_DOWNGRADE,
+                    reason=f"hn_evidence_single_link_weak:{evidence_links_quality}",
+                )
 
         if source_key == "github":
             stars = int(float(metadata.get("stars", 0) or 0))

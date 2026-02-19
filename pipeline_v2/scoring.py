@@ -451,6 +451,8 @@ def rank_items(
         ]
         agent_score_cap = str(relevance_payload.get("agent_score_cap") or "").strip()
         cross_source_bonus = max(0.0, min(0.08, _to_float((item.metadata or {}).get("cross_source_bonus"), 0.0)))
+        repeat_penalty = max(0.0, min(0.16, _to_float((item.metadata or {}).get("recent_topic_repeat_penalty"), 0.0)))
+        repeat_count = int(max(0.0, _to_float((item.metadata or {}).get("recent_topic_pick_count"), 0.0)))
         corroboration_sources = [
             str(value).strip()
             for value in list((item.metadata or {}).get("cross_source_corroboration_sources") or [])
@@ -488,6 +490,8 @@ def rank_items(
             total = _clamp01(total + quality_boost)
         if cross_source_bonus > 0:
             total = _clamp01(total + cross_source_bonus)
+        if repeat_penalty > 0:
+            total = _clamp01(total - repeat_penalty)
 
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
@@ -517,6 +521,8 @@ def rank_items(
                 agent_high_value_hits,
                 agent_score_cap,
                 cross_source_bonus,
+                repeat_penalty,
+                repeat_count,
                 corroboration_sources,
             )
         )
@@ -550,6 +556,8 @@ def rank_items(
             _agent_high_value_hits,
             _agent_score_cap,
             _cross_source_bonus,
+            _repeat_penalty,
+            _repeat_count,
             _corroboration_sources,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
@@ -586,6 +594,8 @@ def rank_items(
         agent_high_value_hits,
         agent_score_cap,
         cross_source_bonus,
+        repeat_penalty,
+        repeat_count,
         corroboration_sources,
     ) in enumerate(ordered, start=1):
         reasons = [
@@ -619,6 +629,9 @@ def rank_items(
             reasons.append(f"cross_source.corroboration_bonus={cross_source_bonus:.2f}")
             if corroboration_sources:
                 reasons.append(f"cross_source.sources={','.join(corroboration_sources)}")
+        if repeat_penalty > 0:
+            reasons.append(f"penalty.recent_topic_repeat={repeat_penalty:.2f}")
+            reasons.append(f"recent_topic.pick_count={repeat_count}")
         signals = _quality_signals(item)
         reasons.extend(
             [

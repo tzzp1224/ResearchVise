@@ -1,6 +1,51 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Live Quality Stabilization v2 (Source Unlock + Facts Cleanup + Repeat Suppression) (New)
+- 本次目标：
+  - 解决 live 下长期“GitHub 单源占满 + 固定项目反复入选 + facts/script 仍有导航碎句”的组合退化。
+  - 一次性补齐控制闭环：召回后通过 source-aware 审计放行真实高讨论 HN、清理 citation/facts 噪声、并对最近重复入选项目施加可解释惩罚。
+- 根因审计（对应 `run_20260219_113848_b834cf6a`）：
+  - `EvidenceAuditor` 使用统一 `min_evidence_links_quality=2`，HN 常见单链接讨论帖被系统性降级/拒绝，`pass` 池几乎只剩 GitHub。
+  - facts/proof 仍吃到 README 导航句（`Learn more... / Full Quickstart Guide ->`）与 HTML 锚点碎片，导致 onepager/script 可读性差。
+  - 排序缺少“近期重复入选惩罚”，导致同一强势仓库在短时间窗口内持续霸榜，内容新鲜度下降。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - 引入 source-aware 最小证据阈值：HN 默认 `min=1`（保留高讨论帖），HF(agent 主题)适度放宽。
+    - 新增 HN 讨论强度判定：高 points/comments 的单链接帖子可 pass；低互动仍 reject/downgrade。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`
+    - source diversification 阶段增加受控分数松弛（仅 source 补齐时生效），避免“只因分差 0.00x 永远单源”。
+    - 新增 `selected_lt_top_k` 与 `top_picks_min_relevance` 扩检触发条件，防止“pass 数够但入选条数不够/相关性偏低”时提前停止。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - 新增 recent-topic repeat 统计（读取近期同 topic live run），为候选注入 `recent_topic_pick_count/recent_topic_repeat_penalty` 元数据。
+    - diagnosis `candidate_rows` 增加重复入选字段，增强可观测性。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - 排序总分接入 `recent_topic_repeat_penalty`，并在 reasons 中落盘 `penalty.recent_topic_repeat`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`
+    - citation snippet 统一清洗 HTML/锚点属性/导航词，防止 `<a href=...>` 与“Learn more”碎片进入成品。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`
+    - facts/proof 增加导航句过滤与 URL->可验证陈述回退，减少口号/导航句进入 WHAT/HOW/PROOF。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`
+    - onepager 的 `#### Citations` 优先消费 audit 证据 URL，避免与审计口径漂移和 HTML 噪声回流。
+- 测试更新：
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_normalize.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_script_storyboard_prompt.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_report_export_notification.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 验收点：
+    - onepager `#### Citations` 不再出现 `<a href=...>` 残片；
+    - HN 强讨论帖不再被统一证据阈值误杀；
+    - diagnosis 可见 `recent_topic_pick_count/recent_topic_repeat_penalty`，重复项目得分被压制；
+    - facts `how_it_works/proof` 不再包含 `Learn more...` 导航句或代码碎片（如 `invoke({...})`）。
+- 风险与回滚：
+  - 风险：重复惩罚会降低超强项目短周期重复曝光，可能让 Top3 波动增大（这是内容去同质化的预期行为）。
+  - 风险：HN 放宽后需要依赖互动强度与后续审计，低质量帖可能以 downgrade 进入候选池但不会破坏 pass-first。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Low-Traction GitHub Gate Tightening (Benchmark Keyword False-Positive Fix) (New)
 - 本次目标：
   - 修复低 star/fork 仓库仅凭 README 关键词（`benchmark`/`quickstart`）被误判为高信号并通过审计的问题。

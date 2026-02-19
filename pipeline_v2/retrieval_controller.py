@@ -17,6 +17,7 @@ class AttemptOutcome:
     reject_count: int
     pass_ratio: float
     top_picks_min_evidence_quality: float
+    top_picks_min_relevance: float
     bucket_coverage: int
     source_coverage: int
     used_downgrade: bool
@@ -34,12 +35,15 @@ class ExpansionDecision:
 class SelectionController:
     """Select top picks from audit output and decide expansion triggers."""
 
+    _SOURCE_DIVERSITY_EXTRA_GAP = 0.05
+
     def __init__(
         self,
         *,
         requested_top_k: int,
         min_pass_ratio: float = 0.3,
         min_evidence_quality: float = 2.0,
+        min_top_relevance: float = 0.75,
         min_bucket_coverage: int = 2,
         min_source_coverage: int = 2,
         diversity_score_gap: float = 0.12,
@@ -49,6 +53,7 @@ class SelectionController:
         self._requested_top_k = max(1, int(requested_top_k))
         self._min_pass_ratio = max(0.0, min(1.0, float(min_pass_ratio)))
         self._min_evidence_quality = float(max(0.0, min_evidence_quality))
+        self._min_top_relevance = max(0.0, min(1.0, float(min_top_relevance)))
         self._min_bucket_coverage = max(1, int(min_bucket_coverage))
         self._min_source_coverage = max(1, int(min_source_coverage))
         self._diversity_score_gap = max(0.0, min(0.5, float(diversity_score_gap)))
@@ -113,6 +118,26 @@ class SelectionController:
             return value
         return SelectionController._relevance(row)
 
+    @staticmethod
+    def _score_baseline(
+        rows: Sequence[Any],
+        *,
+        target_count: int,
+        preselected: Sequence[Any] | None = None,
+    ) -> float:
+        scores = [
+            SelectionController._total_score(row)
+            for row in list(rows or []) + list(preselected or [])
+            if row is not None
+        ]
+        if not scores:
+            return 0.0
+        ordered = sorted(scores, reverse=True)
+        top_score = float(ordered[0])
+        ref_idx = min(max(0, int(target_count) - 1), len(ordered) - 1)
+        ref_score = float(ordered[ref_idx])
+        return max(ref_score, top_score - 0.18)
+
     def _is_selection_eligible(self, row: Any, *, min_relevance: float) -> bool:
         if self._relevance(row) <= 0.0:
             return False
@@ -135,9 +160,10 @@ class SelectionController:
         selected_ids = {self._item_id(row) for row in selected if self._item_id(row)}
         used_sources = {self._item_source(row) for row in selected if self._item_source(row)}
         used_buckets = {bucket for row in selected for bucket in self._item_buckets(row)}
-        score_baseline = max(
-            [self._total_score(row) for row in list(rows or []) + list(preselected or [])],
-            default=0.0,
+        score_baseline = self._score_baseline(
+            rows,
+            target_count=target_count,
+            preselected=preselected,
         )
 
         def _add(row: Any) -> None:
@@ -178,7 +204,8 @@ class SelectionController:
             source = self._item_source(row)
             if source and source in used_sources:
                 continue
-            if selected and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
+            source_gap = float(self._diversity_score_gap + self._SOURCE_DIVERSITY_EXTRA_GAP)
+            if selected and self._total_score(row) + 1e-9 < float(score_baseline - source_gap):
                 continue
             _add(row)
 
@@ -207,9 +234,10 @@ class SelectionController:
         used_sources = {self._item_source(row) for row in picks if self._item_source(row)}
         used_buckets = {bucket for row in picks for bucket in self._item_buckets(row)}
         base_count = len(picks)
-        score_baseline = max(
-            [self._total_score(row) for row in list(selected or []) + list(downgrade_rows or [])],
-            default=0.0,
+        score_baseline = self._score_baseline(
+            downgrade_rows,
+            target_count=target_count,
+            preselected=picks,
         )
 
         def _add(row: Any) -> None:
@@ -234,7 +262,8 @@ class SelectionController:
                 continue
             source = self._item_source(row)
             if source and source not in used_sources:
-                if picks and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
+                source_gap = float(self._diversity_score_gap + self._SOURCE_DIVERSITY_EXTRA_GAP)
+                if picks and self._total_score(row) + 1e-9 < float(score_baseline - source_gap):
                     continue
                 _add(row)
                 if len([token for token in used_sources if token]) >= int(self._min_source_coverage):
@@ -303,6 +332,7 @@ class SelectionController:
         selected_verdicts: Dict[str, str] = {}
         selected_downgrade_reasons: Dict[str, List[str]] = {}
         evidence_qualities: List[float] = []
+        selected_relevance: List[float] = []
         selected_buckets = set()
         selected_sources = set()
         all_selected_downgrade = bool(selected)
@@ -312,6 +342,7 @@ class SelectionController:
             record = records_by_id.get(item_id)
             verdict = str(getattr(record, "verdict", "reject") or "reject").strip().lower()
             selected_verdicts[item_id] = verdict
+            selected_relevance.append(self._relevance(row))
             if verdict != "downgrade":
                 all_selected_downgrade = False
             if verdict == "downgrade":
@@ -342,6 +373,7 @@ class SelectionController:
         candidate_count = len(eligible_rows)
         pass_ratio = float(pass_count) / float(max(1, candidate_count))
         min_evidence_quality = min(evidence_qualities) if evidence_qualities else 0.0
+        min_relevance = min(selected_relevance) if selected_relevance else 0.0
         downgrade_cap_reached = bool(
             allow_downgrade_fill
             and len(selected) < self._requested_top_k
@@ -358,6 +390,7 @@ class SelectionController:
             reject_count=reject_count,
             pass_ratio=pass_ratio,
             top_picks_min_evidence_quality=float(min_evidence_quality),
+            top_picks_min_relevance=float(min_relevance),
             bucket_coverage=int(len([bucket for bucket in selected_buckets if bucket])),
             source_coverage=int(len([source for source in selected_sources if source])),
             used_downgrade=bool(used_downgrade),
@@ -368,11 +401,15 @@ class SelectionController:
 
     def expansion_decision(self, *, outcome: AttemptOutcome) -> ExpansionDecision:
         reasons: List[str] = []
+        if len(list(outcome.selected_rows or [])) < int(self._requested_top_k):
+            reasons.append(f"selected_lt_{self._requested_top_k}")
 
         if int(outcome.pass_count) < int(self._requested_top_k):
             reasons.append(f"pass_count_lt_{self._requested_top_k}")
         if float(outcome.pass_ratio) < float(self._min_pass_ratio):
             reasons.append(f"pass_ratio_lt_{self._min_pass_ratio:.2f}")
+        if float(outcome.top_picks_min_relevance) < float(self._min_top_relevance):
+            reasons.append(f"top_picks_min_relevance_lt_{self._min_top_relevance:.2f}")
         if float(outcome.top_picks_min_evidence_quality) < float(self._min_evidence_quality):
             reasons.append(f"top_picks_min_evidence_quality_lt_{self._min_evidence_quality:.1f}")
         if int(outcome.bucket_coverage) < int(self._min_bucket_coverage):
@@ -380,6 +417,7 @@ class SelectionController:
         quality_core_satisfied = bool(
             int(outcome.pass_count) >= int(self._requested_top_k)
             and float(outcome.pass_ratio) >= float(self._min_pass_ratio)
+            and float(outcome.top_picks_min_relevance) >= float(self._min_top_relevance)
             and float(outcome.top_picks_min_evidence_quality) >= float(self._min_evidence_quality)
             and int(outcome.bucket_coverage) >= int(self._min_bucket_coverage)
         )

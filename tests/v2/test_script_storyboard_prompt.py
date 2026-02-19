@@ -260,3 +260,39 @@ def test_build_facts_filters_low_context_flowchart_fragments() -> None:
         text = str(sentence).strip()
         assert text
         assert text.endswith((".", "!", "?", "。", "！", "？"))
+
+
+def test_build_facts_filters_navigation_link_sentences() -> None:
+    item = _sample_item()
+    body = (
+        "## How it works\n"
+        "Learn more about MCP Orchestrator →\n"
+        "Full Quickstart Guide →\n"
+        "The runtime routes tools through deterministic orchestration checkpoints.\n"
+        "Quickstart includes pip install and reproducible run commands.\n"
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    merged = " ".join(
+        [str(facts.get("what_it_is") or "")]
+        + [str(v) for v in list(facts.get("how_it_works") or [])]
+        + [str(v) for v in list(facts.get("proof") or [])]
+    ).lower()
+    assert "learn more about" not in merged
+    assert "full quickstart guide" not in merged
+
+
+def test_build_facts_filters_code_like_fragments_from_how() -> None:
+    item = _sample_item()
+    body = (
+        "## Usage\n"
+        "invoke({\"text\": \"\"})) # {'text': 'ab'}\n"
+        "The runtime executes deterministic orchestration checkpoints with rollback safety.\n"
+        "Tool-calling routes are validated before execution.\n"
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    merged = " ".join([str(v) for v in list(facts.get("how_it_works") or [])]).lower()
+    assert "invoke({\"text\"" not in merged

@@ -169,10 +169,44 @@ def _fact_bullets(item: NormalizedItem) -> List[str]:
     return normalized
 
 
-def _citation_bullets(item: NormalizedItem) -> List[str]:
+def _citation_label_from_url(url: str) -> str:
+    token = canonicalize_url(str(url or "").strip())
+    parsed = urlparse(token)
+    host = str(parsed.netloc or "").strip().lower()
+    path = str(parsed.path or "").strip().lower()
+    if host.endswith("github.com") and "/releases/" in path:
+        return "GitHub release notes"
+    if host.endswith("github.com") and path.count("/") >= 2:
+        return "GitHub source repository"
+    if "docs" in host or "/docs" in path:
+        return "Official documentation"
+    if host in {"news.ycombinator.com"}:
+        return "Hacker News discussion"
+    if host in {"arxiv.org", "openreview.net"}:
+        return "Research publication"
+    if host:
+        return f"Source: {host}"
+    return "Evidence link"
+
+
+def _citation_bullets(item: NormalizedItem, *, audit_urls_by_item: dict[str, list[str]] | None = None) -> List[str]:
+    audit_map = dict(audit_urls_by_item or {})
+    audit_urls = [canonicalize_url(str(url or "").strip()) for url in list(audit_map.get(str(item.id), []) or [])]
+    audit_urls = [url for url in audit_urls if url and is_allowed_citation_url(url)]
+    if audit_urls:
+        lines: List[str] = []
+        for url in audit_urls[:2]:
+            lines.append(f"{_citation_label_from_url(url)} ({url})")
+        return lines
+
     lines: List[str] = []
     for citation in list(item.citations or [])[:6]:
         snippet = _compact_text(citation.snippet or citation.title or "", max_len=160)
+        snippet = re.sub(r"<[^>]+>", " ", snippet)
+        snippet = re.sub(r"\s*→\s*", " ", snippet)
+        snippet = re.sub(r"\s+", " ", snippet).strip(" -:|")
+        if any(token in snippet.lower() for token in ("href=", "target=", "style=")):
+            snippet = ""
         url = canonicalize_url(str(citation.url or "").strip())
         if url and not is_allowed_citation_url(url):
             continue
@@ -448,7 +482,7 @@ def generate_onepager(
         credibility = str((item.metadata or {}).get("credibility") or "unknown")
         metrics = _quality_metrics(item)
         fact_bullets = _fact_bullets(item)
-        citation_bullets = _citation_bullets(item)
+        citation_bullets = _citation_bullets(item, audit_urls_by_item=top_evidence_urls)
         relevance_value = _relevance(payload)
         verdict = top_verdicts.get(str(item.id), "")
         downgrade_reasons = [str(reason).strip() for reason in list(top_reasons.get(str(item.id)) or []) if str(reason).strip()]

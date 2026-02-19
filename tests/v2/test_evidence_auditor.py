@@ -164,6 +164,35 @@ def test_evidence_auditor_downgrades_recent_low_engagement_hn_with_external_evid
     assert any("hn_low_engagement_recent" in reason for reason in list(record.reasons or []))
 
 
+def test_evidence_auditor_allows_high_discussion_hn_with_single_evidence_link() -> None:
+    row = _row(
+        "hn_high_discussion",
+        source="hackernews",
+        body=("agent orchestration lessons and failure reports " * 80).strip(),
+        citations=[
+            Citation(
+                title="hn",
+                url="https://news.ycombinator.com/item?id=4242",
+                snippet="operator review thread",
+                source="hn",
+            ),
+        ],
+        metadata={
+            "body_len": 900,
+            "points": 220,
+            "comment_count": 48,
+            "quality_signals": {"evidence_links_quality": 0, "publish_or_update_time": "2026-02-19T10:00:00Z"},
+            "topic_hard_match_pass": True,
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == "pass"
+    assert (record.machine_action or {}).get("reason_code") == "ok"
+    assert all("single_domain_repo_self_evidence" not in reason for reason in list(record.reasons or []))
+
+
 def test_evidence_auditor_rejects_zero_body_and_hard_gate_fail() -> None:
     row = _row(
         "bad_core",
