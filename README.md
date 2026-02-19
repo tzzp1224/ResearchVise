@@ -1,6 +1,26 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Low-Traction GitHub Gate Tightening (Benchmark Keyword False-Positive Fix) (New)
+- 本次目标：
+  - 修复低 star/fork 仓库仅凭 README 关键词（`benchmark`/`quickstart`）被误判为高信号并通过审计的问题。
+  - 明确把“可验证 benchmark 证据”与“文本关键词”区分开，避免 `OpenBrowser-AI` 类条目再次高位入选。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - GitHub traction 规则中，`has_results_or_bench` 不再直接作为强信号；新增 `has_benchmark_evidence`（基于证据 URL 路径/域名）判定。
+    - 证据判定排除 `item.url` 和仓库 root URL，避免 repo 名称/路径里的 `benchmark` 词误触发。
+    - 对低 traction（低 stars/forks、无 release、无外部讨论、无跨源佐证）条目直接 downgrade/reject（`github_low_signal_repo`）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+    - 新增回归：仅有 `benchmark` 关键词但无可验证 benchmark 证据的低 traction 仓库必须 downgrade/reject。
+- 如何验证：
+  - `pytest -q tests/v2/test_evidence_auditor.py`
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 预期：`OpenBrowser-AI` 在 `evidence_audit.json` 中为 `reject`，`reason_code=github_low_signal_repo`。
+- 风险与回滚：
+  - 风险：对刚发布、尚未形成外部信号的真实新项目更严格，短期可能增加 `<top_k` 概率。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Selector Quality Hardening + Low-Traction Guard + Facts Fragment Filter (New)
 - 本次目标：
   - 修复 `AI agent` live 结果中“中等/低质仓库被多样性策略抬升”的结构性问题，避免类似 `OpenBrowser-AI` 这类低 traction 条目高位入选。

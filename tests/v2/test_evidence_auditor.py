@@ -274,4 +274,37 @@ def test_evidence_auditor_downgrades_low_traction_github_repo_even_with_quicksta
     auditor = EvidenceAuditor(topic="AI agent")
     record = auditor.audit_row(row, rank=1)
     assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
-    assert any("github_traction_weak" in reason for reason in list(record.reasons or []))
+    assert any(
+        ("github_traction_weak" in reason) or ("github_low_signal_repo" in reason)
+        for reason in list(record.reasons or [])
+    )
+
+
+def test_evidence_auditor_does_not_treat_keyword_benchmark_as_real_traction_signal() -> None:
+    row = _row(
+        "gh_fake_benchmark",
+        source="github",
+        body=("agent benchmark orchestration quickstart " * 80).strip(),
+        citations=[
+            Citation(title="repo", url="https://github.com/acme/agent-demo", snippet="repo", source="github"),
+            Citation(title="docs", url="https://docs.agent-demo.dev/guide", snippet="docs", source="docs"),
+        ],
+        metadata={
+            "body_len": 1500,
+            "stars": 5,
+            "forks": 1,
+            "topic_hard_match_pass": True,
+            "quality_signals": {
+                "evidence_links_quality": 3,
+                "publish_or_update_time": "2026-02-19T10:00:00Z",
+                "has_quickstart": True,
+                "has_results_or_bench": True,
+            },
+            "evidence_links": ["https://github.com/acme/agent-demo", "https://docs.agent-demo.dev/guide"],
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
+    assert any("github_low_signal_repo" in reason for reason in list(record.reasons or []))

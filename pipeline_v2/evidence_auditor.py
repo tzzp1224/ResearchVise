@@ -573,14 +573,47 @@ class EvidenceAuditor:
         if source_key == "github":
             stars = int(float(metadata.get("stars", 0) or 0))
             forks = int(float(metadata.get("forks", 0) or 0))
-            has_benchmark = bool(has_results)
+            canonical_item_url = canonicalize_url(str(item.url or "").strip())
+            parsed_item = urlparse(canonical_item_url) if canonical_item_url else None
+            repo_root_path = ""
+            if parsed_item and str(parsed_item.netloc or "").strip().lower().endswith("github.com"):
+                parts = [part for part in str(parsed_item.path or "").split("/") if part]
+                if len(parts) >= 2:
+                    repo_root_path = f"/{parts[0].lower()}/{parts[1].lower()}"
+            benchmark_evidence_paths: List[str] = []
+            benchmark_evidence_domains: List[str] = []
+            for url in list(urls or []):
+                token = canonicalize_url(str(url or "").strip())
+                if not token or token == canonical_item_url:
+                    continue
+                parsed = urlparse(token)
+                host = str(parsed.netloc or "").strip().lower()
+                path = str(parsed.path or "").strip().lower()
+                if repo_root_path and host.endswith("github.com") and (path == repo_root_path or path == f"{repo_root_path}/"):
+                    continue
+                benchmark_evidence_paths.append(path)
+                benchmark_evidence_domains.append(host)
+            has_benchmark_evidence = any(
+                token in path for path in benchmark_evidence_paths for token in ("bench", "eval", "leaderboard", "result")
+            ) or any(
+                domain in {"arxiv.org", "openreview.net", "paperswithcode.com"}
+                for domain in benchmark_evidence_domains
+            )
+            has_benchmark = bool(has_results and has_benchmark_evidence)
             has_external_discussion = any(
                 domain in {"news.ycombinator.com", "reddit.com", "www.reddit.com", "lobste.rs"}
                 for domain in list(domains or [])
             )
             traction_emerging = bool(stars >= 15 or forks >= 3)
             traction_strong = bool(stars >= 50 or forks >= 10)
-            if stars < 30 and forks < 5 and not has_release_note and not has_benchmark and not has_quickstart:
+            if (
+                stars < 30
+                and forks < 5
+                and not has_release_note
+                and not has_benchmark
+                and not cross_source_corroborated
+                and not has_external_discussion
+            ):
                 target = VERDICT_REJECT if stars < 10 and forks < 2 else VERDICT_DOWNGRADE
                 verdict = self._apply_rule(
                     verdict=verdict,
