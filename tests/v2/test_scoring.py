@@ -12,6 +12,7 @@ from pipeline_v2.scoring import (
     score_talkability,
     score_visual_assets,
 )
+from pipeline_v2.topic_intent import TopicIntent
 
 
 def _item(
@@ -351,3 +352,76 @@ def test_generic_agent_evaluation_terms_fail_hard_gate_and_cannot_reach_one() ->
     payload = evaluate_relevance(item, "AI agent")
     assert payload["hard_pass"] is False
     assert float(payload["score"]) < 1.0
+
+
+def test_hot_new_agent_trend_signal_beats_large_framework_body_size_proxy() -> None:
+    intent = TopicIntent.for_request(topic="AI agent", time_window="7d")
+    assert intent is not None
+
+    framework = _item(
+        "infra_langchain",
+        tier="A",
+        source="github",
+        title="langchain-ai/langchain",
+        metadata={
+            "credibility": "high",
+            "stars": 120000,
+            "forks": 32000,
+            "citation_count": 3,
+            "created_at": "2022-10-17T00:00:00Z",
+            "updated_at": "2026-02-18T00:00:00Z",
+            "quality_signals": {
+                "content_density": 0.32,
+                "has_quickstart": True,
+                "has_results_or_bench": True,
+                "evidence_links_quality": 3,
+                "update_recency_days": 1.0,
+            },
+        },
+    )
+    framework.body_md = (
+        "AI agent framework SDK and orchestration library updates. "
+        "Framework notes cover maintenance changes and migration details."
+    )
+
+    hot_agent = _item(
+        "hot_agent_demo",
+        tier="A",
+        source="github",
+        title="acme/mcp-agent-demo",
+        metadata={
+            "credibility": "high",
+            "stars": 240,
+            "forks": 30,
+            "citation_count": 3,
+            "created_at": "2026-02-10T00:00:00Z",
+            "updated_at": "2026-02-18T10:00:00Z",
+            "release_published_at": "2026-02-17T09:00:00Z",
+            "cross_source_corroboration_count": 3,
+            "search_rank": 1,
+            "search_pool_size": 30,
+            "quality_signals": {
+                "content_density": 0.34,
+                "has_quickstart": True,
+                "has_results_or_bench": True,
+                "evidence_links_quality": 3,
+                "update_recency_days": 1.0,
+            },
+        },
+    )
+    hot_agent.body_md = (
+        "MCP agent app demo with tool calling workflow. "
+        "Quickstart and benchmark included, plus release notes and community discussion."
+    )
+
+    ranked = rank_items(
+        [framework, hot_agent],
+        topic="AI agent",
+        topic_intent=intent,
+        relevance_threshold=0.55,
+        recall_window="7d",
+    )
+    assert ranked[0].item.id == "hot_agent_demo"
+    top_reasons = list(ranked[0].reasons or [])
+    assert any("trend.signal=" in reason for reason in top_reasons)
+    assert any("intent.hot_candidate=true" in reason for reason in top_reasons)

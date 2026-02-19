@@ -1,6 +1,53 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Hot-New-Agents Intent Calibration (Top Picks vs Infra Watchlist) (New)
+- 本次目标：
+  - 修复 `AI agent 7d` 场景下 Top Picks 被长期基础框架（langchain/langgraph 等）挤占的问题，回归“新且爆的 agent 项目”定位。
+  - 明确将基础框架更新沉淀到 `Infra Watchlist`，不再默认占据 Top3。
+- 策略变化：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/topic_intent.py`
+    - 引入 `TopicIntent`（`hot_new_agents`）与双桶策略：`top_pick_bucket` / `infra_watchlist` / `background_reading`。
+    - AI agent + `window_days>=7` 下默认启用 infra exclusion：
+      - `langchain/langgraph/autogen/crewai/llamaindex`（repo/org+关键词）默认不进 Top Picks。
+      - 仅允许 `infra_exception_event=true` 的突发事件级条目例外进入（并在 reasons 标记）。
+    - 新增 window-aware 趋势信号：`created_at_recency/release_recency/commit_recency/discussion_signal/search_rank_proxy`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - 7d `hot_new_agents` 模式下，排序目标切换为 `relevance(hard) + trend_signal + evidence_alignment`，弱化“大项目体量”优势。
+    - reasons 增加 intent/trend 可解释输出（`trend.signal`、`intent.bucket`、`infra_exception_event` 等）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - Top pick 选择前应用 intent 过滤（infra/handbook 不进入 top picks）。
+    - 构建并落盘 `infra_watchlist/background_reading`、`infra_filtered_count/watchlist_count`。
+    - shortage rescue 在 hot mode 下不回捞非 exception infra，避免兜底反向污染 Top Picks。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`
+    - onepager 结构校准为：
+      - `Top Picks: Hot New Agents (Top3)`
+      - `Why trending`
+      - `Infra Watchlist (optional)`
+      - `Background Reading (optional)`
+    - header 明示 `Intent/IntentMode/InfraFilteredCount/WatchlistCount`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`
+    - 新增门禁：
+      - `top_picks_not_infra_dominant`（ai_agent+7d 下 top3 infra 默认 `0`，最多允许 `1` 个 exception）
+      - `onepager_has_hot_new_agents_section`
+- 默认阈值（关键）：
+  - `hot_new_agents` 激活条件：`topic` 命中 `agent` 且 `window_days>=7`。
+  - infra top-pick 默认上限：`0`；exception 上限：`1`。
+  - `min_hot_trend_score=0.36`；`infra_watchlist_max=3`；`background_max=3`。
+- 测试更新：
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_report_export_notification.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_validate_artifacts_v2.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window 7d --tz Asia/Singapore --targets web --top-k 3`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 风险与回滚：
+  - 风险：严格定位后，弱信号时段更容易触发 `<top_k`（会在 `Why not more?` 和 diagnosis 解释）。
+  - 风险：基础框架被系统性移出 Top Picks，短期可能与“传统 star 导向排序”直觉不同。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Timeout-Resilient Retrieval + Relevance/Evidence Hardening (New)
 - 本次目标：
   - 修复 live `--time_window 7d --topic "AI agent"` 下“topic 检索超时导致召回塌陷、但该 attempt 仍被选中”的核心缺陷。

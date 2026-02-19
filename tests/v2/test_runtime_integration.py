@@ -529,6 +529,178 @@ def _timeout_then_recover_connectors() -> dict:
     }
 
 
+def _hot_new_agents_vs_infra_connectors() -> dict:
+    infra_body = (
+        "AI agent framework SDK orchestration library update log and migration notes. "
+        "Framework maintenance focused update."
+    ) * 12
+    hot_github_body = (
+        "MCP agent app demo with tool calling workflow and vertical-agent use case. "
+        "Quickstart and benchmark are included."
+    ) * 16
+    hot_hf_body = (
+        "Agent demo space with runtime orchestration and tool routing. "
+        "Includes quickstart and live workflow examples."
+    ) * 14
+    hot_hn_body = (
+        "Show HN: production MCP agent demo discussion with benchmark and release notes. "
+        "Users discuss real workflow outcomes and integration details."
+    ) * 12
+
+    async def _github_topic_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id="infra_langchain",
+                source="github",
+                title="langchain-ai/langchain",
+                url="https://github.com/langchain-ai/langchain",
+                body=infra_body,
+                tier="A",
+                metadata={
+                    "stars": 120000,
+                    "forks": 32000,
+                    "item_type": "repo",
+                    "updated_at": "2026-02-18T09:00:00Z",
+                    "citations": [
+                        {
+                            "title": "LangChain release notes",
+                            "url": "https://github.com/langchain-ai/langchain/releases",
+                            "snippet": "Release notes and migration docs.",
+                            "source": "github",
+                        }
+                    ],
+                },
+            ),
+            RawItem(
+                id="infra_langgraph",
+                source="github",
+                title="langchain-ai/langgraph",
+                url="https://github.com/langchain-ai/langgraph",
+                body=infra_body,
+                tier="A",
+                metadata={
+                    "stars": 46000,
+                    "forks": 5000,
+                    "item_type": "repo",
+                    "updated_at": "2026-02-18T08:00:00Z",
+                    "citations": [
+                        {
+                            "title": "LangGraph updates",
+                            "url": "https://github.com/langchain-ai/langgraph/releases",
+                            "snippet": "Runtime update changelog.",
+                            "source": "github",
+                        }
+                    ],
+                },
+            ),
+            RawItem(
+                id="hot_agent_github",
+                source="github",
+                title="acme/mcp-agent-demo",
+                url="https://github.com/acme/mcp-agent-demo",
+                body=hot_github_body,
+                tier="A",
+                metadata={
+                    "stars": 320,
+                    "forks": 42,
+                    "item_type": "repo",
+                    "created_at": "2026-02-12T09:00:00Z",
+                    "updated_at": "2026-02-18T12:00:00Z",
+                    "release_published_at": "2026-02-17T09:00:00Z",
+                    "search_rank": 1,
+                    "search_pool_size": 24,
+                    "cross_source_corroboration_count": 2,
+                    "citations": [
+                        {
+                            "title": "Release v0.2.0",
+                            "url": "https://github.com/acme/mcp-agent-demo/releases/tag/v0.2.0",
+                            "snippet": "Release notes with benchmark and quickstart.",
+                            "source": "github",
+                        },
+                        {
+                            "title": "Demo docs",
+                            "url": "https://docs.acme.dev/mcp-agent-demo",
+                            "snippet": "MCP workflow quickstart docs.",
+                            "source": "docs",
+                        },
+                    ],
+                },
+            ),
+        ]
+
+    async def _hf_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id="hot_agent_hf",
+                source="huggingface",
+                title="acme/agent-demo-space",
+                url="https://huggingface.co/spaces/acme/agent-demo-space",
+                body=hot_hf_body,
+                tier="A",
+                metadata={
+                    "likes": 180,
+                    "downloads": 3200,
+                    "item_type": "space",
+                    "updated_at": "2026-02-18T06:00:00Z",
+                    "citations": [
+                        {
+                            "title": "HF Space",
+                            "url": "https://huggingface.co/spaces/acme/agent-demo-space",
+                            "snippet": "Agent runtime demo and workflow.",
+                            "source": "huggingface",
+                        }
+                    ],
+                },
+            )
+        ]
+
+    async def _hn_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id="hot_agent_hn",
+                source="hackernews",
+                title="Show HN: MCP agent workflow demo",
+                url="https://news.ycombinator.com/item?id=772233",
+                body=hot_hn_body,
+                tier="A",
+                metadata={
+                    "points": 260,
+                    "comment_count": 72,
+                    "item_type": "story",
+                    "published_at": "2026-02-18T02:00:00Z",
+                    "citations": [
+                        {
+                            "title": "HN thread",
+                            "url": "https://news.ycombinator.com/item?id=772233",
+                            "snippet": "Discussion on MCP agent implementation details.",
+                            "source": "hackernews",
+                        }
+                    ],
+                },
+            )
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _github_topic_search,
+        "fetch_huggingface_search": _hf_search,
+        "fetch_hackernews_search": _hn_search,
+        "fetch_github_query_fallback": _none,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -971,6 +1143,64 @@ def test_runtime_skips_key_timeout_attempt_when_non_timeout_attempt_exists(tmp_p
     assert bool(diagnosis.get("selected_attempt_has_key_connector_timeout")) is False
     assert bool(diagnosis.get("all_attempts_key_connector_timeout")) is False
     assert any(bool(item.get("fallback_used")) for item in attempts)
+
+
+def test_runtime_ai_agent_7d_pushes_infra_to_watchlist_not_top_picks(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_hot_new_agents_vs_infra_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_hot_agents_intent",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="7d",
+            tz="UTC",
+            budget={
+                "top_k": 3,
+                "include_tier_b": False,
+                "render_enabled": False,
+                "min_source_coverage": 1,
+                "min_pass_ratio": 0.0,
+                "min_evidence_quality": 1.0,
+            },
+            output_targets=["web"],
+        ),
+        idempotency_key="u_hot_agents_intent:ai-agent:7d",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+    diagnosis = json.loads((run_dir / "retrieval_diagnosis.json").read_text(encoding="utf-8"))
+
+    top_ids = [str(value).strip() for value in list(ranking.get("top_item_ids") or []) if str(value).strip()]
+    assert "infra_langchain" not in top_ids
+    assert "infra_langgraph" not in top_ids
+
+    watchlist = list(ranking.get("infra_watchlist") or [])
+    watchlist_ids = {str(item.get("item_id") or "").strip() for item in watchlist}
+    assert "infra_langchain" in watchlist_ids
+    assert "infra_langgraph" in watchlist_ids
+    assert int(ranking.get("infra_filtered_count", 0) or 0) >= 2
+
+    candidate_map = {
+        str((item or {}).get("item_id") or "").strip(): dict(item or {})
+        for item in list(diagnosis.get("candidate_rows") or [])
+        if str((item or {}).get("item_id") or "").strip()
+    }
+    assert all(bool(candidate_map.get(item_id, {}).get("intent_is_infra")) is False for item_id in top_ids[:3])
+
+    onepager = (run_dir / "onepager.md").read_text(encoding="utf-8")
+    assert "## Top Picks: Hot New Agents (Top3)" in onepager
+    assert "## Infra Watchlist" in onepager
 
 
 def test_selection_priority_vector_prefers_quality_complete_attempt() -> None:

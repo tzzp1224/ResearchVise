@@ -167,3 +167,46 @@ def test_onepager_citation_block_uses_audit_urls_and_strips_html_snippets(tmp_pa
     assert "https://docs.acme.dev/agent-runtime" in text
     assert "https://github.com/acme/agent-runtime/releases/tag/v1.0.0" in text
     assert "<a href=" not in text
+
+
+def test_onepager_hot_new_agents_and_infra_watchlist_sections(tmp_path: Path) -> None:
+    item = _item()
+    item.id = "hot_agent_1"
+    item.metadata = {
+        **dict(item.metadata or {}),
+        "trend_signal_reasons": [
+            "trend.created_at_recency=1.00",
+            "trend.release_recency=0.85",
+            "trend.discussion_signal=0.70",
+        ],
+        "trend_signal_proxy_used": True,
+        "cross_source_corroborated": True,
+    }
+    run_context = {
+        "data_mode": "live",
+        "topic": "AI agent",
+        "time_window": "7d",
+        "ranking_stats": {
+            "requested_top_k": 3,
+            "intent": "hot_new_agents",
+            "intent_mode": "hot_new_agents",
+            "infra_filtered_count": 2,
+            "watchlist_count": 1,
+            "infra_watchlist": [
+                {
+                    "item_id": "infra_langchain",
+                    "title": "langchain-ai/langchain",
+                    "url": "https://github.com/langchain-ai/langchain",
+                    "trend_signal_reasons": ["trend.commit_recency=0.80"],
+                }
+            ],
+        },
+    }
+    onepager = generate_onepager([item], item.citations, out_dir=tmp_path, run_context=run_context)
+    text = Path(onepager).read_text(encoding="utf-8")
+    assert "## Top Picks: Hot New Agents (Top3)" in text
+    assert "- Intent: `hot_new_agents`" in text
+    assert "- InfraFilteredCount: `2`" in text
+    assert "- WatchlistCount: `1`" in text
+    assert "#### Why trending" in text
+    assert "## Infra Watchlist" in text

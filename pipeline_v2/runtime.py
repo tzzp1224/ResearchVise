@@ -31,6 +31,7 @@ from pipeline_v2.scoring import rank_items
 from pipeline_v2.script_generator import build_facts, generate_script
 from pipeline_v2.sanitize import is_allowed_citation_url, normalize_url
 from pipeline_v2.storyboard_generator import auto_fix_storyboard, script_to_storyboard, validate_storyboard
+from pipeline_v2.topic_intent import TopicIntent
 from pipeline_v2.topic_profile import TopicProfile
 from render import align_subtitles, mix_bgm, tts_generate
 from render.manager import RenderManager
@@ -188,9 +189,11 @@ class RunPipelineRuntime:
 
         topic_value = str(request.topic or "").strip()
         topic_profile: Optional[TopicProfile] = None
+        request_intent: Optional[TopicIntent] = None
         retrieval_plan: Optional[RetrievalPlan] = None
         if data_mode == "live" and topic_value:
             topic_profile = TopicProfile.for_topic(topic_value)
+            request_intent = TopicIntent.for_request(topic=topic_value, time_window=str(request.time_window or "today"))
             planner = self._resolve_research_planner(request)
             retrieval_plan = planner.plan(topic_value, time_window=request.time_window)
 
@@ -234,6 +237,7 @@ class RunPipelineRuntime:
                 raw_items=raw_items,
                 run_id=run_id,
                 topic=request.topic,
+                time_window=request.time_window,
             )
 
             normalized = [normalize(item) for item in raw_items]
@@ -250,6 +254,12 @@ class RunPipelineRuntime:
                 merged=merged,
                 topic=request.topic,
                 topic_profile=topic_profile,
+                topic_intent=TopicIntent.for_request(
+                    topic=topic_value,
+                    time_window=str((collect_diag.get("profile") or {}).get("window") or profile.window),
+                )
+                if request_intent is not None
+                else None,
                 data_mode=data_mode,
                 top_count=top_count,
                 recall_window=str((collect_diag.get("profile") or {}).get("window") or profile.window),
@@ -257,6 +267,18 @@ class RunPipelineRuntime:
             ranked = list(rank_pack["ranked"] or [])
             relevance_eligible = list(rank_pack["relevance_eligible"] or [])
             audit_records = auditor.audit_rows(ranked_rows=ranked)
+            attempt_intent = TopicIntent.for_request(
+                topic=topic_value,
+                time_window=str((collect_diag.get("profile") or {}).get("window") or profile.window),
+            )
+            filtered_relevance_rows = list(relevance_eligible)
+            intent_filter_stats = {
+                "infra_filtered_count": 0,
+                "handbook_filtered_count": 0,
+                "infra_exception_top_pick_count": 0,
+            }
+            if attempt_intent is not None and attempt_intent.hot_new_agents_mode:
+                filtered_relevance_rows, intent_filter_stats = attempt_intent.filter_rows_for_top_picks(relevance_eligible)
             if str(data_mode or "").strip().lower() == "smoke":
                 selection_relevance_floor = float(rank_pack["relevance_threshold"])
             else:
@@ -266,13 +288,21 @@ class RunPipelineRuntime:
                 )
 
             pass_first_outcome = controller.evaluate(
-                ranked_rows=relevance_eligible,
+                ranked_rows=filtered_relevance_rows,
                 audit_records=audit_records,
                 allow_downgrade_fill=False,
                 min_relevance_for_selection=float(selection_relevance_floor),
             )
             expansion_decision = controller.expansion_decision(outcome=pass_first_outcome)
             quality_reasons = [str(value).strip() for value in list(expansion_decision.reasons or []) if str(value).strip()]
+            if int(intent_filter_stats.get("infra_filtered_count", 0) or 0) > 0:
+                quality_reasons.append(
+                    f"infra_filtered_for_top_picks:{int(intent_filter_stats.get('infra_filtered_count', 0) or 0)}"
+                )
+            if int(intent_filter_stats.get("handbook_filtered_count", 0) or 0) > 0:
+                quality_reasons.append(
+                    f"background_filtered_for_top_picks:{int(intent_filter_stats.get('handbook_filtered_count', 0) or 0)}"
+                )
             has_next_attempt = idx < len(recall_profiles)
             quality_triggered_expansion = bool(expansion_decision.should_expand and has_next_attempt)
             quality_triggered_any = bool(quality_triggered_any or quality_triggered_expansion)
@@ -280,7 +310,7 @@ class RunPipelineRuntime:
             final_outcome = pass_first_outcome
             if not quality_triggered_expansion and not has_next_attempt:
                 final_outcome = controller.evaluate(
-                    ranked_rows=relevance_eligible,
+                    ranked_rows=filtered_relevance_rows,
                     audit_records=audit_records,
                     allow_downgrade_fill=True,
                     min_relevance_for_selection=float(selection_relevance_floor),
@@ -325,6 +355,7 @@ class RunPipelineRuntime:
                 "candidate_count": int(final_outcome.candidate_count),
                 "top_picks_count": len(picks),
                 "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
+                "intent_filtered_out": max(0, len(relevance_eligible) - len(filtered_relevance_rows)),
                 "relevance_threshold_used": float(rank_pack["relevance_threshold"]),
                 "relaxation_steps": int(rank_pack["relaxation_steps"]),
                 "connector_calls": list(collect_diag.get("connector_calls") or []),
@@ -360,6 +391,13 @@ class RunPipelineRuntime:
                 "quality_trigger_reasons": list(quality_reasons),
                 "quality_deficit_count": int(len(quality_reasons)),
                 "selection_quality_ok": bool(not quality_reasons),
+                "intent": (attempt_intent.config.key if attempt_intent else None),
+                "intent_mode": (
+                    attempt_intent.config.top_pick_bucket if (attempt_intent and attempt_intent.hot_new_agents_mode) else "default"
+                ),
+                "infra_filtered_count": int(intent_filter_stats.get("infra_filtered_count", 0) or 0),
+                "handbook_filtered_count": int(intent_filter_stats.get("handbook_filtered_count", 0) or 0),
+                "infra_exception_top_pick_count": int(intent_filter_stats.get("infra_exception_top_pick_count", 0) or 0),
                 "explain": list(attempt_explain),
                 "selected_item_ids": [
                     str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "")
@@ -513,6 +551,7 @@ class RunPipelineRuntime:
                 ranked=ranked,
                 relevance_eligible=relevance_eligible,
                 audit_records=audit_records,
+                topic_intent=request_intent,
             )
             if rescued_pick is None:
                 raise RuntimeError("no candidates survived evidence audit")
@@ -625,12 +664,17 @@ class RunPipelineRuntime:
             evidence_links = int(float(signals.get("evidence_links_quality", 0) or 0))
             if evidence_links > 0:
                 chunks.append(f"evidence={evidence_links}")
+            trend_signal = float(metadata.get("trend_signal_score", 0.0) or 0.0)
+            if trend_signal > 0:
+                chunks.append(f"trend={trend_signal:.2f}")
             recent_update_signal = float(metadata.get("recent_update_signal", 0.0) or 0.0)
             if recent_update_signal > 0:
                 chunks.append(f"recent_update={recent_update_signal:.2f}")
             stars_delta_proxy = float(metadata.get("stars_delta_proxy", 0.0) or 0.0)
             if stars_delta_proxy > 0:
                 chunks.append(f"stars_delta_proxy={stars_delta_proxy:.2f}")
+            if bool(metadata.get("infra_exception_event")):
+                chunks.append("infra_exception_event=true")
             if record is not None:
                 alignment = float(getattr(record, "evidence_target_alignment", 0.0) or 0.0)
                 if alignment > 0:
@@ -640,7 +684,7 @@ class RunPipelineRuntime:
                 chunks.append(f"repeat_penalty={repeat_penalty:.2f}")
             if bool(signals.get("has_quickstart")):
                 chunks.append("quickstart")
-            return " | ".join(chunks[:4])
+            return " | ".join(chunks[:6])
 
         picked_ids = {pick.item.id for pick in picks}
         candidate_rows = []
@@ -669,6 +713,13 @@ class RunPipelineRuntime:
                     "bucket_hits": [str(value) for value in list(metadata.get("bucket_hits") or []) if str(value).strip()],
                     "cross_source_corroborated": bool(metadata.get("cross_source_corroborated")),
                     "cross_source_count": int(float(metadata.get("cross_source_corroboration_count", 0) or 0)),
+                    "intent_bucket": str(metadata.get("intent_bucket") or ""),
+                    "intent_is_infra": bool(metadata.get("intent_is_infra", False)),
+                    "intent_is_handbook": bool(metadata.get("intent_is_handbook", False)),
+                    "infra_exception_event": bool(metadata.get("infra_exception_event", False)),
+                    "intent_hot_candidate": bool(metadata.get("intent_hot_candidate", False)),
+                    "trend_signal_score": float(metadata.get("trend_signal_score", 0.0) or 0.0),
+                    "trend_signal_reasons": list(metadata.get("trend_signal_reasons") or []),
                     "recent_update_signal": float(metadata.get("recent_update_signal", 0.0) or 0.0),
                     "stars_delta_proxy": float(metadata.get("stars_delta_proxy", 0.0) or 0.0),
                     "audit_verdict": str(record.verdict if record else "unknown"),
@@ -697,6 +748,25 @@ class RunPipelineRuntime:
             selected_attempt_payload.get("top_picks_min_evidence_quality", quality_snapshot.get("top_picks_min_evidence_quality", 0.0))
             or 0.0
         )
+        selected_intent_key = str(selected_attempt_payload.get("intent") or "")
+        selected_intent_mode = str(selected_attempt_payload.get("intent_mode") or "default")
+        infra_filtered_count = int(selected_attempt_payload.get("infra_filtered_count", 0) or 0)
+        handbook_filtered_count = int(selected_attempt_payload.get("handbook_filtered_count", 0) or 0)
+
+        selected_intent = TopicIntent.for_request(
+            topic=topic_value,
+            time_window=str(selected_attempt_payload.get("window") or request.time_window or "today"),
+        )
+        watchlists = {"infra_watchlist": [], "background_reading": []}
+        if selected_intent is not None and selected_intent.hot_new_agents_mode:
+            watchlists = selected_intent.build_watchlists(
+                ranked_rows=ranked,
+                selected_ids=[str(entry.item.id) for entry in list(picks or []) if getattr(entry, "item", None)],
+            )
+        infra_watchlist = list(watchlists.get("infra_watchlist") or [])
+        background_reading = list(watchlists.get("background_reading") or [])
+        watchlist_count = int(len(infra_watchlist))
+        background_count = int(len(background_reading))
 
         selected_verdicts = dict(selection_outcome.selected_verdicts or {})
         selected_downgrade_reasons = dict(selection_outcome.selected_downgrade_reasons or {})
@@ -779,6 +849,14 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
+            "intent": selected_intent_key or None,
+            "intent_mode": selected_intent_mode,
+            "infra_filtered_count": int(infra_filtered_count),
+            "handbook_filtered_count": int(handbook_filtered_count),
+            "infra_watchlist": infra_watchlist,
+            "background_reading": background_reading,
+            "watchlist_count": watchlist_count,
+            "background_count": background_count,
             "candidate_rows": candidate_rows,
             "top_dropped_items": top_dropped,
             "evidence_audit_path": audit_path,
@@ -818,6 +896,14 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
+            "intent": selected_intent_key or None,
+            "intent_mode": selected_intent_mode,
+            "infra_filtered_count": int(infra_filtered_count),
+            "handbook_filtered_count": int(handbook_filtered_count),
+            "infra_watchlist": infra_watchlist,
+            "background_reading": background_reading,
+            "watchlist_count": watchlist_count,
+            "background_count": background_count,
             "expansion_steps": [
                 {
                     "attempt": int(item.get("attempt", 0) or 0),
@@ -904,6 +990,14 @@ class RunPipelineRuntime:
             "top_evidence_audit_reasons": top_reasons,
             "top_evidence_urls": top_evidence_urls,
             "min_body_len_for_top_picks": 300,
+            "intent": selected_intent_key or None,
+            "intent_mode": selected_intent_mode,
+            "infra_filtered_count": int(infra_filtered_count),
+            "handbook_filtered_count": int(handbook_filtered_count),
+            "infra_watchlist": infra_watchlist,
+            "background_reading": background_reading,
+            "watchlist_count": watchlist_count,
+            "background_count": background_count,
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
             "top_picks_min_relevance": top_picks_min_relevance,
@@ -1988,6 +2082,7 @@ class RunPipelineRuntime:
         ranked: Sequence[Any],
         relevance_eligible: Sequence[Any],
         audit_records: Sequence[Any],
+        topic_intent: Optional[TopicIntent] = None,
     ) -> Optional[Any]:
         records_by_id = {
             str(getattr(record, "item_id", "") or "").strip(): record
@@ -2006,6 +2101,15 @@ class RunPipelineRuntime:
         for row in pool:
             if not self._row_hard_selection_eligible(row):
                 continue
+            if topic_intent is not None and topic_intent.hot_new_agents_mode:
+                metadata = dict((getattr(getattr(row, "item", None), "metadata", None) or {}))
+                is_handbook = bool(metadata.get("intent_is_handbook", False))
+                is_infra = bool(metadata.get("intent_is_infra", False))
+                infra_exception_event = bool(metadata.get("infra_exception_event", False))
+                if is_handbook:
+                    continue
+                if is_infra and not infra_exception_event:
+                    continue
             item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
             record = records_by_id.get(item_id)
             if record is not None:
@@ -2499,6 +2603,7 @@ class RunPipelineRuntime:
         raw_items: Sequence[RawItem],
         run_id: str,
         topic: Optional[str],
+        time_window: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _utcnow().isoformat(timespec="seconds")
         connector_stats: Dict[str, Dict[str, Any]] = {}
@@ -2528,6 +2633,7 @@ class RunPipelineRuntime:
             "run_id": run_id,
             "data_mode": str(data_mode or "live"),
             "topic": str(topic or "").strip() or None,
+            "time_window": str(time_window or "").strip() or None,
             "connector_stats": connector_stats,
             "extraction_stats": {
                 "methods": extraction_methods,
@@ -2592,6 +2698,7 @@ class RunPipelineRuntime:
         merged: Sequence[Any],
         topic: Optional[str],
         topic_profile: Optional[TopicProfile],
+        topic_intent: Optional[TopicIntent],
         data_mode: str,
         top_count: int,
         recall_window: Optional[str] = None,
@@ -2609,6 +2716,7 @@ class RunPipelineRuntime:
                 merged,
                 topic=topic,
                 topic_profile=topic_profile,
+                topic_intent=topic_intent,
                 relevance_threshold=relevance_threshold,
                 recall_window=recall_window,
             )

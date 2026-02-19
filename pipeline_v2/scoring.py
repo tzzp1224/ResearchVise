@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from core import NormalizedItem, RankedItem
 from pipeline_v2.topic_profile import TopicProfile
+from pipeline_v2.topic_intent import TopicIntent
 
 
 def _clamp01(value: float) -> float:
@@ -551,11 +552,13 @@ def rank_items(
     min_body_len_for_top_picks: int = 300,
     topic: Optional[str] = None,
     topic_profile: Optional[TopicProfile] = None,
+    topic_intent: Optional[TopicIntent] = None,
     relevance_threshold: float = 0.55,
     recall_window: Optional[str] = None,
 ) -> List[RankedItem]:
     """Rank items with explainable subscores and Tier B top3 gate."""
     staged = []
+    window_days = _parse_window_days(recall_window)
     for item in items:
         body_len, citation_count, published_recency, link_count = _quality_metrics(item)
         short_announcement = _is_short_announcement(item)
@@ -576,9 +579,11 @@ def rank_items(
             str(value) for value in list(relevance_payload.get("agent_high_value_hits") or []) if str(value).strip()
         ]
         agent_score_cap = str(relevance_payload.get("agent_score_cap") or "").strip()
+        if topic_intent is not None:
+            topic_intent.classify_and_annotate(item)
         cross_source_bonus = max(0.0, min(0.08, _to_float((item.metadata or {}).get("cross_source_bonus"), 0.0)))
         repeat_penalty = max(0.0, min(0.16, _to_float((item.metadata or {}).get("recent_topic_repeat_penalty"), 0.0)))
-        if _parse_window_days(recall_window) >= 7:
+        if window_days >= 7:
             # Keep anti-repetition, but avoid overwhelming true trending/high-signal repos in weekly mode.
             repeat_penalty = min(0.08, repeat_penalty * 0.5)
         repeat_count = int(max(0.0, _to_float((item.metadata or {}).get("recent_topic_pick_count"), 0.0)))
@@ -632,6 +637,35 @@ def rank_items(
         if repeat_penalty > 0:
             total = _clamp01(total - repeat_penalty)
 
+        intent_metadata = dict(item.metadata or {})
+        trend_signal_score = _clamp01(_to_float(intent_metadata.get("trend_signal_score"), 0.0))
+        trend_reasons = [str(value).strip() for value in list(intent_metadata.get("trend_signal_reasons") or []) if str(value).strip()]
+        trend_proxy_used = bool(intent_metadata.get("trend_signal_proxy_used"))
+        intent_hot_candidate = bool(intent_metadata.get("intent_hot_candidate"))
+        intent_is_infra = bool(intent_metadata.get("intent_is_infra"))
+        intent_is_handbook = bool(intent_metadata.get("intent_is_handbook"))
+        infra_exception_event = bool(intent_metadata.get("infra_exception_event"))
+        intent_bucket = str(intent_metadata.get("intent_bucket") or "").strip().lower()
+        evidence_alignment_proxy = _clamp01(
+            float(_quality_signals(item)["content_density"]) * 1.4
+            + (0.2 if bool(_quality_signals(item)["has_quickstart"]) else 0.0)
+            + (0.2 if bool(_quality_signals(item)["has_results_or_bench"]) else 0.0)
+            + min(0.3, float(_quality_signals(item)["evidence_links_quality"]) * 0.1)
+            + (0.2 if bool((item.metadata or {}).get("cross_source_corroborated")) else 0.0)
+        )
+
+        if topic_intent is not None and topic_intent.hot_new_agents_mode:
+            trend_objective = _clamp01(0.68 * trend_signal_score + 0.32 * evidence_alignment_proxy)
+            total = _clamp01(0.15 * total + 0.60 * trend_objective + 0.25 * relevance_score)
+            if intent_hot_candidate:
+                total = _clamp01(total + 0.06)
+            else:
+                total = _clamp01(total - 0.04)
+            if intent_is_infra and not infra_exception_event:
+                total = _clamp01(total - 0.22)
+            if intent_is_handbook:
+                total = _clamp01(total - 0.28)
+
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
             margin = (scores["talkability"] - float(tier_b_top3_talkability_threshold)) / max(
@@ -664,6 +698,15 @@ def rank_items(
                 repeat_count,
                 corroboration_sources,
                 activity,
+                trend_signal_score,
+                evidence_alignment_proxy,
+                trend_reasons,
+                trend_proxy_used,
+                intent_hot_candidate,
+                intent_is_infra,
+                intent_is_handbook,
+                infra_exception_event,
+                intent_bucket,
             )
         )
 
@@ -700,6 +743,15 @@ def rank_items(
             _repeat_count,
             _corroboration_sources,
             _activity,
+            _trend_signal_score,
+            _evidence_alignment_proxy,
+            _trend_reasons,
+            _trend_proxy_used,
+            _intent_hot_candidate,
+            _intent_is_infra,
+            _intent_is_handbook,
+            _infra_exception_event,
+            _intent_bucket,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -735,10 +787,19 @@ def rank_items(
         agent_high_value_hits,
         agent_score_cap,
         cross_source_bonus,
-        repeat_penalty,
+            repeat_penalty,
             repeat_count,
             corroboration_sources,
             activity,
+            trend_signal_score,
+            evidence_alignment_proxy,
+            trend_reasons,
+            trend_proxy_used,
+            intent_hot_candidate,
+            intent_is_infra,
+            intent_is_handbook,
+            infra_exception_event,
+            intent_bucket,
         ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -777,6 +838,23 @@ def rank_items(
         if repeat_penalty > 0:
             reasons.append(f"penalty.recent_topic_repeat={repeat_penalty:.2f}")
             reasons.append(f"recent_topic.pick_count={repeat_count}")
+        if trend_signal_score > 0:
+            reasons.append(f"trend.signal={trend_signal_score:.2f}")
+            reasons.append(f"trend.evidence_alignment_proxy={evidence_alignment_proxy:.2f}")
+        if trend_reasons:
+            reasons.append(f"trend.reasons={','.join(trend_reasons[:3])}")
+        if trend_proxy_used:
+            reasons.append("trend.proxy=search_rank_position")
+        if intent_hot_candidate:
+            reasons.append("intent.hot_candidate=true")
+        if intent_is_infra:
+            reasons.append("intent.infra=true")
+        if intent_is_handbook:
+            reasons.append("intent.handbook=true")
+        if infra_exception_event:
+            reasons.append("infra_exception_event=true")
+        if intent_bucket:
+            reasons.append(f"intent.bucket={intent_bucket}")
         signals = _quality_signals(item)
         reasons.extend(
             [

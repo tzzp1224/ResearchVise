@@ -61,6 +61,8 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["selected_attempt_has_no_key_connector_timeout"] is True
     assert report["checks"]["top_picks_not_link_heavy_low_alignment"] is True
     assert report["checks"]["relevance_not_all_1.0"] is True
+    assert report["checks"]["top_picks_not_infra_dominant"] is True
+    assert report["checks"]["onepager_has_hot_new_agents_section"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:
@@ -254,3 +256,131 @@ def test_validate_artifacts_v2_flags_selected_key_timeout_attempt(tmp_path: Path
     report = json.loads(validated.stdout)
     assert report["checks"]["selected_attempt_has_no_key_connector_timeout"] is False
     assert "selected_attempt_has_key_connector_timeout" in list(report.get("errors") or [])
+
+
+def test_validate_artifacts_v2_flags_infra_dominant_top_picks_for_hot_agent_mode(tmp_path: Path) -> None:
+    smoke_dir = tmp_path / "smoke_infra_dominant"
+    payload = json.loads(
+        subprocess.run([sys.executable, "scripts/e2e_smoke_v2.py", "--out-dir", str(smoke_dir)], check=True, capture_output=True, text=True).stdout
+    )
+    run_id = str(payload["run_id"])
+    render_job_id = str(payload["render_job_id"])
+    run_dir = smoke_dir / "runs" / run_id
+    render_dir = smoke_dir / "render_jobs" / render_job_id
+
+    run_context_path = run_dir / "run_context.json"
+    run_context = json.loads(run_context_path.read_text(encoding="utf-8"))
+    run_context["data_mode"] = "live"
+    run_context["topic"] = "AI agent"
+    run_context["time_window"] = "7d"
+    ranking = dict(run_context.get("ranking_stats") or {})
+    ranking["intent"] = "hot_new_agents"
+    ranking["intent_mode"] = "hot_new_agents"
+    top_ids = [str(value).strip() for value in list(ranking.get("top_item_ids") or []) if str(value).strip()]
+    ranking["top_item_ids"] = top_ids
+    run_context["ranking_stats"] = ranking
+    run_context_path.write_text(json.dumps(run_context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    diagnosis_path = run_dir / "retrieval_diagnosis.json"
+    diagnosis = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+    candidate_rows = list(diagnosis.get("candidate_rows") or [])
+    candidate_map = {
+        str((item or {}).get("item_id") or "").strip(): dict(item or {})
+        for item in candidate_rows
+        if str((item or {}).get("item_id") or "").strip()
+    }
+    for item_id in top_ids[:3]:
+        row = dict(candidate_map.get(item_id) or {"item_id": item_id, "title": item_id, "url": "https://example.com", "source": "github"})
+        row["intent_is_infra"] = True
+        row["infra_exception_event"] = False
+        candidate_map[item_id] = row
+    diagnosis["candidate_rows"] = list(candidate_map.values())
+    diagnosis_path.write_text(json.dumps(diagnosis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    onepager_path = run_dir / "onepager.md"
+    onepager_path.write_text(
+        onepager_path.read_text(encoding="utf-8").replace("DataMode: `smoke`", "DataMode: `live`"),
+        encoding="utf-8",
+    )
+
+    validated = subprocess.run(
+        [
+            sys.executable,
+            "scripts/validate_artifacts_v2.py",
+            "--run-dir",
+            str(run_dir),
+            "--render-dir",
+            str(render_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 1
+    report = json.loads(validated.stdout)
+    assert report["checks"]["top_picks_not_infra_dominant"] is False
+    assert any(str(err).startswith("top_picks_infra_dominant:") for err in list(report.get("errors") or []))
+
+
+def test_validate_artifacts_v2_flags_missing_hot_new_agents_section(tmp_path: Path) -> None:
+    smoke_dir = tmp_path / "smoke_missing_hot_section"
+    payload = json.loads(
+        subprocess.run([sys.executable, "scripts/e2e_smoke_v2.py", "--out-dir", str(smoke_dir)], check=True, capture_output=True, text=True).stdout
+    )
+    run_id = str(payload["run_id"])
+    render_job_id = str(payload["render_job_id"])
+    run_dir = smoke_dir / "runs" / run_id
+    render_dir = smoke_dir / "render_jobs" / render_job_id
+
+    run_context_path = run_dir / "run_context.json"
+    run_context = json.loads(run_context_path.read_text(encoding="utf-8"))
+    run_context["data_mode"] = "live"
+    run_context["topic"] = "AI agent"
+    run_context["time_window"] = "7d"
+    ranking = dict(run_context.get("ranking_stats") or {})
+    ranking["intent"] = "hot_new_agents"
+    ranking["intent_mode"] = "hot_new_agents"
+    top_ids = [str(value).strip() for value in list(ranking.get("top_item_ids") or []) if str(value).strip()]
+    ranking["top_item_ids"] = top_ids
+    run_context["ranking_stats"] = ranking
+    run_context_path.write_text(json.dumps(run_context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    diagnosis_path = run_dir / "retrieval_diagnosis.json"
+    diagnosis = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+    candidate_rows = list(diagnosis.get("candidate_rows") or [])
+    candidate_map = {
+        str((item or {}).get("item_id") or "").strip(): dict(item or {})
+        for item in candidate_rows
+        if str((item or {}).get("item_id") or "").strip()
+    }
+    for item_id in top_ids[:3]:
+        row = dict(candidate_map.get(item_id) or {"item_id": item_id, "title": item_id, "url": "https://example.com", "source": "github"})
+        row["intent_is_infra"] = False
+        row["infra_exception_event"] = False
+        candidate_map[item_id] = row
+    diagnosis["candidate_rows"] = list(candidate_map.values())
+    diagnosis_path.write_text(json.dumps(diagnosis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    onepager_path = run_dir / "onepager.md"
+    onepager = onepager_path.read_text(encoding="utf-8")
+    onepager = onepager.replace("DataMode: `smoke`", "DataMode: `live`")
+    onepager = onepager.replace("## Top Picks: Hot New Agents (Top3)", "## Top Picks")
+    onepager_path.write_text(onepager, encoding="utf-8")
+
+    validated = subprocess.run(
+        [
+            sys.executable,
+            "scripts/validate_artifacts_v2.py",
+            "--run-dir",
+            str(run_dir),
+            "--render-dir",
+            str(render_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 1
+    report = json.loads(validated.stdout)
+    assert report["checks"]["onepager_has_hot_new_agents_section"] is False
+    assert "onepager_missing_hot_new_agents_section" in list(report.get("errors") or [])

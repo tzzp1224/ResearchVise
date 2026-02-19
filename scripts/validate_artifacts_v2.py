@@ -29,6 +29,29 @@ PLACEHOLDER_REPO_PATTERNS = [
 ]
 
 
+def _parse_window_days(value: str) -> int:
+    token = str(value or "").strip().lower()
+    if not token:
+        return 1
+    if token == "today":
+        return 1
+    if token.endswith("d"):
+        try:
+            return max(1, int(token[:-1]))
+        except Exception:
+            return 3
+    if token.endswith("h"):
+        try:
+            return max(1, int((int(token[:-1]) + 23) // 24))
+        except Exception:
+            return 1
+    if token in {"past_week", "last_week", "weekly"}:
+        return 7
+    if token in {"past_month", "monthly"}:
+        return 30
+    return 3
+
+
 def _load_json(path: Path) -> Dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -346,10 +369,13 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("script_citation_denylist:" + ",".join(sorted(set(script_bad_urls))[:6]))
 
     onepager_urls: List[str] = []
+    onepager_text = ""
     onepager_has_why_not_more = False
+    onepager_has_hot_new_agents_section = False
     report["checks"]["candidate_shortage_explained"] = True
     if onepager_path.exists():
         onepager = onepager_path.read_text(encoding="utf-8")
+        onepager_text = str(onepager)
         urls = _extract_urls(onepager)
         onepager_urls = urls
         top_pick_headings = re.findall(r"^###\s+\d+\.\s+", onepager, flags=re.MULTILINE)
@@ -400,7 +426,11 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             str(quality_trigger_match.group(1)).strip().lower() == "true" if quality_trigger_match else None
         )
         onepager_has_why_not_more = bool(re.search(r"^##\s+Why not more\?\s*$", onepager, flags=re.MULTILINE))
+        onepager_has_hot_new_agents_section = bool(
+            re.search(r"^##\s+Top Picks:\s+Hot New Agents \(Top3\)\s*$", onepager, flags=re.MULTILINE)
+        )
         report["details"]["onepager_has_why_not_more"] = onepager_has_why_not_more
+        report["details"]["onepager_has_hot_new_agents_section"] = onepager_has_hot_new_agents_section
         report["checks"]["onepager_diagnosis_path_present"] = bool(diagnosis_header_path and diagnosis_header_path != "N/A")
         report["checks"]["onepager_evidence_audit_path_present"] = bool(
             evidence_audit_header_path and evidence_audit_header_path != "N/A"
@@ -810,6 +840,60 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         if not relevance_not_all_ones:
             report["errors"].append("relevance_scores_all_1.0_top3")
 
+        intent_mode = str(ranking_stats.get("intent_mode", retrieval_ctx.get("intent_mode", "")) or "").strip().lower()
+        time_window_value = str(
+            run_context.get("time_window")
+            or diagnosis_payload.get("time_window")
+            or retrieval_ctx.get("time_window")
+            or ""
+        ).strip()
+        hot_new_agents_mode = bool(
+            "agent" in str(topic_value or "").strip().lower()
+            and (_parse_window_days(time_window_value) >= 7 or intent_mode == "hot_new_agents")
+        )
+        report["details"]["hot_new_agents_mode"] = hot_new_agents_mode
+        report["details"]["intent_mode"] = intent_mode or None
+        report["details"]["time_window"] = time_window_value or None
+
+        onepager_hot_section_ok = bool((not hot_new_agents_mode) or onepager_has_hot_new_agents_section)
+        report["checks"]["onepager_has_hot_new_agents_section"] = onepager_hot_section_ok
+        if not onepager_hot_section_ok:
+            report["errors"].append("onepager_missing_hot_new_agents_section")
+
+        top3_ids = [str(value).strip() for value in list(top_item_ids or []) if str(value).strip()][:3]
+        infra_top_count = 0
+        infra_exception_top_count = 0
+        unresolved_top3_ids: List[str] = []
+        if hot_new_agents_mode and top3_ids:
+            for item_id in top3_ids:
+                diag_row = dict(diagnosis_candidate_map.get(item_id) or {})
+                if not diag_row:
+                    unresolved_top3_ids.append(item_id)
+                    continue
+                if bool(diag_row.get("intent_is_infra", False)):
+                    infra_top_count += 1
+                    if bool(diag_row.get("infra_exception_event", False)):
+                        infra_exception_top_count += 1
+        infra_non_exception_top_count = max(0, infra_top_count - infra_exception_top_count)
+        infra_dominant_ok = True
+        if hot_new_agents_mode:
+            infra_dominant_ok = bool(
+                infra_non_exception_top_count <= 0
+                and infra_top_count <= 1
+                and infra_exception_top_count <= 1
+                and not unresolved_top3_ids
+            )
+        report["checks"]["top_picks_not_infra_dominant"] = infra_dominant_ok
+        report["details"]["top3_infra_count"] = int(infra_top_count)
+        report["details"]["top3_infra_exception_count"] = int(infra_exception_top_count)
+        report["details"]["top3_unresolved_ids"] = unresolved_top3_ids
+        if not infra_dominant_ok:
+            report["errors"].append(
+                "top_picks_infra_dominant:"
+                f"infra={infra_top_count},infra_exception={infra_exception_top_count},"
+                f"unresolved={','.join(unresolved_top3_ids[:3]) if unresolved_top3_ids else 'none'}"
+            )
+
         record_map = {
             str((row or {}).get("item_id") or "").strip(): dict(row or {})
             for row in list(evidence_audit_payload.get("records") or [])
@@ -832,6 +916,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["retrieval_quality_triggered_expansion_recorded"] = True
         report["checks"]["selected_attempt_has_no_key_connector_timeout"] = True
         report["checks"]["relevance_not_all_1.0"] = True
+        report["checks"]["onepager_has_hot_new_agents_section"] = True
+        report["checks"]["top_picks_not_infra_dominant"] = True
         report["checks"]["top_picks_not_all_downgrade"] = True
 
     all_urls = []

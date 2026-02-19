@@ -309,6 +309,40 @@ def _why_ranked(item: object, normalized: NormalizedItem) -> str:
     return " · ".join(parts[:3]) if parts else "rel=N/A"
 
 
+def _why_trending_bullets(item: NormalizedItem) -> List[str]:
+    metadata = dict(item.metadata or {})
+    trend_reasons = [str(value).strip() for value in list(metadata.get("trend_signal_reasons") or []) if str(value).strip()]
+    bullets: List[str] = []
+    for reason in trend_reasons:
+        if reason.startswith("trend.created_at_recency="):
+            bullets.append("新项目/新阶段发布，创建时效性强。")
+        elif reason.startswith("trend.release_recency="):
+            bullets.append("近 7 天出现 release 信号，变化有明确里程碑。")
+        elif reason.startswith("trend.commit_recency="):
+            bullets.append("近 7 天持续活跃，提交更新密度高。")
+        elif reason.startswith("trend.discussion_signal="):
+            bullets.append("社区讨论热度高（跨源或互动信号明显）。")
+        elif reason.startswith("trend.search_rank_proxy="):
+            bullets.append("检索排序靠前（proxy），窗口内关注度高。")
+    if bool(metadata.get("trend_signal_proxy_used")):
+        bullets.append("趋势信号含排序 proxy，不等价于真实 stars 增量。")
+    if bool(metadata.get("cross_source_corroborated")):
+        bullets.append("跨源被提及，讨论与可信度更稳定。")
+    if bool(metadata.get("infra_exception_event")):
+        bullets.append("触发 infra 例外事件，可进入 Top picks。")
+    if not bullets:
+        bullets.append("在相关性、趋势与证据上综合领先。")
+    deduped: List[str] = []
+    seen = set()
+    for bullet in bullets:
+        key = str(bullet).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(bullet)
+    return deduped[:3]
+
+
 def generate_onepager(
     items: Sequence[object],
     citations: Sequence[Citation],
@@ -374,6 +408,12 @@ def generate_onepager(
         ranking_stats.get("selected_downgrade_count", retrieval.get("selected_downgrade_count", 0)) or 0
     )
     selected_all_downgrade = bool(ranking_stats.get("selected_all_downgrade", False))
+    intent = str(ranking_stats.get("intent", retrieval.get("intent", "")) or "").strip() or "default"
+    intent_mode = str(ranking_stats.get("intent_mode", retrieval.get("intent_mode", "default")) or "default").strip()
+    infra_filtered_count = int(ranking_stats.get("infra_filtered_count", retrieval.get("infra_filtered_count", 0)) or 0)
+    watchlist_count = int(ranking_stats.get("watchlist_count", retrieval.get("watchlist_count", 0)) or 0)
+    infra_watchlist = list(ranking_stats.get("infra_watchlist") or retrieval.get("infra_watchlist") or [])
+    background_reading = list(ranking_stats.get("background_reading") or retrieval.get("background_reading") or [])
     top_cross_source_corroborated_count = int(
         ranking_stats.get(
             "top_cross_source_corroborated_count",
@@ -469,6 +509,10 @@ def generate_onepager(
         f"- TopPicksMinRelevance: `{top_picks_min_relevance:.2f}`",
         f"- TopPicksHardMatchCount: `{top_picks_hard_match_count}`",
         f"- TopPicksMinEvidenceQuality: `{top_picks_min_evidence_quality:.2f}`",
+        f"- Intent: `{intent}`",
+        f"- IntentMode: `{intent_mode}`",
+        f"- InfraFilteredCount: `{infra_filtered_count}`",
+        f"- WatchlistCount: `{watchlist_count}`",
         f"- SelectedPassCount: `{selected_pass_count}`",
         f"- SelectedDowngradeCount: `{selected_downgrade_count}`",
         f"- BucketCoverage: `{bucket_coverage}`",
@@ -493,7 +537,7 @@ def generate_onepager(
         f"- DiagnosisPath: `{diagnosis_path or 'N/A'}`",
         f"- EvidenceAuditPath: `{evidence_audit_path or 'N/A'}`",
         "",
-        "## Top Picks",
+        "## Top Picks: Hot New Agents (Top3)" if intent_mode == "hot_new_agents" else "## Top Picks",
         "",
     ]
     if top_picks_count < requested_top_k:
@@ -558,6 +602,14 @@ def generate_onepager(
                     f"link_count={metrics['link_count']}"
                 ),
                 "",
+                "#### Why trending",
+            ]
+        )
+        for bullet in _why_trending_bullets(item):
+            lines.append(f"- {bullet}")
+        lines.extend(
+            [
+                "",
                 "#### Compact Brief",
             ]
         )
@@ -567,6 +619,36 @@ def generate_onepager(
         lines.append("#### Citations")
         for bullet in citation_bullets:
             lines.append(f"- {bullet}")
+        lines.append("")
+
+    if infra_watchlist:
+        lines.extend(
+            [
+                "## Infra Watchlist",
+                "",
+            ]
+        )
+        for idx, entry in enumerate(list(infra_watchlist)[:3], start=1):
+            payload = dict(entry or {})
+            title = str(payload.get("title") or "N/A").strip()
+            url = str(payload.get("url") or "N/A").strip()
+            reasons = [str(value).strip() for value in list(payload.get("trend_signal_reasons") or []) if str(value).strip()]
+            lines.append(f"- {idx}. {title} ({url})")
+            lines.append(f"  - reason: `{','.join(reasons[:2]) if reasons else 'framework update tracked'}`")
+        lines.append("")
+
+    if background_reading:
+        lines.extend(
+            [
+                "## Background Reading",
+                "",
+            ]
+        )
+        for idx, entry in enumerate(list(background_reading)[:3], start=1):
+            payload = dict(entry or {})
+            title = str(payload.get("title") or "N/A").strip()
+            url = str(payload.get("url") or "N/A").strip()
+            lines.append(f"- {idx}. {title} ({url})")
         lines.append("")
 
     if why_not_more_reasons:

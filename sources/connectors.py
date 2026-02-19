@@ -419,6 +419,8 @@ async def fetch_github_trending(
                     "stars": int(repo.stars or 0),
                     "forks": int(repo.forks or 0),
                     "watchers": int(repo.watchers or 0),
+                    "created_at": str(repo.created_at or ""),
+                    "updated_at": str(repo.updated_at or ""),
                     "last_push": str(repo.updated_at or ""),
                     "language": repo.language,
                     "topics": list(repo.topics or []),
@@ -453,11 +455,11 @@ async def fetch_github_topic_search(
     cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
 
     token = str(get_settings().github.token or os.getenv("GITHUB_TOKEN") or "").strip() or None
-    repos_by_full_name: Dict[str, Tuple[Any, str]] = {}
+    repos_by_full_name: Dict[str, Tuple[Any, str, int]] = {}
     async with GitHubScraper() as scraper:
         for query in query_list:
             repos = await scraper.search_repos(query=query, max_results=per_query, sort="updated", order="desc")
-            for repo in list(repos or []):
+            for rank_pos, repo in enumerate(list(repos or []), start=1):
                 full_name = str(getattr(repo, "full_name", "") or "").strip()
                 if not full_name:
                     continue
@@ -477,15 +479,21 @@ async def fetch_github_topic_search(
                 updated_dt = _parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None))
                 if updated_dt and updated_dt.timestamp() < cutoff:
                     continue
-                if full_name not in repos_by_full_name:
-                    repos_by_full_name[full_name] = (repo, query)
+                existing = repos_by_full_name.get(full_name)
+                if existing is None:
+                    repos_by_full_name[full_name] = (repo, query, rank_pos)
+                else:
+                    _prev_repo, _prev_query, prev_rank = existing
+                    if rank_pos < prev_rank:
+                        repos_by_full_name[full_name] = (repo, query, rank_pos)
                 if len(repos_by_full_name) >= max_items * 2:
                     break
             if len(repos_by_full_name) >= max_items * 2:
                 break
 
     items: List[RawItem] = []
-    for full_name, (repo, query) in list(repos_by_full_name.items())[:max_items]:
+    selected = list(repos_by_full_name.items())[:max_items]
+    for selected_idx, (full_name, (repo, query, rank_pos)) in enumerate(selected, start=1):
         readme = await _fetch_github_readme(full_name, token)
         body = _safe_truncate(
             "\n\n".join(
@@ -515,12 +523,18 @@ async def fetch_github_topic_search(
                     "stars": int(getattr(repo, "stars", 0) or 0),
                     "forks": int(getattr(repo, "forks", 0) or 0),
                     "watchers": int(getattr(repo, "watchers", 0) or 0),
+                    "created_at": str(getattr(repo, "created_at", "") or ""),
+                    "updated_at": str(getattr(repo, "updated_at", "") or ""),
                     "last_push": str(getattr(repo, "updated_at", "") or ""),
                     "language": getattr(repo, "language", None),
                     "topics": list(getattr(repo, "topics", []) or []),
                     "item_type": "repo",
                     "retrieval_mode": "topic_search",
                     "source_query": query,
+                    "search_rank": int(rank_pos),
+                    "search_pool_size": int(max(1, len(selected))),
+                    "search_sort": "updated",
+                    "search_selected_rank": int(selected_idx),
                     "window_days": window_days,
                     "search_endpoint": "github_search_repositories",
                     "extraction_method": "github_topic_search_readme" if readme else "github_topic_search_metadata",
@@ -566,12 +580,12 @@ async def fetch_github_query_fallback(
                 recency_bonus = 25.0
         return stars + forks * 2.0 + recency_bonus
 
-    repos_by_full_name: Dict[str, Tuple[Any, str, str]] = {}
+    repos_by_full_name: Dict[str, Tuple[Any, str, str, int]] = {}
     async with GitHubScraper() as scraper:
         for query in query_list:
             for sort_key in ("updated", "stars"):
                 repos = await scraper.search_repos(query=query, max_results=per_query, sort=sort_key, order="desc")
-                for repo in list(repos or []):
+                for rank_pos, repo in enumerate(list(repos or []), start=1):
                     full_name = str(getattr(repo, "full_name", "") or "").strip()
                     if not full_name:
                         continue
@@ -593,11 +607,13 @@ async def fetch_github_query_fallback(
                         continue
                     existing = repos_by_full_name.get(full_name)
                     if existing is None:
-                        repos_by_full_name[full_name] = (repo, query, sort_key)
+                        repos_by_full_name[full_name] = (repo, query, sort_key, rank_pos)
                     else:
-                        prev_repo, _prev_query, _prev_sort = existing
+                        prev_repo, _prev_query, _prev_sort, prev_rank = existing
                         if _repo_priority(repo) > _repo_priority(prev_repo):
-                            repos_by_full_name[full_name] = (repo, query, sort_key)
+                            repos_by_full_name[full_name] = (repo, query, sort_key, rank_pos)
+                        elif _repo_priority(repo) == _repo_priority(prev_repo) and rank_pos < prev_rank:
+                            repos_by_full_name[full_name] = (repo, query, sort_key, rank_pos)
                 if len(repos_by_full_name) >= max_items * 3:
                     break
             if len(repos_by_full_name) >= max_items * 3:
@@ -610,7 +626,7 @@ async def fetch_github_query_fallback(
     )[:max_items]
 
     items: List[RawItem] = []
-    for full_name, (repo, query, sort_key) in ordered:
+    for selected_idx, (full_name, (repo, query, sort_key, rank_pos)) in enumerate(ordered, start=1):
         body = _safe_truncate(
             "\n\n".join(
                 [
@@ -638,12 +654,18 @@ async def fetch_github_query_fallback(
                     "stars": int(getattr(repo, "stars", 0) or 0),
                     "forks": int(getattr(repo, "forks", 0) or 0),
                     "watchers": int(getattr(repo, "watchers", 0) or 0),
+                    "created_at": str(getattr(repo, "created_at", "") or ""),
+                    "updated_at": str(getattr(repo, "updated_at", "") or ""),
                     "last_push": str(getattr(repo, "updated_at", "") or ""),
                     "language": getattr(repo, "language", None),
                     "topics": list(getattr(repo, "topics", []) or []),
                     "item_type": "repo",
                     "retrieval_mode": "query_fallback",
                     "source_query": query,
+                    "search_rank": int(rank_pos),
+                    "search_pool_size": int(max(1, len(ordered))),
+                    "search_sort": str(sort_key),
+                    "search_selected_rank": int(selected_idx),
                     "window_days": window_days,
                     "search_endpoint": "github_search_repositories",
                     "fallback_used": True,
@@ -1034,11 +1056,11 @@ async def fetch_hackernews_search(
     else:
         hn_range = "past_year"
 
-    by_id: Dict[str, Tuple[Any, str]] = {}
+    by_id: Dict[str, Tuple[Any, str, int]] = {}
     async with HackerNewsScraper() as scraper:
         for query in query_list:
             stories = await scraper.search(query=query, max_results=per_query, sort_by="relevance", time_range=hn_range)
-            for story in list(stories or []):
+            for rank_pos, story in enumerate(list(stories or []), start=1):
                 sid = str(getattr(story, "id", "") or "").strip()
                 if not sid:
                     continue
@@ -1055,12 +1077,13 @@ async def fetch_hackernews_search(
                 ):
                     continue
                 if sid not in by_id:
-                    by_id[sid] = (story, query)
+                    by_id[sid] = (story, query, rank_pos)
             if len(by_id) >= max_items * 2:
                 break
 
     items: List[RawItem] = []
-    for sid, (story, query) in list(by_id.items())[:max_items]:
+    selected_hn = list(by_id.items())[:max_items]
+    for selected_idx, (sid, (story, query, rank_pos)) in enumerate(selected_hn, start=1):
         comments: List[str] = []
         try:
             payload = await _hn_fetch_item(sid)
@@ -1095,6 +1118,10 @@ async def fetch_hackernews_search(
                     "top_comments": comments,
                     "retrieval_mode": "topic_search",
                     "source_query": query,
+                    "search_rank": int(rank_pos),
+                    "search_pool_size": int(max(1, len(selected_hn))),
+                    "search_sort": "relevance",
+                    "search_selected_rank": int(selected_idx),
                     "window_days": window_days,
                     "search_endpoint": _HN_ALGOLIA_SEARCH,
                     "extraction_method": "hn_algolia_search",
