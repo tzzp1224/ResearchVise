@@ -1,6 +1,25 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: No-Candidate Crash Fix + Shortage Rescue (New)
+- 本次目标：
+  - 修复 live 场景下 `no candidates survived evidence audit` 直接导致 run 失败的问题。
+  - 保持硬相关不变量不变（`relevance>0`、`hard_match_pass`、`body_len>0`）前提下，避免“全 reject 即崩溃”。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - 新增 `shortage rescue`：当最大 phase 后 `picks` 为空时，从 hard-eligible 候选中选择 1 条并标记 `shortage_fallback_after_max_phase`（downgrade），继续生成产物。
+    - 回填 `attempts/quality_snapshot/selection_outcome`，避免 onepager 继续显示 `TopPicksMinRelevance=0` 之类失真值。
+    - 新增 HF metadata-only 深抓取触发条件：`extraction_method=*_metadata` 且正文过短也会尝试补抓。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+    - 新增“all reject 不崩溃”回归测试，确保 run 仍输出 artifacts，并在质量原因中标注 shortage fallback。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 预期：命令不再因 `no candidates survived evidence audit` 失败；会产出 diagnosis/facts/script/onepager（可能 `<top_k`，并附 shortage 原因）。
+- 已知限制与回滚：
+  - 当当天信号极弱时，仍可能只产出 1 条 downgrade 兜底（不会凑满）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Hard Invariants + Source-Coverage Shortage Policy (New)
 - 本次目标：
   - 修复 `topic="AI agent"` 下扩检后仍混入非 agent 条目（如 Qwen-VL/ColBERT）的问题。

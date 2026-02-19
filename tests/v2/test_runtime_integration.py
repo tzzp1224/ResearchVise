@@ -371,6 +371,40 @@ def _single_source_only_connectors() -> dict:
     }
 
 
+def _all_reject_connectors() -> dict:
+    body = ("Agent orchestration runtime with tool calling workflow and MCP session router. " * 24).strip()
+
+    async def _hn_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id="reject_hn_1",
+                source="hackernews",
+                title="Agent runtime experiment thread",
+                url="https://news.ycombinator.com/item?id=999331",
+                body=body,
+                tier="A",
+                metadata={"points": 1, "comment_count": 0, "item_type": "story"},
+            )
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _none,
+        "fetch_huggingface_search": _none,
+        "fetch_hackernews_search": _hn_search,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -663,3 +697,38 @@ def test_hf_metadata_only_item_triggers_deep_fetch_and_updates_body(tmp_path: Pa
     assert len(str(refreshed[0].body or "").strip()) > 0
     assert bool((refreshed[0].metadata or {}).get("deep_fetch_applied")) is True
     assert details and bool(details[0].get("accepted")) is True
+
+
+def test_runtime_shortage_rescue_prevents_crash_when_all_audit_verdicts_reject(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_all_reject_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_reject_rescue",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="today",
+            tz="UTC",
+            budget={"top_k": 3, "include_tier_b": False, "render_enabled": False},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_reject_rescue:ai-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+    assert int(ranking.get("top_picks_count", 0) or 0) >= 1
+    assert int(ranking.get("selected_downgrade_count", 0) or 0) >= 1
+    assert any(
+        "shortage_fallback_after_max_phase" in str(reason)
+        for reason in list(ranking.get("quality_trigger_reasons") or []) + list(ranking.get("why_not_more") or [])
+    )

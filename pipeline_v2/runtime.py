@@ -376,7 +376,57 @@ class RunPipelineRuntime:
         quality_snapshot = dict(selected.get("quality_snapshot") or {})
 
         if not picks:
-            raise RuntimeError("no candidates survived evidence audit")
+            rescued_pick = self._shortage_rescue_pick(
+                ranked=ranked,
+                relevance_eligible=relevance_eligible,
+                audit_records=audit_records,
+            )
+            if rescued_pick is None:
+                raise RuntimeError("no candidates survived evidence audit")
+
+            rescue_id = str((getattr(rescued_pick, "item", None).id if getattr(rescued_pick, "item", None) else "") or "").strip()
+            picks = [rescued_pick]
+            selection_outcome.selected_rows = list(picks)
+            selection_outcome.selected_verdicts = {rescue_id: "downgrade"} if rescue_id else {}
+            selection_outcome.selected_downgrade_reasons = (
+                {rescue_id: ["shortage_fallback_after_max_phase"]} if rescue_id else {}
+            )
+            selection_outcome.used_downgrade = True
+            selection_outcome.all_selected_downgrade = True
+
+            if "shortage_fallback_after_max_phase" not in selected_quality_reasons:
+                selected_quality_reasons.append("shortage_fallback_after_max_phase")
+
+            quality_snapshot = self._attempt_quality_snapshot(
+                ranked=ranked,
+                picks=picks,
+                topic_profile=topic_profile,
+                audit_records=audit_records,
+                selection_outcome=selection_outcome,
+            )
+            selected["quality_snapshot"] = dict(quality_snapshot)
+            selected["quality_reasons"] = list(selected_quality_reasons)
+            selected["selection_outcome"] = selection_outcome
+
+            attempt_idx = int(selected.get("attempt", 1) or 1) - 1
+            if 0 <= attempt_idx < len(attempts):
+                attempt_payload = dict(attempts[attempt_idx] or {})
+                attempt_payload["top_picks_count"] = len(picks)
+                attempt_payload["top_picks_min_relevance"] = float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0)
+                attempt_payload["top_picks_hard_match_count"] = int(quality_snapshot.get("top_picks_hard_match_count", 0) or 0)
+                attempt_payload["bucket_coverage"] = int(quality_snapshot.get("bucket_coverage", 0) or 0)
+                attempt_payload["source_coverage"] = int(quality_snapshot.get("source_coverage", 0) or 0)
+                attempt_payload["top_picks_min_evidence_quality"] = float(
+                    quality_snapshot.get("top_picks_min_evidence_quality", 0.0) or 0.0
+                )
+                attempt_payload["selected_pass_count"] = 0
+                attempt_payload["selected_downgrade_count"] = len(picks)
+                attempt_payload["selected_all_downgrade"] = True
+                attempt_reasons = [str(value) for value in list(attempt_payload.get("quality_trigger_reasons") or []) if str(value).strip()]
+                if "shortage_fallback_after_max_phase" not in attempt_reasons:
+                    attempt_reasons.append("shortage_fallback_after_max_phase")
+                attempt_payload["quality_trigger_reasons"] = attempt_reasons
+                attempts[attempt_idx] = attempt_payload
 
         audit_payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1347,6 +1397,70 @@ class RunPipelineRuntime:
             min_bucket_coverage=max(1, min_bucket),
             min_source_coverage=max(1, _int("min_source_coverage", "ARA_V2_MIN_SOURCE_COVERAGE", 2)),
         )
+
+    @staticmethod
+    def _row_hard_selection_eligible(row: Any) -> bool:
+        item = getattr(row, "item", None)
+        if item is None:
+            return False
+        metadata = dict(getattr(item, "metadata", None) or {})
+        try:
+            relevance = float(getattr(row, "relevance_score", 0.0) or 0.0)
+        except Exception:
+            relevance = 0.0
+        if relevance <= 0.0:
+            return False
+        if not bool(metadata.get("topic_hard_match_pass", True)):
+            return False
+        try:
+            body_len = int(float(metadata.get("body_len", len(str(getattr(item, "body_md", "") or ""))) or 0))
+        except Exception:
+            body_len = len(str(getattr(item, "body_md", "") or "").strip())
+        return body_len > 0
+
+    def _shortage_rescue_pick(
+        self,
+        *,
+        ranked: Sequence[Any],
+        relevance_eligible: Sequence[Any],
+        audit_records: Sequence[Any],
+    ) -> Optional[Any]:
+        records_by_id = {
+            str(getattr(record, "item_id", "") or "").strip(): record
+            for record in list(audit_records or [])
+            if str(getattr(record, "item_id", "") or "").strip()
+        }
+        seen = set()
+        pool: List[Any] = []
+        for row in list(relevance_eligible or []) + list(ranked or []):
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            pool.append(row)
+
+        for row in pool:
+            if not self._row_hard_selection_eligible(row):
+                continue
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+            record = records_by_id.get(item_id)
+            if record is not None:
+                verdict = str(getattr(record, "verdict", "") or "").strip().lower()
+                if verdict == "reject":
+                    reasons = [str(value) for value in list(getattr(record, "reasons", []) or []) if str(value).strip()]
+                    if "shortage_fallback_after_max_phase" not in reasons:
+                        reasons.append("shortage_fallback_after_max_phase")
+                    record.reasons = reasons
+                    record.verdict = "downgrade"
+                    machine_action = dict(getattr(record, "machine_action", {}) or {})
+                    machine_action["action"] = "downgrade"
+                    machine_action["reason_code"] = "shortage_fallback_after_max_phase"
+                    machine_action["human_reason"] = (
+                        "no pass/downgrade candidates after max phase; selected best hard-relevant candidate"
+                    )
+                    record.machine_action = machine_action
+            return row
+        return None
 
     def _annotate_raw_item_topic_context(
         self,
