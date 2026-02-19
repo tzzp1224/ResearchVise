@@ -4,7 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from core import PromptSpec, RawItem, RunMode, RunRequest, Shot, Storyboard
+from core import NormalizedItem, PromptSpec, RawItem, RunMode, RunRequest, Shot, Storyboard
 from orchestrator import RunOrchestrator
 from orchestrator.queue import InMemoryRunQueue
 from orchestrator.store import InMemoryRunStore
@@ -759,6 +759,43 @@ def test_hf_metadata_only_item_triggers_deep_fetch_and_updates_body(tmp_path: Pa
     assert len(str(refreshed[0].body or "").strip()) > 0
     assert bool((refreshed[0].metadata or {}).get("deep_fetch_applied")) is True
     assert details and bool(details[0].get("accepted")) is True
+
+
+def test_runtime_cross_source_corroboration_annotation_marks_shared_entity(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides={},
+    )
+
+    github_item = NormalizedItem(
+        id="gh_item",
+        source="github",
+        title="acme/agent-runtime",
+        url="https://github.com/acme/agent-runtime",
+        body_md="Agent runtime orchestration quickstart.",
+        tier="A",
+        hash="hash-gh",
+        metadata={},
+    )
+    hn_item = NormalizedItem(
+        id="hn_item",
+        source="hackernews",
+        title="HN discussion: acme/agent-runtime",
+        url="https://github.com/acme/agent-runtime",
+        body_md="Discussion on production rollout.",
+        tier="A",
+        hash="hash-hn",
+        metadata={"hn_url": "https://news.ycombinator.com/item?id=123"},
+    )
+
+    annotated = runtime._annotate_cross_source_corroboration([github_item, hn_item])  # type: ignore[attr-defined]
+    assert bool((annotated[0].metadata or {}).get("cross_source_corroborated")) is True
+    assert bool((annotated[1].metadata or {}).get("cross_source_corroborated")) is True
+    assert int((annotated[0].metadata or {}).get("cross_source_corroboration_count", 0) or 0) >= 2
 
 
 def test_runtime_shortage_rescue_prevents_crash_when_all_audit_verdicts_reject(tmp_path: Path) -> None:

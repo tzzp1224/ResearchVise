@@ -1,6 +1,50 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Cross-source Soft Bonus + Dynamic HN/HF Audit Thresholds + Relevance De-saturation (New)
+- 本次目标：
+  - 提升 AI agent 主题 live 结果的“内容产品感”：允许单源强趋势稳定返回，不再把多源覆盖当成硬失败；同时补上跨源佐证加分、HN/HF 动态审计、relevance 满分去饱和。
+  - 保持 deterministic + 可插拔架构（LLM Planner/Auditor 仍是可选插槽，默认关闭）。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - 新增 cross-source corroboration 标注：按可解析 entity key（GitHub repo/HF repo）聚合同实体跨源出现，写入 `cross_source_*` 元数据与 diagnosis。
+    - 选择结果摘要新增 `source_diversity_status` 与 `top_cross_source_corroborated_*` 字段。
+    - `why_not_more` 调整为“数量不足时才记录 source_diversity_lt_2”；TopK 已满足但单源时改为状态说明，不再误导为失败。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - 新增 `cross_source_bonus`（软加分）并在 `why_ranked` 解释里落地 `cross_source.corroboration_bonus`。
+    - 收紧 AI agent `relevance=1.0` 条件：必须高价值术语 + 可验证内容信号 + 正文密度与长度门槛同时满足；其余结果上限降到 `<=0.93`，避免 1.0 泛滥。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - HN 低互动规则改为动态：新帖（默认 24h 内）且有高可信外链/跨源佐证时降级而非直接拒绝。
+    - HF 缺更新时间规则放宽：deep-fetch 成功且正文/证据达标时不再一刀切降级。
+    - `hf_missing_agent_signals` 改为 `hf_agent_signal_weak`（默认 downgrade），减少“新项目早期信号”被过度 reject。
+    - 增加 cross-source 边界提升逻辑：仅在无硬拒绝原因时允许从 downgrade 升到 pass。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`
+    - onepager header 与每个 Top pick 增加 cross-source / diversity 可解释字段。
+- 新增/更新测试：
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+    - 新增 `cross_source` 软加分生效回归。
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+    - 新增 HN 新帖低互动“降级而非拒绝”回归。
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+    - 新增 runtime cross-source 标注回归。
+- 阈值与可配置项：
+  - `ARA_V2_AUDIT_HN_MIN_POINTS`（默认 `5`）
+  - `ARA_V2_AUDIT_HN_MIN_COMMENTS`（默认 `2`）
+  - `ARA_V2_AUDIT_HN_RECENT_HOURS`（默认 `24`）
+  - 其余门槛沿用现有 `SelectionController`/`TopicProfile` 配置。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 重点观察：
+    - `TopPicksCount` 稳定；
+    - `top_relevance_scores` 不再大量 `1.0`；
+    - `source_diversity_status` 与 `top_cross_source_corroborated_count` 在 onepager/retrieval_diagnosis 可追踪；
+    - HN 新帖低互动在有外链证据时以 downgrade 保留，而非直接全 reject。
+- 风险与回滚：
+  - 风险：cross-source bonus 可能在极少数情况下抬高边缘候选排序（已通过 hard relevance + auditor 护栏限制）。
+  - 风险：HN 动态阈值会增加降级候选数，若当日信号弱可能触发更多扩检。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: SelectionController Pass-Fill Fix (Avoid Single-Item Collapse Under Source Diversity Pressure) (New)
 - 本次目标：
   - 修复 live 产物中“候选很多、pass 很多，但 Top picks 经常只剩 1-2 条”的选择器退化。

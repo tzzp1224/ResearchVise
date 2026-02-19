@@ -233,6 +233,7 @@ class RunPipelineRuntime:
             embeddings = embed(unique_items)
             grouped = cluster(unique_items, embeddings)
             merged = [merge_cluster(group) for group in grouped]
+            merged = self._annotate_cross_source_corroboration(merged)
             rank_pack = self._rank_with_relevance_gate(
                 merged=merged,
                 topic=request.topic,
@@ -541,6 +542,8 @@ class RunPipelineRuntime:
                     "hard_match_pass": bool(metadata.get("topic_hard_match_pass")),
                     "hard_match_terms": [str(value) for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()],
                     "bucket_hits": [str(value) for value in list(metadata.get("bucket_hits") or []) if str(value).strip()],
+                    "cross_source_corroborated": bool(metadata.get("cross_source_corroborated")),
+                    "cross_source_count": int(float(metadata.get("cross_source_corroboration_count", 0) or 0)),
                     "audit_verdict": str(record.verdict if record else "unknown"),
                     "audit_reason_code": str(machine_action.get("reason_code") or ""),
                     "drop_reason": None if item.id in picked_ids else _drop_reason(row),
@@ -567,6 +570,14 @@ class RunPipelineRuntime:
         )
         max_downgrade_allowed = int(getattr(selection_outcome, "max_downgrade_allowed", 0) or 0)
         downgrade_cap_reached = bool(getattr(selection_outcome, "downgrade_cap_reached", False))
+        source_coverage_now = len(
+            {str(entry.item.source or "").strip().lower() for entry in list(picks or []) if getattr(entry, "item", None)}
+        )
+        source_diversity_status = (
+            "met"
+            if source_coverage_now >= 2
+            else ("single_source_only_topk_filled" if len(picks) >= top_count else "single_source_with_shortage")
+        )
         why_not_more: List[str] = []
         if len(picks) < top_count:
             why_not_more.append(f"top_picks_lt_{top_count}")
@@ -576,12 +587,18 @@ class RunPipelineRuntime:
             why_not_more.append("used_downgrade_fallback_after_expansion")
         if bool(selection_outcome.all_selected_downgrade):
             why_not_more.append("all_top_picks_downgrade_after_max_phase")
-        if len({str(entry.item.source or "").strip().lower() for entry in list(picks or []) if getattr(entry, "item", None)}) < 2:
+        if source_coverage_now < 2 and len(picks) < top_count:
             why_not_more.append("source_diversity_lt_2")
         if selected_bucket_coverage < 2 and (topic_profile and topic_profile.minimum_bucket_coverage >= 2):
             why_not_more.append("bucket_coverage_lt_2")
         if downgrade_cap_reached:
             why_not_more.append(f"downgrade_fill_cap_reached:{max_downgrade_allowed}")
+
+        top_cross_source_ids = [
+            str(entry.item.id)
+            for entry in list(picks or [])
+            if bool((entry.item.metadata or {}).get("cross_source_corroborated"))
+        ]
 
         retrieval_diagnosis = {
             "run_id": run_id,
@@ -612,9 +629,12 @@ class RunPipelineRuntime:
             "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
             "max_downgrade_allowed": max_downgrade_allowed,
             "downgrade_cap_reached": downgrade_cap_reached,
+            "source_diversity_status": source_diversity_status,
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
             "why_not_more": why_not_more,
+            "top_cross_source_corroborated_ids": top_cross_source_ids,
+            "top_cross_source_corroborated_count": len(top_cross_source_ids),
             "candidate_rows": candidate_rows,
             "top_dropped_items": top_dropped,
             "evidence_audit_path": audit_path,
@@ -642,9 +662,12 @@ class RunPipelineRuntime:
             "selected_downgrade_count": selected_downgrade_count,
             "max_downgrade_allowed": max_downgrade_allowed,
             "downgrade_cap_reached": downgrade_cap_reached,
+            "source_diversity_status": source_diversity_status,
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
             "why_not_more": why_not_more,
+            "top_cross_source_corroborated_ids": top_cross_source_ids,
+            "top_cross_source_corroborated_count": len(top_cross_source_ids),
             "expansion_steps": [
                 {
                     "attempt": int(item.get("attempt", 0) or 0),
@@ -735,6 +758,7 @@ class RunPipelineRuntime:
             "downgrade_cap_reached": downgrade_cap_reached,
             "bucket_coverage": selected_bucket_coverage,
             "selected_source_coverage": int(selected_attempt_payload.get("source_coverage", quality_snapshot.get("source_coverage", 0)) or 0),
+            "source_diversity_status": source_diversity_status,
             "top_bucket_hits": sorted(
                 {
                     str(bucket).strip()
@@ -746,6 +770,8 @@ class RunPipelineRuntime:
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": selected_quality_reasons,
             "why_not_more": why_not_more,
+            "top_cross_source_corroborated_ids": top_cross_source_ids,
+            "top_cross_source_corroborated_count": len(top_cross_source_ids),
             "top_why_ranked": [_why_ranked(entry) for entry in picks],
             "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
             "drop_reason_samples": [
@@ -1375,6 +1401,82 @@ class RunPipelineRuntime:
             seen.add(key)
             output.append(token)
         return output
+
+    @staticmethod
+    def _entity_key_from_url(url: str) -> str:
+        token = normalize_url(str(url or "").strip())
+        if not token:
+            return ""
+        parsed = urlparse(token)
+        host = str(parsed.netloc or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        parts = [part for part in str(parsed.path or "").split("/") if part]
+        if host == "github.com" and len(parts) >= 2:
+            if parts[0].lower() in {"orgs", "organizations", "topics", "search", "collections"}:
+                return ""
+            return f"github:{parts[0].lower()}/{parts[1].lower()}"
+        if host.endswith("huggingface.co"):
+            if not parts:
+                return ""
+            if parts[0] in {"models", "datasets", "spaces"} and len(parts) >= 3:
+                return f"huggingface:{parts[0].lower()}:{parts[1].lower()}/{parts[2].lower()}"
+            if len(parts) >= 2 and parts[0] not in {"blog", "docs"}:
+                return f"huggingface:model:{parts[0].lower()}/{parts[1].lower()}"
+            return ""
+        return ""
+
+    def _corroboration_key(self, item: Any) -> str:
+        metadata = dict((getattr(item, "metadata", None) or {}) if item else {})
+        source = str((getattr(item, "source", "") if item else "") or "").strip().lower()
+        title = str((getattr(item, "title", "") if item else "") or "").strip().lower()
+        url = str((getattr(item, "url", "") if item else "") or "").strip()
+
+        for candidate in [url, str(metadata.get("canonical_url") or ""), str(metadata.get("hn_url") or "")]:
+            key = self._entity_key_from_url(candidate)
+            if key:
+                return key
+
+        repo_id = str(metadata.get("repo_id") or "").strip().lower()
+        if source == "huggingface" and repo_id:
+            item_type = str(metadata.get("item_type") or "model").strip().lower() or "model"
+            return f"huggingface:{item_type}:{repo_id}"
+
+        if source == "github":
+            repo_name = title if "/" in title else ""
+            if repo_name:
+                owner, repo = repo_name.split("/", 1)
+                if owner and repo:
+                    return f"github:{owner.strip().lower()}/{repo.strip().lower()}"
+        return ""
+
+    def _annotate_cross_source_corroboration(self, items: Sequence[Any]) -> List[Any]:
+        out: List[Any] = [item for item in list(items or [])]
+        key_to_sources: Dict[str, set[str]] = {}
+        for item in out:
+            key = self._corroboration_key(item)
+            if not key:
+                continue
+            source = str((getattr(item, "source", "") if item else "") or "").strip().lower()
+            if not source:
+                continue
+            if key not in key_to_sources:
+                key_to_sources[key] = set()
+            key_to_sources[key].add(source)
+
+        for item in out:
+            metadata = dict((getattr(item, "metadata", None) or {}) if item else {})
+            key = self._corroboration_key(item)
+            sources = sorted(key_to_sources.get(key) or [])
+            corroborated = len(sources) >= 2
+            metadata["cross_source_corroboration_key"] = key
+            metadata["cross_source_corroboration_sources"] = sources
+            metadata["cross_source_corroboration_count"] = len(sources)
+            metadata["cross_source_corroborated"] = bool(corroborated)
+            metadata["cross_source_bonus"] = 0.05 if corroborated else 0.0
+            if item is not None:
+                item.metadata = metadata
+        return out
 
     def _resolve_research_planner(self, request: RunRequest) -> ResearchPlanner:
         budget = dict(request.budget or {})

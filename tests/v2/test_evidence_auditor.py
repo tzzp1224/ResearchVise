@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from core import Citation, NormalizedItem, RankedItem
 from pipeline_v2.evidence_auditor import EvidenceAuditor, VERDICT_DOWNGRADE, VERDICT_REJECT
 
@@ -136,6 +138,30 @@ def test_evidence_auditor_rejects_low_engagement_hn_item() -> None:
     record = auditor.audit_row(row, rank=1)
     assert record.verdict == VERDICT_REJECT
     assert any("hn_low_engagement" in reason for reason in list(record.reasons or []))
+
+
+def test_evidence_auditor_downgrades_recent_low_engagement_hn_with_external_evidence() -> None:
+    row = _row(
+        "hn_recent_low",
+        source="hackernews",
+        body=("agent runtime orchestration notes " * 80).strip(),
+        citations=[
+            Citation(title="docs", url="https://docs.acme.dev/agent-runtime", snippet="quickstart docs", source="docs"),
+            Citation(title="hn", url="https://news.ycombinator.com/item?id=999", snippet="discussion", source="hn"),
+        ],
+        metadata={
+            "body_len": 900,
+            "points": 2,
+            "comment_count": 1,
+            "quality_signals": {"evidence_links_quality": 2, "publish_or_update_time": "2026-02-19T10:00:00Z"},
+        },
+        rank=1,
+    )
+    row.item.published_at = datetime.now(timezone.utc)
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == VERDICT_DOWNGRADE
+    assert any("hn_low_engagement_recent" in reason for reason in list(record.reasons or []))
 
 
 def test_evidence_auditor_rejects_zero_body_and_hard_gate_fail() -> None:

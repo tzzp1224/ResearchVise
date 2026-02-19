@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence
 from urllib.parse import urlparse
@@ -283,6 +284,28 @@ def _is_evergreen_source(source: str) -> bool:
     return str(source or "").strip().lower() in {"arxiv", "semantic_scholar", "openreview"}
 
 
+def _parse_datetime_token(value: str) -> datetime | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    try:
+        return datetime.fromisoformat(token.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _item_age_hours(item: NormalizedItem, *, publish_or_update_time: str) -> float | None:
+    dt = item.published_at
+    if dt is None:
+        dt = _parse_datetime_token(publish_or_update_time)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+    return max(0.0, float(delta.total_seconds()) / 3600.0)
+
+
 def _reason_code(reason: str) -> str:
     token = str(reason or "").strip()
     if not token:
@@ -325,6 +348,18 @@ class EvidenceAuditor:
         self._duplicate_ratio_threshold = float(max(0.0, min(1.0, duplicate_ratio_threshold)))
         self._topic = str(topic or "").strip()
         self._topic_profile = topic_profile
+        try:
+            self._hn_min_points = max(0, int(float(os.getenv("ARA_V2_AUDIT_HN_MIN_POINTS", "5"))))
+        except Exception:
+            self._hn_min_points = 5
+        try:
+            self._hn_min_comments = max(0, int(float(os.getenv("ARA_V2_AUDIT_HN_MIN_COMMENTS", "2"))))
+        except Exception:
+            self._hn_min_comments = 2
+        try:
+            self._hn_recent_hours = max(1, int(float(os.getenv("ARA_V2_AUDIT_HN_RECENT_HOURS", "24"))))
+        except Exception:
+            self._hn_recent_hours = 24
 
     def _is_agent_topic(self) -> bool:
         if self._topic_profile and str(self._topic_profile.key or "").strip().lower() == "ai_agent":
@@ -352,13 +387,17 @@ class EvidenceAuditor:
     def audit_row(self, row: Any, rank: int) -> AuditRecord:
         item = row.item
         metadata = dict(item.metadata or {})
+        source_key = str(item.source or "").strip().lower()
         signals = dict(metadata.get("quality_signals") or {})
         body_len = int(float(metadata.get("body_len", len(str(item.body_md or ""))) or 0))
         relevance_score = float(getattr(row, "relevance_score", 0.0) or 0.0)
         hard_gate_fail = not bool(metadata.get("topic_hard_match_pass", True))
+        cross_source_count = int(float(metadata.get("cross_source_corroboration_count", 0) or 0))
+        cross_source_corroborated = bool(metadata.get("cross_source_corroborated")) or cross_source_count >= 2
         min_body_len = _source_min_body_len(item.source)
         evidence_links_quality = int(float(signals.get("evidence_links_quality", 0) or 0))
         publish_or_update_time = str(signals.get("publish_or_update_time") or metadata.get("publish_or_update_time") or "").strip()
+        age_hours = _item_age_hours(item, publish_or_update_time=publish_or_update_time)
         duplicate_ratio = _citation_duplicate_ratio(item)
         urls = _collect_evidence_urls(item)
         domains = _domains(urls)
@@ -422,12 +461,19 @@ class EvidenceAuditor:
             )
 
         if not publish_or_update_time and not _is_evergreen_source(item.source):
-            verdict = self._apply_rule(
-                verdict=verdict,
-                reasons=reasons,
-                target=VERDICT_DOWNGRADE,
-                reason="missing_publish_or_update_time",
+            hf_acceptable_missing_time = bool(
+                source_key == "huggingface"
+                and bool(metadata.get("deep_fetch_applied"))
+                and body_len >= min_body_len
+                and evidence_links_quality >= max(1, self._min_evidence_links_quality - 1)
             )
+            if not hf_acceptable_missing_time:
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_DOWNGRADE,
+                    reason="missing_publish_or_update_time",
+                )
 
         clean_text = str(metadata.get("clean_text") or item.body_md or "")
         head_text = " ".join(re.split(r"[.!?;\n]+", clean_text)[:3]).strip()
@@ -447,7 +493,6 @@ class EvidenceAuditor:
                 reason="single_domain_repo_self_evidence",
             )
 
-        source_key = str(item.source or "").strip().lower()
         text = " ".join([str(item.title or ""), clean_text]).lower()
         has_quickstart = bool(signals.get("has_quickstart"))
         has_results = bool(signals.get("has_results_or_bench"))
@@ -457,16 +502,32 @@ class EvidenceAuditor:
         if source_key == "hackernews":
             points = int(float(metadata.get("points", 0) or 0))
             comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
-            has_strong_signal = bool(
-                has_multi_domain_evidence and (has_quickstart or has_results or evidence_links_quality >= 3)
+            low_engagement = points < self._hn_min_points and comments < self._hn_min_comments
+            has_external_high_trust = bool(
+                _has_high_trust_technical_evidence(urls)
+                and any(str(domain).strip().lower() != "news.ycombinator.com" for domain in list(domains or []))
             )
-            if points < 5 and comments < 2 and not has_strong_signal:
-                verdict = self._apply_rule(
-                    verdict=verdict,
-                    reasons=reasons,
-                    target=VERDICT_REJECT,
-                    reason=f"hn_low_engagement:{points}/{comments}",
-                )
+            has_strong_signal = bool(
+                (has_multi_domain_evidence and (has_quickstart or has_results or evidence_links_quality >= 3))
+                or cross_source_corroborated
+            )
+            if low_engagement and not has_strong_signal:
+                if age_hours is not None and age_hours <= float(self._hn_recent_hours) and (
+                    has_external_high_trust or cross_source_corroborated
+                ):
+                    verdict = self._apply_rule(
+                        verdict=verdict,
+                        reasons=reasons,
+                        target=VERDICT_DOWNGRADE,
+                        reason=f"hn_low_engagement_recent:{points}/{comments}",
+                    )
+                else:
+                    verdict = self._apply_rule(
+                        verdict=verdict,
+                        reasons=reasons,
+                        target=VERDICT_REJECT,
+                        reason=f"hn_low_engagement:{points}/{comments}",
+                    )
 
         if source_key == "github":
             stars = int(float(metadata.get("stars", 0) or 0))
@@ -495,9 +556,23 @@ class EvidenceAuditor:
                 verdict = self._apply_rule(
                     verdict=verdict,
                     reasons=reasons,
-                    target=VERDICT_REJECT,
-                    reason="hf_missing_agent_signals",
+                    target=VERDICT_DOWNGRADE,
+                    reason="hf_agent_signal_weak",
                 )
+
+        if verdict == VERDICT_DOWNGRADE and cross_source_corroborated and evidence_links_quality >= 1:
+            hard_reject_reasons = {
+                "topic_relevance_zero",
+                "topic_hard_gate_fail",
+                "body_len_zero",
+                "hf_cv_offtopic_for_agent_topic",
+                "hn_low_engagement",
+            }
+            reason_codes = {_reason_code(reason) for reason in list(reasons or [])}
+            if not reason_codes.intersection(hard_reject_reasons) and "evidence_high_trust_missing" not in reason_codes:
+                verdict = VERDICT_PASS
+                if "cross_source_corroboration_bonus" not in reasons:
+                    reasons.append("cross_source_corroboration_bonus")
 
         if source_key in {"github", "huggingface"} and verdict == VERDICT_PASS:
             if not _has_high_trust_technical_evidence(urls):

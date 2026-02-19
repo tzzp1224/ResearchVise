@@ -321,6 +321,9 @@ def generate_onepager(
     selected_source_coverage = int(
         ranking_stats.get("selected_source_coverage", retrieval.get("source_coverage", 0)) or 0
     )
+    source_diversity_status = str(
+        ranking_stats.get("source_diversity_status", retrieval.get("source_diversity_status", "unknown")) or "unknown"
+    ).strip()
     quality_triggered_expansion = bool(
         ranking_stats.get("quality_triggered_expansion", retrieval.get("quality_triggered_expansion", False))
     )
@@ -337,6 +340,24 @@ def generate_onepager(
         ranking_stats.get("selected_downgrade_count", retrieval.get("selected_downgrade_count", 0)) or 0
     )
     selected_all_downgrade = bool(ranking_stats.get("selected_all_downgrade", False))
+    top_cross_source_corroborated_count = int(
+        ranking_stats.get(
+            "top_cross_source_corroborated_count",
+            retrieval.get("top_cross_source_corroborated_count", 0),
+        )
+        or 0
+    )
+    top_cross_source_corroborated_ids = [
+        str(value).strip()
+        for value in list(
+            ranking_stats.get(
+                "top_cross_source_corroborated_ids",
+                retrieval.get("top_cross_source_corroborated_ids", []),
+            )
+            or []
+        )
+        if str(value).strip()
+    ]
     why_not_more_reasons = [
         str(value).strip()
         for value in list(ranking_stats.get("why_not_more") or retrieval.get("why_not_more") or [])
@@ -389,6 +410,13 @@ def generate_onepager(
         f"- SelectedDowngradeCount: `{selected_downgrade_count}`",
         f"- BucketCoverage: `{bucket_coverage}`",
         f"- SelectedSourceCoverage: `{selected_source_coverage}`",
+        f"- SourceDiversityStatus: `{source_diversity_status}`",
+        f"- TopCrossSourceCorroboratedCount: `{top_cross_source_corroborated_count}`",
+        (
+            f"- TopCrossSourceCorroboratedIds: `{','.join(top_cross_source_corroborated_ids)}`"
+            if top_cross_source_corroborated_ids
+            else "- TopCrossSourceCorroboratedIds: `N/A`"
+        ),
         f"- QualityTriggeredExpansion: `{str(quality_triggered_expansion).lower()}`",
         f"- QualityTriggerReasons: `{','.join(quality_trigger_reasons) if quality_trigger_reasons else 'N/A'}`",
         f"- WhyNotMoreReasons: `{','.join(why_not_more_reasons) if why_not_more_reasons else 'N/A'}`",
@@ -427,6 +455,12 @@ def generate_onepager(
         title_suffix = ""
         if verdict == "downgrade":
             title_suffix = f" (降级: {downgrade_reasons[0] if downgrade_reasons else 'evidence_weak'})"
+        corroborated = bool((item.metadata or {}).get("cross_source_corroborated"))
+        corroboration_sources = [
+            str(value).strip()
+            for value in list((item.metadata or {}).get("cross_source_corroboration_sources") or [])
+            if str(value).strip()
+        ]
 
         lines.extend(
             [
@@ -435,6 +469,11 @@ def generate_onepager(
                 f"- Source Domain: `{_domain(item.url)}`",
                 f"- Tier/Credibility: `{item.tier}` / `{credibility}`",
                 f"- Topic Relevance: `{relevance_value:.2f}`" if relevance_value is not None else "- Topic Relevance: `N/A`",
+                (
+                    f"- Cross-source Corroboration: `yes ({','.join(corroboration_sources)})`"
+                    if corroborated and corroboration_sources
+                    else "- Cross-source Corroboration: `no`"
+                ),
                 f"- Why Ranked: `{_why_ranked(payload, item)}`",
                 (
                     "- Quality Metrics: "

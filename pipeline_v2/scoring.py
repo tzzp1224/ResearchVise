@@ -243,27 +243,38 @@ def evaluate_relevance(
                 agent_high_value_hits.append(term)
 
         has_high_value = bool(agent_high_value_hits)
+        high_value_count = len(
+            {str(term).strip().lower() for term in agent_high_value_hits if str(term).strip()}
+        )
         non_generic_count = len({str(term).strip().lower() for term in agent_non_generic_hits if str(term).strip()})
         if score >= 0.8 and not (has_high_value or non_generic_count >= 2):
             score = 0.79
             agent_score_cap = "cap_lt_0.8_requires_non_generic_or_high_value"
-        elif score >= 0.9 and not has_high_value:
+        elif score >= 0.9 and not (has_high_value and non_generic_count >= 2):
             score = 0.89
-            agent_score_cap = "cap_lt_0.9_requires_high_value_agent_term"
+            agent_score_cap = "cap_lt_0.9_requires_high_value_and_non_generic_depth"
 
         signals = _quality_signals(item)
-        has_substantive_content = bool(
+        body_len = int(_to_float((item.metadata or {}).get("body_len"), len(str(item.body_md or ""))))
+        has_verifiable_content_signal = bool(
             float(signals["content_density"]) >= 0.14
             or bool(signals["has_quickstart"])
             or bool(signals["has_results_or_bench"])
             or re.search(r"\b(quickstart|benchmark|result|usage|cli|api|workflow)\b", topic_text)
         )
-        if has_high_value and has_substantive_content and score >= 0.92:
+        if (
+            has_high_value
+            and (high_value_count >= 2 or non_generic_count >= 2)
+            and has_verifiable_content_signal
+            and float(signals["content_density"]) >= 0.18
+            and body_len >= 500
+            and score >= 0.94
+        ):
             score = 1.0
         else:
-            score = min(score, 0.95)
-            if not agent_score_cap and score >= 0.95:
-                agent_score_cap = "cap_lt_1.0_requires_high_value_plus_substantive_content"
+            score = min(score, 0.93)
+            if not agent_score_cap and score >= 0.93:
+                agent_score_cap = "cap_lt_1.0_requires_high_value_plus_verifiable_content"
 
     return {
         "score": score,
@@ -419,6 +430,12 @@ def rank_items(
             str(value) for value in list(relevance_payload.get("agent_high_value_hits") or []) if str(value).strip()
         ]
         agent_score_cap = str(relevance_payload.get("agent_score_cap") or "").strip()
+        cross_source_bonus = max(0.0, min(0.08, _to_float((item.metadata or {}).get("cross_source_bonus"), 0.0)))
+        corroboration_sources = [
+            str(value).strip()
+            for value in list((item.metadata or {}).get("cross_source_corroboration_sources") or [])
+            if str(value).strip()
+        ]
 
         metadata = dict(item.metadata or {})
         metadata["topic_hard_match_pass"] = bool(hard_match_pass)
@@ -449,6 +466,8 @@ def rank_items(
             total = _clamp01(total * 0.45)
         else:
             total = _clamp01(total + quality_boost)
+        if cross_source_bonus > 0:
+            total = _clamp01(total + cross_source_bonus)
 
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
@@ -477,6 +496,8 @@ def rank_items(
                 agent_non_generic_hits,
                 agent_high_value_hits,
                 agent_score_cap,
+                cross_source_bonus,
+                corroboration_sources,
             )
         )
 
@@ -508,6 +529,8 @@ def rank_items(
             _agent_non_generic_hits,
             _agent_high_value_hits,
             _agent_score_cap,
+            _cross_source_bonus,
+            _corroboration_sources,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -542,6 +565,8 @@ def rank_items(
         agent_non_generic_hits,
         agent_high_value_hits,
         agent_score_cap,
+        cross_source_bonus,
+        corroboration_sources,
     ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -570,6 +595,10 @@ def rank_items(
             reasons.append(f"topic.agent_high_value_hits={','.join(agent_high_value_hits)}")
         if agent_score_cap:
             reasons.append(f"topic.agent_score_cap={agent_score_cap}")
+        if cross_source_bonus > 0:
+            reasons.append(f"cross_source.corroboration_bonus={cross_source_bonus:.2f}")
+            if corroboration_sources:
+                reasons.append(f"cross_source.sources={','.join(corroboration_sources)}")
         signals = _quality_signals(item)
         reasons.extend(
             [

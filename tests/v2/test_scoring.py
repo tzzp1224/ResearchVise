@@ -218,3 +218,28 @@ def test_source_query_terms_do_not_bypass_hard_relevance_gate() -> None:
     item.body_md = "Vision-language model card with OCR, image understanding, and video reasoning examples."
     score = score_relevance(item, "AI agent")
     assert score == 0.0
+
+
+def test_cross_source_corroboration_bonus_improves_ranking_order() -> None:
+    baseline = _item(
+        "baseline",
+        tier="A",
+        source="github",
+        title="Agent orchestration runtime",
+        metadata={"credibility": "high", "citation_count": 2},
+    )
+    corroborated = _item(
+        "corroborated",
+        tier="A",
+        source="github",
+        title="Agent orchestration runtime",
+        metadata={
+            "credibility": "high",
+            "citation_count": 2,
+            "cross_source_bonus": 0.05,
+            "cross_source_corroboration_sources": ["github", "hackernews"],
+        },
+    )
+    ranked = rank_items([baseline, corroborated], topic="AI agent", relevance_threshold=0.55)
+    assert ranked[0].item.id == "corroborated"
+    assert any("cross_source.corroboration_bonus=0.05" in reason for reason in list(ranked[0].reasons or []))
