@@ -23,6 +23,20 @@ See docs at https://example.com/docs
     assert stats["clean_len"] > 20
 
 
+def test_sanitize_markdown_keeps_substantive_line_with_promo_url() -> None:
+    raw = (
+        "Agent runtime supports MCP orchestration and rollback workflows. "
+        "Sponsor link: https://buymeacoffee.com/demo"
+    )
+    clean_md, clean_text, _stats = sanitize_markdown(raw)
+
+    lowered = clean_text.lower()
+    assert "buymeacoffee" not in lowered
+    assert "mcp orchestration" in lowered
+    assert "rollback workflows" in lowered
+    assert clean_md.strip() != ""
+
+
 def test_is_allowed_citation_url_applies_denylist() -> None:
     assert is_allowed_citation_url("https://example.com/report") is True
     assert is_allowed_citation_url("https://img.shields.io/badge/x") is False

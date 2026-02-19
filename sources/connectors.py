@@ -175,7 +175,10 @@ def _coalesce_text(*values: Any) -> str:
 
 
 def _safe_truncate(text: str, max_len: int = 9000) -> str:
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = str(text or "")
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t\f\v]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if len(value) <= max_len:
         return value
     return value[: max_len - 3].rstrip() + "..."

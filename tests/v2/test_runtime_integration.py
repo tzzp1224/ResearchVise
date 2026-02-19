@@ -405,6 +405,66 @@ def _all_reject_connectors() -> dict:
     }
 
 
+def _best_attempt_regression_connectors() -> dict:
+    strong_body = (
+        "AI agent orchestration runtime with MCP tool calling and workflow checkpoints.\n"
+        "Quickstart: pip install acme-agent && acme-agent run demo.\n"
+        "Docs: https://docs.acme.dev/agent-runtime\n"
+        "Release: https://github.com/acme/agent-runtime/releases/tag/v1.0.0\n"
+    ) * 18
+
+    async def _github_topic_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, limit, kwargs
+        if time_window == "today" and not expanded:
+            return [
+                RawItem(
+                    id="best_gh_pass",
+                    source="github",
+                    title="acme/agent-runtime",
+                    url="https://github.com/acme/agent-runtime",
+                    body=strong_body,
+                    tier="A",
+                    metadata={
+                        "stars": 2100,
+                        "forks": 280,
+                        "item_type": "repo",
+                        "updated_at": "2026-02-18T09:00:00Z",
+                    },
+                )
+            ]
+        return []
+
+    async def _hn_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id=f"best_hn_noise_{time_window}_{'expanded' if expanded else 'base'}",
+                source="hackernews",
+                title="Frontend dashboard css theme changelog",
+                url="https://news.ycombinator.com/item?id=700001",
+                body=("frontend css theme tweaks and icon set updates. " * 24).strip(),
+                tier="A",
+                metadata={"points": 2, "comment_count": 0, "item_type": "story"},
+            )
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _github_topic_search,
+        "fetch_huggingface_search": _none,
+        "fetch_hackernews_search": _hn_search,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -732,3 +792,38 @@ def test_runtime_shortage_rescue_prevents_crash_when_all_audit_verdicts_reject(t
         "shortage_fallback_after_max_phase" in str(reason)
         for reason in list(ranking.get("quality_trigger_reasons") or []) + list(ranking.get("why_not_more") or [])
     )
+
+
+def test_runtime_prefers_best_attempt_when_late_phase_degrades(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_best_attempt_regression_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_best_attempt",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="today",
+            tz="UTC",
+            budget={"top_k": 3, "include_tier_b": False, "render_enabled": False},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_best_attempt:ai-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+    diagnosis = json.loads((run_dir / "retrieval_diagnosis.json").read_text(encoding="utf-8"))
+
+    assert int(ranking.get("selected_pass_count", 0) or 0) >= 1
+    assert int(ranking.get("top_picks_count", 0) or 0) >= 1
+    assert any("selected_from_best_attempt" in str(reason) for reason in list(ranking.get("quality_trigger_reasons") or []))
+    assert int(diagnosis.get("selected_attempt", 0) or 0) < len(list(diagnosis.get("attempts") or []))

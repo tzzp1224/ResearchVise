@@ -206,6 +206,8 @@ class RunPipelineRuntime:
             recall_profiles = list(recall_profiles)[:max_recall_attempts]
         attempts: List[Dict[str, Any]] = []
         selected: Optional[Dict[str, Any]] = None
+        best_selected: Optional[Dict[str, Any]] = None
+        best_priority = float("-inf")
         quality_triggered_any = False
 
         for idx, profile in enumerate(recall_profiles, start=1):
@@ -322,10 +324,7 @@ class RunPipelineRuntime:
             }
             attempts.append(attempt_payload)
 
-            if quality_triggered_expansion:
-                continue
-
-            selected = {
+            attempt_selection_payload = {
                 "raw_items": raw_items,
                 "run_context": run_context_candidate,
                 "normalized": normalized,
@@ -337,12 +336,46 @@ class RunPipelineRuntime:
                 "quality_reasons": quality_reasons,
                 "selection_outcome": final_outcome,
                 "audit_records": audit_records,
+                "selection_priority": float("-inf"),
             }
+            if picks:
+                attempt_priority = (
+                    self._selection_priority(picks=picks, quality_snapshot=quality_snapshot)
+                    + float(selected_pass_count) * 200.0
+                    + float(int(quality_snapshot.get("source_coverage", 0) or 0)) * 40.0
+                    + float(final_outcome.pass_ratio) * 20.0
+                    - float(selected_downgrade_count) * 25.0
+                )
+                attempt_selection_payload["selection_priority"] = float(attempt_priority)
+                if best_selected is None or float(attempt_priority) > float(best_priority):
+                    best_selected = dict(attempt_selection_payload)
+                    best_priority = float(attempt_priority)
+
+            if quality_triggered_expansion:
+                continue
+
+            selected = dict(attempt_selection_payload)
             if picks:
                 break
 
+        if selected is None and best_selected is not None:
+            selected = dict(best_selected)
+            reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
+            if "selected_from_best_attempt" not in reasons:
+                reasons.append("selected_from_best_attempt")
+            selected["quality_reasons"] = reasons
+
         if selected is None:
             raise RuntimeError("no relevant ranked items available")
+
+        if best_selected is not None:
+            selected_priority = float(selected.get("selection_priority", float("-inf")) or float("-inf"))
+            if float(best_priority) > selected_priority + 1e-9:
+                selected = dict(best_selected)
+                reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
+                if "selected_from_best_attempt" not in reasons:
+                    reasons.append("selected_from_best_attempt")
+                selected["quality_reasons"] = reasons
 
         raw_items = list(selected["raw_items"] or [])
         run_context = dict(selected["run_context"] or {})

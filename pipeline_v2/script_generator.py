@@ -14,14 +14,21 @@ _FORBIDDEN_TOKENS = re.compile(r"\b(placeholder|dummy|lorem|todo|testsrc|colorba
 _HTML_TAGS = re.compile(r"<[^>]+>")
 _MARKDOWN_NOISE = re.compile(r"^\s*[*#>\-|`]+\s*$")
 _URL_FRAGMENT = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s]+", re.IGNORECASE)
-_PATH_FRAGMENT = re.compile(r"^(?:[a-z0-9._-]+/){1,4}[a-z0-9._%-]+$", re.IGNORECASE)
+_PATH_FRAGMENT = re.compile(r"^(?:[a-z0-9._-]+[\\/]){1,4}[a-z0-9._%-]+$", re.IGNORECASE)
 _FACT_NOISE_PATTERNS = (
     re.compile(r"\bstars?\s*:\s*\d+", re.IGNORECASE),
     re.compile(r"\bforks?\s*:\s*\d+", re.IGNORECASE),
     re.compile(r"\blast(push|_push|_modified)?\s*:\s*", re.IGNORECASE),
     re.compile(r"\b(?:readme|license|contributing)\b", re.IGNORECASE),
+    re.compile(r"\blanguages?\s*:\s*", re.IGNORECASE),
+    re.compile(r"\b(?:important|warning)\b.*\b(?:impersonation|official website)\b", re.IGNORECASE),
+    re.compile(r"\brust toolchain\b", re.IGNORECASE),
+    re.compile(r"\bcurl\s+.*(?:proto|tlsv1)\b", re.IGNORECASE),
 )
-_HN_META_LINE = re.compile(r"^\s*Points:\s*\d+\s*(?:\|\s*Comments:\s*\d+)?\s*$", re.IGNORECASE)
+_HN_META_LINE = re.compile(
+    r"^\s*Points:\s*\d+\s*(?:\|\s*Comments:\s*\d+)?(?:\|\s*ItemType:\s*[a-z0-9_-]+)?\s*$",
+    re.IGNORECASE,
+)
 _SECTION_HEADER = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 _SECTION_PRIORITY = {
     "overview": 1.2,
@@ -74,14 +81,32 @@ def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = str(text or "")
     if _HN_META_LINE.match(value.strip()):
         return ""
+    if re.search(r"\bPoints:\s*\d+\b", value, flags=re.IGNORECASE) and re.search(
+        r"\bComments:\s*\d+\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return ""
     value = re.sub(r"^\s*>+\s*", "", value)
     value = _HTML_TAGS.sub(" ", value)
     value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", value)
     value = re.sub(r"https?://[^\s)\]>]+", "", value)
+    value = re.sub(r"^\s{0,3}#{1,6}\s*", "", value)
+    value = re.sub(r"^\s*\d+[.)]\s*", "", value)
     value = _URL_FRAGMENT.sub(" ", value)
     value = re.sub(r"[*_`]{1,3}", " ", value)
     value = re.sub(r"\s*[-]{2,}\s*", " ", value)
     value = re.sub(r"\s+", " ", value).strip(" -:;,.")
+    if re.search(
+        r"\b(?:python\s+-m\s+venv|pip\s+install|npm\s+i|npm\s+install|activate)\b",
+        value,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:agent|orchestration|workflow|runtime|tool calling|benchmark|result|usage|quickstart)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return ""
     value = _FORBIDDEN_TOKENS.sub("", value)
     value = re.sub(r"\s{2,}", " ", value).strip()
     return _compact_text(value, max_len=max_len)
@@ -165,10 +190,25 @@ def _has_verifiable_signal(text: str) -> bool:
     lowered = str(text or "").strip().lower()
     if not lowered:
         return False
+    has_domain_signal = any(
+        token in lowered
+        for token in (
+            "agent",
+            "orchestration",
+            "workflow",
+            "runtime",
+            "tool calling",
+            "mcp",
+            "benchmark",
+            "quickstart",
+            "usage",
+            "deployment",
+        )
+    )
     if any(token in lowered for token in _VERIFIABLE_TOKENS):
         return True
     if _COMMAND_PATTERN.search(lowered):
-        return True
+        return bool(has_domain_signal)
     if re.search(r"\b\d+(\.\d+)?(%|ms|s|x)?\b", lowered):
         return True
     return False
@@ -328,13 +368,20 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
     quality_signals = dict(metadata.get("quality_signals") or {})
 
     what_it_is = ""
+    fallback_what = ""
     for sentence in feature_candidates:
         cleaned = _clean_fact_point(sentence, max_len=150)
         if not cleaned or cleaned.lower().startswith(("we believe", "our vision", "the most")):
             continue
-        if _has_verifiable_signal(cleaned):
+        if not _has_verifiable_signal(cleaned):
+            continue
+        if not fallback_what:
+            fallback_what = cleaned
+        if re.search(r"\b(agent|orchestration|workflow|runtime|tool calling|mcp)\b", cleaned, flags=re.IGNORECASE):
             what_it_is = cleaned
             break
+    if not what_it_is and fallback_what:
+        what_it_is = fallback_what
     if not what_it_is:
         what_it_is = _clean_fact_point(
             f"{item.title} provides a concrete workflow for engineering teams to run and validate.",
@@ -349,6 +396,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         if not cleaned or token in seen:
             continue
         if not _has_verifiable_signal(cleaned):
+            continue
+        if _is_fact_noise(cleaned):
             continue
         if _looks_like_fragment(cleaned):
             continue
@@ -394,6 +443,10 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
             continue
         snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
         if not snippet or _looks_like_fragment(snippet):
+            continue
+        if _is_fact_noise(snippet):
+            continue
+        if not _has_verifiable_signal(snippet):
             continue
         proof.append(snippet)
         proof_links.append(citation_url)

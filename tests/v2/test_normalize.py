@@ -45,6 +45,25 @@ def test_extract_citations_filters_badge_and_image_urls() -> None:
     assert "https://example.com/logo.svg" not in urls
 
 
+def test_extract_citations_uses_contextual_snippets_per_url() -> None:
+    raw = RawItem(
+        id="raw_ctx",
+        source="github",
+        title="acme/agent",
+        url="https://github.com/acme/agent",
+        body=(
+            "Quickstart guide [install docs](https://docs.example.com/agent/install) for first boot.\n"
+            "Benchmark notes [results](https://docs.example.com/agent/results) include latency and throughput.\n"
+            "Community discussion https://news.ycombinator.com/item?id=42 with production feedback.\n"
+        ),
+        metadata={},
+    )
+    citations = extract_citations(raw)
+    snippets = [str(item.snippet or "").strip() for item in citations if str(item.url or "").strip().startswith("https://docs.example.com")]
+    assert len(snippets) >= 2
+    assert len(set(snippets)) >= 2
+
+
 def test_extract_citations_excludes_tooling_links_and_canonicalizes_noise() -> None:
     raw = RawItem(
         id="raw_tool",

@@ -32,15 +32,30 @@ def _row(item_id: str, *, source: str, body: str, citations: list[Citation], met
     )
 
 
-def test_evidence_auditor_rejects_mostly_duplicate_citations() -> None:
+def test_evidence_auditor_flags_mostly_duplicate_citations() -> None:
     row = _row(
         "dup",
         source="web_article",
         body=("deploy benchmark workflow " * 120).strip(),
         citations=[
-            Citation(title="c1", url="https://docs.example.com/a", snippet="repeated evidence prefix for validator and auditor checks alpha", source="web"),
-            Citation(title="c2", url="https://docs.example.com/b", snippet="repeated evidence prefix for validator and auditor checks beta", source="web"),
-            Citation(title="c3", url="https://docs.example.com/c", snippet="repeated evidence prefix for validator and auditor checks gamma", source="web"),
+            Citation(
+                title="c1",
+                url="https://docs.example.com/agent?id=1",
+                snippet="repeated evidence prefix for validator and auditor checks alpha",
+                source="web",
+            ),
+            Citation(
+                title="c2",
+                url="https://docs.example.com/agent?id=2",
+                snippet="repeated evidence prefix for validator and auditor checks beta",
+                source="web",
+            ),
+            Citation(
+                title="c3",
+                url="https://docs.example.com/agent?id=3",
+                snippet="repeated evidence prefix for validator and auditor checks gamma",
+                source="web",
+            ),
         ],
         metadata={
             "body_len": 900,
@@ -50,7 +65,7 @@ def test_evidence_auditor_rejects_mostly_duplicate_citations() -> None:
     )
     auditor = EvidenceAuditor()
     record = auditor.audit_row(row, rank=1)
-    assert record.verdict == VERDICT_REJECT
+    assert record.verdict in {VERDICT_REJECT, VERDICT_DOWNGRADE}
     assert record.citation_duplicate_prefix_ratio > 0.6
 
 

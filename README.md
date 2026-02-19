@@ -1,6 +1,41 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Live Quality Stabilization (Sanitization + Citation Context + Best Attempt Selection) (New)
+- 本次目标：
+  - 修复 live 质量持续退化的三类主因：正文被误清空、证据重复误判、扩检后被最后 phase 低质量结果覆盖。
+  - 在不引入 LLM 依赖的前提下，提升 `AI agent` 主题稳定相关性与可读性。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`
+    - `_safe_truncate` 改为保留换行结构，避免 README/model card 被压成单行后在清洗阶段被整行误删。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/sanitize.py`
+    - 调整清洗顺序：先做链接/URL 清理，再判断是否丢弃行。
+    - 新增 badge 噪声判定，避免“含 sponsor/badge 子串就整行删除”导致正文丢失。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/normalize.py`
+    - `extract_citations` 改为按 URL 上下文抽取 snippet，并在无上下文时做句子级回退，减少所有 citation 复用同一 snippet 的情况。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - `citation_duplicate_ratio` 改为 `host+path+snippet_prefix` 组合键，降低跨链接误伤。
+    - 当证据域名多样且 evidence_links_quality 达标时，重复证据从 `reject` 降为 `downgrade`（保留审计理由）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - 引入 best-attempt 保留策略：扩检过程中记录最佳选择，若最后 phase 退化，则回退到最佳 attempt，避免“越扩检越差”。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`
+    - 扩展 HN 元信息过滤，覆盖 `Points|Comments|ItemType` 复合行，减少 facts/script 污染。
+- 测试更新：
+  - 新增/更新：
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_sanitize.py`
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_connectors.py`
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_normalize.py`
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 重点查看 `retrieval_diagnosis.json` 与 `evidence_audit.json`：`body_len_zero`、`citation_duplicate_prefix_ratio_gt_threshold` 是否明显下降；`selected_attempt` 是否能回退到最佳 phase。
+- 风险与回滚：
+  - 风险：保留更多正文后，单次 normalize/scoring 字符处理开销略升。
+  - 风险：duplicate 规则放宽可能允许少量“相似证据”以 downgrade 进入候选池，但仍受 pass-first 与硬相关门禁控制。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: No-Candidate Crash Fix + Shortage Rescue (New)
 - 本次目标：
   - 修复 live 场景下 `no candidates survived evidence audit` 直接导致 run 失败的问题。

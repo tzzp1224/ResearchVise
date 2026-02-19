@@ -58,6 +58,43 @@ def _compact_text(value: Any, max_len: int = 300) -> str:
     return text if len(text) <= max_len else text[: max_len - 3].rstrip() + "..."
 
 
+def _url_context_snippet(body: str, url: str, *, max_len: int = 220) -> str:
+    raw_body = str(body or "")
+    target = canonicalize_url(str(url or "").strip())
+    if not raw_body or not target:
+        return ""
+
+    url_variants = {
+        str(url or "").strip(),
+        target,
+        target.replace("https://", "http://"),
+    }
+    for line in raw_body.replace("\r\n", "\n").split("\n"):
+        lowered = str(line or "").strip()
+        if not lowered:
+            continue
+        if not any(token and token in lowered for token in url_variants):
+            continue
+        snippet = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", lowered)
+        snippet = re.sub(r"https?://[^\s)\]>]+", "", snippet)
+        snippet = re.sub(r"\s+", " ", snippet).strip(" -:|")
+        if len(snippet) >= 18:
+            return _compact_text(snippet, max_len=max_len)
+    return ""
+
+
+def _fallback_url_snippet(clean_text: str, url: str, *, max_len: int = 220) -> str:
+    text = str(clean_text or "").strip()
+    if not text:
+        return ""
+    chunks = [re.sub(r"\s+", " ", token).strip() for token in re.split(r"[.!?;\n]+", text)]
+    candidates = [token for token in chunks if len(token) >= 24]
+    if not candidates:
+        return _compact_text(text, max_len=max_len)
+    seed = int(hashlib.sha1(str(url or "").encode("utf-8")).hexdigest()[:8], 16)
+    return _compact_text(candidates[seed % len(candidates)], max_len=max_len)
+
+
 def _count_links(body: str, url: str) -> int:
     links = set()
     for link in re.findall(r"https?://[^\s)\]>]+", str(body or "")):
@@ -233,11 +270,14 @@ def extract_citations(item: Any) -> List[Citation]:
         normalized_link = canonicalize_url(str(link).strip())
         if not is_allowed_citation_url(normalized_link):
             continue
+        snippet = _url_context_snippet(body, normalized_link, max_len=220)
+        if not snippet:
+            snippet = _fallback_url_snippet(clean_text, normalized_link, max_len=220)
         citations.append(
             Citation(
                 title=_compact_text(title, max_len=140),
                 url=normalized_link,
-                snippet=_compact_text(clean_text, max_len=220),
+                snippet=snippet,
                 source=raw.source,
             )
         )
@@ -247,22 +287,28 @@ def extract_citations(item: Any) -> List[Citation]:
         normalized_link = canonicalize_url(str(link).strip())
         if not is_allowed_citation_url(normalized_link):
             continue
+        snippet = _url_context_snippet(body, normalized_link, max_len=220)
+        if not snippet:
+            snippet = _fallback_url_snippet(clean_text, normalized_link, max_len=220)
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
                 url=normalized_link,
-                snippet=_compact_text(clean_text, max_len=220),
+                snippet=snippet,
                 source=raw.source,
             )
         )
 
     normalized_raw_url = canonicalize_url(str(raw.url or "").strip())
     if normalized_raw_url and is_allowed_citation_url(normalized_raw_url):
+        snippet = _url_context_snippet(body, normalized_raw_url, max_len=220)
+        if not snippet:
+            snippet = _fallback_url_snippet(clean_text, normalized_raw_url, max_len=220)
         citations.append(
             Citation(
                 title=_compact_text(raw.title, max_len=140),
                 url=normalized_raw_url,
-                snippet=_compact_text(clean_text, max_len=220),
+                snippet=snippet,
                 source=raw.source,
             )
         )

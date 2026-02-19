@@ -145,16 +145,20 @@ def _source_min_body_len(source: str) -> int:
 
 
 def _citation_duplicate_ratio(item: NormalizedItem) -> float:
-    snippets = [
-        re.sub(r"\s+", " ", str(citation.snippet or citation.title or "")).strip().lower()
-        for citation in list(item.citations or [])
-        if str(citation.snippet or citation.title or "").strip()
-    ]
-    if len(snippets) < 2:
+    keys: List[str] = []
+    for citation in list(item.citations or []):
+        snippet = re.sub(r"\s+", " ", str(citation.snippet or citation.title or "")).strip().lower()
+        if not snippet:
+            continue
+        prefix = snippet[:48]
+        url = canonicalize_url(str(citation.url or "").strip())
+        host = str(urlparse(url).netloc or "").strip().lower()
+        path = str(urlparse(url).path or "").strip().lower()[:64]
+        keys.append(f"{host}|{path}|{prefix}")
+    if len(keys) < 2:
         return 0.0
-    prefixes = [snippet[:48] for snippet in snippets]
-    unique_prefixes = len(set(prefixes))
-    ratio = 1.0 - float(unique_prefixes) / float(max(1, len(prefixes)))
+    unique_keys = len(set(keys))
+    ratio = 1.0 - float(unique_keys) / float(max(1, len(keys)))
     return max(0.0, min(1.0, ratio))
 
 
@@ -338,10 +342,13 @@ class EvidenceAuditor:
             )
 
         if duplicate_ratio > self._duplicate_ratio_threshold:
+            duplicate_target = VERDICT_REJECT
+            if len(domains) >= 2 and evidence_links_quality >= self._min_evidence_links_quality:
+                duplicate_target = VERDICT_DOWNGRADE
             verdict = self._apply_rule(
                 verdict=verdict,
                 reasons=reasons,
-                target=VERDICT_REJECT,
+                target=duplicate_target,
                 reason=f"citation_duplicate_prefix_ratio_gt_threshold:{duplicate_ratio:.2f}>{self._duplicate_ratio_threshold:.2f}",
             )
 

@@ -100,3 +100,10 @@ async def test_fetch_github_releases_maps_response(monkeypatch) -> None:
     assert items[0].source == "github"
     assert items[0].tier == "A"
     assert items[0].metadata.get("item_type") == "release"
+
+
+def test_safe_truncate_preserves_newline_structure() -> None:
+    raw = "# Title\n\nline one with details\nline two with docs"
+    value = connectors._safe_truncate(raw, max_len=200)
+    assert "\n" in value
+    assert "line one with details" in value

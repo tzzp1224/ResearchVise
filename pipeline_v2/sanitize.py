@@ -196,6 +196,25 @@ def is_allowed_citation_url(url: str) -> bool:
     return classify_link(url) == "evidence"
 
 
+def _looks_like_badge_noise(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return True
+    pure = re.sub(r"https?://[^\s]+", " ", lowered)
+    pure = re.sub(r"[\[\](){}<>*`_#:|/\\-]+", " ", pure)
+    pure = re.sub(r"\s+", " ", pure).strip()
+    if not pure:
+        return True
+    if len(pure) < 12:
+        return True
+    # Badge rows often contain a tiny set of decorative tokens without content.
+    decorative_tokens = {"badge", "sponsor", "ci", "build", "stars", "forks", "license"}
+    words = [token for token in pure.split(" ") if token]
+    if words and all(token in decorative_tokens for token in words):
+        return True
+    return False
+
+
 def _drop_line(line: str) -> bool:
     lowered = str(line or "").strip().lower()
     if not lowered:
@@ -204,7 +223,7 @@ def _drop_line(line: str) -> bool:
     if _MD_IMAGE_ONLY_RE.match(lowered):
         return True
 
-    if any(marker in lowered for marker in _BADGE_OR_PROMO_MARKERS):
+    if any(marker in lowered for marker in _BADGE_OR_PROMO_MARKERS) and _looks_like_badge_noise(lowered):
         return True
 
     if lowered.startswith("<img") or lowered.startswith("<picture") or lowered.startswith("<svg"):
@@ -225,7 +244,7 @@ def sanitize_markdown(raw: str, *, max_len: int = 9000) -> Tuple[str, str, Dict[
     dropped = 0
     for raw_line in text.split("\n"):
         line = str(raw_line or "").strip()
-        if _drop_line(line):
+        if not line:
             dropped += 1
             continue
 
@@ -250,7 +269,7 @@ def sanitize_markdown(raw: str, *, max_len: int = 9000) -> Tuple[str, str, Dict[
         line = _HTML_TAG_RE.sub(" ", line)
         line = re.sub(r"`{1,3}", "", line)
         line = re.sub(r"\s+", " ", line).strip(" -|\t")
-        if not line:
+        if _drop_line(line):
             dropped += 1
             continue
 
