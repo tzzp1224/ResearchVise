@@ -15,6 +15,7 @@ _HTML_TAGS = re.compile(r"<[^>]+>")
 _MARKDOWN_NOISE = re.compile(r"^\s*[*#>\-|`]+\s*$")
 _URL_FRAGMENT = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s]+", re.IGNORECASE)
 _PATH_FRAGMENT = re.compile(r"^(?:[a-z0-9._-]+[\\/]){1,4}[a-z0-9._%-]+$", re.IGNORECASE)
+_STRUCTURE_GLYPH = re.compile(r"[│├┤┬┴┼└┘┌┐]")
 _FACT_NOISE_PATTERNS = (
     re.compile(r"\bstars?\s*:\s*\d+", re.IGNORECASE),
     re.compile(r"\bforks?\s*:\s*\d+", re.IGNORECASE),
@@ -81,6 +82,33 @@ _TRAILING_STOPWORDS = {
     "into",
     "is",
     "are",
+}
+
+_ACTION_VERBS = {
+    "run",
+    "install",
+    "deploy",
+    "configure",
+    "start",
+    "create",
+    "build",
+    "execute",
+    "use",
+    "set",
+    "pay",
+}
+
+_SUBJECT_TOKENS = {
+    "agent",
+    "workflow",
+    "runtime",
+    "pipeline",
+    "framework",
+    "system",
+    "platform",
+    "tool",
+    "benchmark",
+    "quickstart",
 }
 
 
@@ -180,7 +208,7 @@ def _section_boost(section_name: str) -> float:
 
 def _sentence_score(sentence: str, *, section_name: str = "root") -> float:
     text = _clean_sentence(sentence, max_len=220)
-    if not text or _is_fact_noise(text) or _looks_like_fragment(text):
+    if not text or _is_fact_noise(text) or _looks_like_fragment(text) or _looks_like_low_context_clause(text):
         return -10.0
 
     lowered = text.lower()
@@ -295,6 +323,28 @@ def _looks_like_fragment(text: str) -> bool:
     return False
 
 
+def _looks_like_low_context_clause(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    if _STRUCTURE_GLYPH.search(value):
+        return True
+    lowered = value.lower()
+    if re.search(r"\s[|/]\s", lowered) and not _has_verifiable_signal(value):
+        return True
+    words = re.findall(r"[a-zA-Z0-9]+", lowered)
+    if len(words) < 5 and not _COMMAND_PATTERN.search(lowered):
+        return True
+    if value[:1].islower() and not _COMMAND_PATTERN.search(lowered):
+        head = words[0] if words else ""
+        if (
+            (head in _ACTION_VERBS or len(words) <= 8)
+            and not any(token in lowered for token in _SUBJECT_TOKENS)
+        ):
+            return True
+    return False
+
+
 def _domain(url: str) -> str:
     parsed = urlparse(str(url or ""))
     host = str(parsed.netloc or "").strip().lower()
@@ -396,6 +446,8 @@ def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
     value = _trim_to_complete_sentence(value, max_len=max_len)
     if not value:
         return ""
+    if _looks_like_low_context_clause(value):
+        return ""
     if value and re.search(r"[a-zA-Z0-9]$", value) and not re.search(r"[.!?。！？]$", value):
         value = value + "."
     return value
@@ -489,6 +541,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
             continue
         if _looks_like_fragment(cleaned):
             continue
+        if _looks_like_low_context_clause(cleaned):
+            continue
         seen.add(token)
         how_it_works.append(cleaned)
         if len(how_it_works) >= 3:
@@ -533,6 +587,8 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
         if not snippet or _looks_like_fragment(snippet):
             continue
         if _is_fact_noise(snippet):
+            continue
+        if _looks_like_low_context_clause(snippet):
             continue
         if not _has_verifiable_signal(snippet):
             continue

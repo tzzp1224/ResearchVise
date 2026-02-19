@@ -255,6 +255,23 @@ def evaluate_relevance(
             agent_score_cap = "cap_lt_0.9_requires_high_value_and_non_generic_depth"
 
         signals = _quality_signals(item)
+        metadata = dict(item.metadata or {})
+        stars = int(_to_float(metadata.get("stars"), 0.0))
+        forks = int(_to_float(metadata.get("forks"), 0.0))
+        points = int(_to_float(metadata.get("points"), 0.0))
+        comments = int(_to_float(metadata.get("comment_count", metadata.get("comments", 0)), 0.0))
+        downloads = int(_to_float(metadata.get("downloads"), 0.0))
+        cross_source_corroborated = bool(metadata.get("cross_source_corroborated")) or int(
+            _to_float(metadata.get("cross_source_corroboration_count"), 0.0)
+        ) >= 2
+        has_engagement_signal = bool(
+            stars >= 30
+            or forks >= 5
+            or points >= 20
+            or comments >= 8
+            or downloads >= 1000
+            or cross_source_corroborated
+        )
         body_len = int(_to_float((item.metadata or {}).get("body_len"), len(str(item.body_md or ""))))
         has_verifiable_content_signal = bool(
             float(signals["content_density"]) >= 0.14
@@ -268,12 +285,15 @@ def evaluate_relevance(
             and has_verifiable_content_signal
             and float(signals["content_density"]) >= 0.18
             and body_len >= 500
+            and has_engagement_signal
             and score >= 0.94
         ):
             score = 1.0
         else:
             score = min(score, 0.93)
-            if not agent_score_cap and score >= 0.93:
+            if not has_engagement_signal and score >= 0.89:
+                agent_score_cap = "cap_lt_1.0_requires_engagement_or_cross_source"
+            elif not agent_score_cap and score >= 0.93:
                 agent_score_cap = "cap_lt_1.0_requires_high_value_plus_verifiable_content"
 
     return {

@@ -120,6 +120,21 @@ class AuditSelection:
 
 
 def _collect_evidence_urls(item: NormalizedItem) -> List[str]:
+    def _is_low_value_evidence(url: str) -> bool:
+        parsed = urlparse(str(url or ""))
+        host = str(parsed.netloc or "").strip().lower()
+        path = str(parsed.path or "").strip().lower()
+        if host == "github.com":
+            if path.startswith("/user-attachments/"):
+                return True
+            if path.endswith(".git"):
+                return True
+            if "/assets/" in path and "/releases/" not in path:
+                return True
+        if host in {"proxy.example.com"}:
+            return True
+        return False
+
     def _evidence_rank(url: str, *, source_hint: str) -> float:
         parsed = urlparse(str(url or ""))
         host = str(parsed.netloc or "").strip().lower()
@@ -161,20 +176,22 @@ def _collect_evidence_urls(item: NormalizedItem) -> List[str]:
             "refactoringenglish.com",
         }:
             score -= 4.5
+        if _is_low_value_evidence(url):
+            score -= 6.0
         return score
 
     urls: List[str] = []
     metadata = dict(item.metadata or {})
     for raw in list(metadata.get("evidence_links") or []):
         token = canonicalize_url(str(raw or ""))
-        if token and is_allowed_citation_url(token) and token not in urls:
+        if token and is_allowed_citation_url(token) and not _is_low_value_evidence(token) and token not in urls:
             urls.append(token)
     for citation in list(item.citations or []):
         token = canonicalize_url(str(citation.url or ""))
-        if token and is_allowed_citation_url(token) and token not in urls:
+        if token and is_allowed_citation_url(token) and not _is_low_value_evidence(token) and token not in urls:
             urls.append(token)
     item_url = canonicalize_url(str(item.url or ""))
-    if item_url and is_allowed_citation_url(item_url) and item_url not in urls:
+    if item_url and is_allowed_citation_url(item_url) and not _is_low_value_evidence(item_url) and item_url not in urls:
         urls.append(item_url)
     ranked = sorted(
         list(urls),
@@ -267,11 +284,35 @@ def _has_high_trust_technical_evidence(urls: Sequence[str]) -> bool:
         parsed = urlparse(token)
         host = str(parsed.netloc or "").strip().lower()
         path = str(parsed.path or "").strip().lower()
+        if host == "github.com" and (path.startswith("/user-attachments/") or path.endswith(".git")):
+            continue
         if host in {"arxiv.org", "openreview.net", "docs.python.org"}:
             return True
         if host in {"github.com"} and (
-            path.count("/") >= 2 or "/releases/" in path or "/wiki" in path or "/issues/" in path
+            (path.count("/") >= 2 and "/blob/" not in path)
+            or "/releases/" in path
+            or "/wiki" in path
+            or "/issues/" in path
         ):
+            return True
+        if host.endswith("huggingface.co") and ("/datasets/" in path or "/models/" in path):
+            return True
+        if "docs" in host or "/docs" in path or "/documentation" in path:
+            return True
+    return False
+
+
+def _has_non_repo_technical_evidence(urls: Sequence[str]) -> bool:
+    for raw in list(urls or []):
+        token = canonicalize_url(str(raw or "").strip())
+        if not token:
+            continue
+        parsed = urlparse(token)
+        host = str(parsed.netloc or "").strip().lower()
+        path = str(parsed.path or "").strip().lower()
+        if host in {"arxiv.org", "openreview.net", "docs.python.org"}:
+            return True
+        if host == "github.com" and ("/releases/" in path or "/wiki" in path or "/issues/" in path):
             return True
         if host.endswith("huggingface.co") and ("/datasets/" in path or "/models/" in path):
             return True
@@ -532,7 +573,13 @@ class EvidenceAuditor:
         if source_key == "github":
             stars = int(float(metadata.get("stars", 0) or 0))
             forks = int(float(metadata.get("forks", 0) or 0))
-            has_benchmark = has_results or ("benchmark" in text)
+            has_benchmark = bool(has_results)
+            has_external_discussion = any(
+                domain in {"news.ycombinator.com", "reddit.com", "www.reddit.com", "lobste.rs"}
+                for domain in list(domains or [])
+            )
+            traction_emerging = bool(stars >= 15 or forks >= 3)
+            traction_strong = bool(stars >= 50 or forks >= 10)
             if stars < 30 and forks < 5 and not has_release_note and not has_benchmark and not has_quickstart:
                 target = VERDICT_REJECT if stars < 10 and forks < 2 else VERDICT_DOWNGRADE
                 verdict = self._apply_rule(
@@ -540,6 +587,30 @@ class EvidenceAuditor:
                     reasons=reasons,
                     target=target,
                     reason=f"github_low_signal_repo:{stars}/{forks}",
+                )
+            if (
+                verdict == VERDICT_PASS
+                and not traction_emerging
+                and not cross_source_corroborated
+                and not has_external_discussion
+                and not has_release_note
+                and not has_benchmark
+            ):
+                target = VERDICT_REJECT if stars < 8 and forks < 2 and not has_external_discussion else VERDICT_DOWNGRADE
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=target,
+                    reason=f"github_traction_weak:{stars}/{forks}",
+                )
+            elif verdict == VERDICT_PASS and not traction_strong and not (
+                has_release_note or has_benchmark or cross_source_corroborated or has_external_discussion
+            ):
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_DOWNGRADE,
+                    reason=f"github_traction_unproven:{stars}/{forks}",
                 )
 
         if source_key == "huggingface" and self._is_agent_topic():

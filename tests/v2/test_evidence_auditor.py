@@ -250,3 +250,28 @@ def test_evidence_auditor_sorts_high_trust_urls_before_social_urls() -> None:
     record = auditor.audit_row(row, rank=1)
     assert record.used_evidence_urls
     assert "x.com" not in record.used_evidence_urls[0]
+
+
+def test_evidence_auditor_downgrades_low_traction_github_repo_even_with_quickstart() -> None:
+    row = _row(
+        "gh_low_traction",
+        source="github",
+        body=("agent runtime orchestration with quickstart and api usage " * 80).strip(),
+        citations=[
+            Citation(title="repo", url="https://github.com/acme/openbrowser-ai", snippet="repo docs", source="github"),
+            Citation(title="docs", url="https://docs.openbrowser.dev/quickstart", snippet="quickstart docs", source="docs"),
+        ],
+        metadata={
+            "body_len": 1400,
+            "stars": 4,
+            "forks": 0,
+            "topic_hard_match_pass": True,
+            "quality_signals": {"evidence_links_quality": 2, "publish_or_update_time": "2026-02-19T10:00:00Z", "has_quickstart": True},
+            "evidence_links": ["https://github.com/acme/openbrowser-ai", "https://docs.openbrowser.dev/quickstart"],
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
+    assert any("github_traction_weak" in reason for reason in list(record.reasons or []))

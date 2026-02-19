@@ -388,8 +388,8 @@ def test_controller_keeps_filling_pass_rows_even_when_source_coverage_short() ->
     assert int(outcome.source_coverage) == 1
 
     decision = controller.expansion_decision(outcome=outcome)
-    assert bool(decision.should_expand) is True
-    assert any("source_coverage_lt_2" in reason for reason in list(decision.reasons or []))
+    assert bool(decision.should_expand) is False
+    assert not list(decision.reasons or [])
 
 
 def test_controller_applies_downgrade_fill_cap_and_returns_shortage() -> None:
@@ -435,3 +435,53 @@ def test_controller_applies_downgrade_fill_cap_and_returns_shortage() -> None:
     assert len(list(outcome.selected_rows or [])) == 2
     assert outcome.max_downgrade_allowed == 1
     assert outcome.downgrade_cap_reached is True
+
+
+def test_controller_does_not_pick_low_score_bucket_outlier() -> None:
+    from types import SimpleNamespace
+
+    def _row(item_id: str, *, relevance: float, total: float, buckets: list[str]):
+        item = SimpleNamespace(
+            id=item_id,
+            source="github",
+            metadata={"bucket_hits": buckets, "body_len": 1200, "topic_hard_match_pass": True},
+            body_md="agent runtime orchestration quickstart benchmark",
+        )
+        return SimpleNamespace(item=item, relevance_score=relevance, total_score=total)
+
+    rows = [
+        _row("top_a", relevance=0.92, total=0.96, buckets=["Ops & runtime"]),
+        _row("low_bucket", relevance=0.75, total=0.74, buckets=["Frameworks"]),
+        _row("top_b", relevance=0.91, total=0.92, buckets=[]),
+        _row("top_c", relevance=0.89, total=0.90, buckets=["Evaluation"]),
+    ]
+    records = [
+        AuditRecord(
+            item_id=str(getattr(row.item, "id", "")),
+            title=str(getattr(row.item, "id", "")),
+            source="github",
+            rank=idx,
+            verdict="pass",
+            reasons=[],
+            used_evidence_urls=["https://docs.acme.dev/agent-runtime"],
+            evidence_domains=["docs.acme.dev"],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=3,
+            body_len=1200,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "pass", "reason_code": "ok", "human_reason": "ok"},
+        )
+        for idx, row in enumerate(rows, start=1)
+    ]
+    controller = SelectionController(requested_top_k=3, min_bucket_coverage=2, diversity_score_gap=0.12)
+    outcome = controller.evaluate(
+        ranked_rows=rows,
+        audit_records=records,
+        allow_downgrade_fill=False,
+        min_relevance_for_selection=0.55,
+    )
+    selected_ids = [str(getattr(row.item, "id", "") or "") for row in list(outcome.selected_rows or [])]
+    assert "low_bucket" not in selected_ids
+    assert selected_ids[0] == "top_a"
+    assert set(selected_ids) == {"top_a", "top_b", "top_c"}

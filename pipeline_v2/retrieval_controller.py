@@ -42,6 +42,7 @@ class SelectionController:
         min_evidence_quality: float = 2.0,
         min_bucket_coverage: int = 2,
         min_source_coverage: int = 2,
+        diversity_score_gap: float = 0.12,
         max_downgrade_ratio: float = 0.34,
         max_downgrade_count: int | None = None,
     ) -> None:
@@ -50,6 +51,7 @@ class SelectionController:
         self._min_evidence_quality = float(max(0.0, min_evidence_quality))
         self._min_bucket_coverage = max(1, int(min_bucket_coverage))
         self._min_source_coverage = max(1, int(min_source_coverage))
+        self._diversity_score_gap = max(0.0, min(0.5, float(diversity_score_gap)))
         ratio = max(0.0, min(1.0, float(max_downgrade_ratio)))
         default_cap = max(1, int(self._requested_top_k * ratio))
         if max_downgrade_count is None:
@@ -101,6 +103,16 @@ class SelectionController:
         metadata = SelectionController._item_metadata(row)
         return bool(metadata.get("topic_hard_match_pass", True))
 
+    @staticmethod
+    def _total_score(row: Any) -> float:
+        try:
+            value = float(getattr(row, "total_score", 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0.0:
+            return value
+        return SelectionController._relevance(row)
+
     def _is_selection_eligible(self, row: Any, *, min_relevance: float) -> bool:
         if self._relevance(row) <= 0.0:
             return False
@@ -123,6 +135,10 @@ class SelectionController:
         selected_ids = {self._item_id(row) for row in selected if self._item_id(row)}
         used_sources = {self._item_source(row) for row in selected if self._item_source(row)}
         used_buckets = {bucket for row in selected for bucket in self._item_buckets(row)}
+        score_baseline = max(
+            [self._total_score(row) for row in list(rows or []) + list(preselected or [])],
+            default=0.0,
+        )
 
         def _add(row: Any) -> None:
             item_id = self._item_id(row)
@@ -147,6 +163,8 @@ class SelectionController:
                     continue
                 if not any(bucket not in used_buckets for bucket in row_buckets):
                     continue
+                if selected and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
+                    continue
                 _add(row)
                 if len(used_buckets) >= self._min_bucket_coverage and len(selected) >= 1:
                     break
@@ -160,6 +178,8 @@ class SelectionController:
             source = self._item_source(row)
             if source and source in used_sources:
                 continue
+            if selected and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
+                continue
             _add(row)
 
         for row in list(rows or []):
@@ -167,6 +187,8 @@ class SelectionController:
                 break
             item_id = self._item_id(row)
             if not item_id or item_id in selected_ids:
+                continue
+            if selected and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
                 continue
             _add(row)
 
@@ -185,6 +207,10 @@ class SelectionController:
         used_sources = {self._item_source(row) for row in picks if self._item_source(row)}
         used_buckets = {bucket for row in picks for bucket in self._item_buckets(row)}
         base_count = len(picks)
+        score_baseline = max(
+            [self._total_score(row) for row in list(selected or []) + list(downgrade_rows or [])],
+            default=0.0,
+        )
 
         def _add(row: Any) -> None:
             item_id = self._item_id(row)
@@ -208,6 +234,8 @@ class SelectionController:
                 continue
             source = self._item_source(row)
             if source and source not in used_sources:
+                if picks and self._total_score(row) + 1e-9 < float(score_baseline - self._diversity_score_gap):
+                    continue
                 _add(row)
                 if len([token for token in used_sources if token]) >= int(self._min_source_coverage):
                     break
@@ -349,7 +377,13 @@ class SelectionController:
             reasons.append(f"top_picks_min_evidence_quality_lt_{self._min_evidence_quality:.1f}")
         if int(outcome.bucket_coverage) < int(self._min_bucket_coverage):
             reasons.append(f"bucket_coverage_lt_{self._min_bucket_coverage}")
-        if int(outcome.source_coverage) < int(self._min_source_coverage):
+        quality_core_satisfied = bool(
+            int(outcome.pass_count) >= int(self._requested_top_k)
+            and float(outcome.pass_ratio) >= float(self._min_pass_ratio)
+            and float(outcome.top_picks_min_evidence_quality) >= float(self._min_evidence_quality)
+            and int(outcome.bucket_coverage) >= int(self._min_bucket_coverage)
+        )
+        if int(outcome.source_coverage) < int(self._min_source_coverage) and not quality_core_satisfied:
             reasons.append(f"source_coverage_lt_{self._min_source_coverage}")
 
         return ExpansionDecision(

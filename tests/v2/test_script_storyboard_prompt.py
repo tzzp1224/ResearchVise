@@ -235,3 +235,28 @@ def test_build_facts_avoids_heading_fragments_and_trailing_stopword_clauses() ->
         text = str(sentence).strip()
         assert text
         assert text.endswith((".", "!", "?", "。", "！", "？"))
+
+
+def test_build_facts_filters_low_context_flowchart_fragments() -> None:
+    item = _sample_item()
+    body = (
+        "## How it works\n"
+        "Execute (complete task / build knowledge) │ │ 4\n"
+        "pay for their own token usage\n"
+        "The runtime orchestrates task assignment, execution, and evaluation with payment accounting.\n"
+        "Quickstart provides pip install and reproducible usage commands.\n"
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    merged = " ".join(
+        [str(facts.get("what_it_is") or "")]
+        + [str(v) for v in list(facts.get("how_it_works") or [])]
+        + [str(v) for v in list(facts.get("proof") or [])]
+    )
+    assert "│" not in merged
+    assert "pay for their own token usage" not in merged.lower()
+    for sentence in list(facts.get("how_it_works") or []):
+        text = str(sentence).strip()
+        assert text
+        assert text.endswith((".", "!", "?", "。", "！", "？"))

@@ -243,3 +243,30 @@ def test_cross_source_corroboration_bonus_improves_ranking_order() -> None:
     ranked = rank_items([baseline, corroborated], topic="AI agent", relevance_threshold=0.55)
     assert ranked[0].item.id == "corroborated"
     assert any("cross_source.corroboration_bonus=0.05" in reason for reason in list(ranked[0].reasons or []))
+
+
+def test_agent_item_without_engagement_signal_is_capped_below_one() -> None:
+    item = _item(
+        "agent_low_engagement",
+        tier="A",
+        source="github",
+        title="MCP agent runtime with LangGraph orchestration",
+        metadata={
+            "credibility": "high",
+            "stars": 4,
+            "forks": 0,
+            "citation_count": 2,
+            "quality_signals": {
+                "content_density": 0.3,
+                "has_quickstart": True,
+                "has_results_or_bench": True,
+                "evidence_links_quality": 3,
+            },
+        },
+    )
+    item.body_md = (
+        "This agent runtime supports tool calling, MCP, and LangGraph orchestration. "
+        "Quickstart includes pip install and benchmark results."
+    )
+    ranked = rank_items([item], topic="AI agent", relevance_threshold=0.55)
+    assert float(ranked[0].relevance_score) < 0.9

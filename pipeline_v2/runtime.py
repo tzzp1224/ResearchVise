@@ -537,6 +537,10 @@ class RunPipelineRuntime:
                     "url": item.url,
                     "source": item.source,
                     "update_time": (item.metadata or {}).get("publish_or_update_time"),
+                    "stars": int(float(metadata.get("stars", 0) or 0)),
+                    "forks": int(float(metadata.get("forks", 0) or 0)),
+                    "hn_points": int(float(metadata.get("points", 0) or 0)),
+                    "hn_comments": int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0)),
                     "relevance_score": round(float(getattr(row, "relevance_score", 0.0)), 4),
                     "total_score": round(float(getattr(row, "total_score", 0.0)), 4),
                     "hard_match_pass": bool(metadata.get("topic_hard_match_pass")),
@@ -1557,6 +1561,7 @@ class RunPipelineRuntime:
             min_evidence_quality=_float("min_evidence_quality", "ARA_V2_MIN_EVIDENCE_QUALITY", 2.0),
             min_bucket_coverage=max(1, min_bucket),
             min_source_coverage=max(1, _int("min_source_coverage", "ARA_V2_MIN_SOURCE_COVERAGE", 2)),
+            diversity_score_gap=_float("diversity_score_gap", "ARA_V2_DIVERSITY_SCORE_GAP", 0.12),
             max_downgrade_ratio=max_downgrade_ratio,
             max_downgrade_count=max_downgrade_count,
         )

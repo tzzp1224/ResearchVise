@@ -1,6 +1,41 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Selector Quality Hardening + Low-Traction Guard + Facts Fragment Filter (New)
+- 本次目标：
+  - 修复 `AI agent` live 结果中“中等/低质仓库被多样性策略抬升”的结构性问题，避免类似 `OpenBrowser-AI` 这类低 traction 条目高位入选。
+  - 避免 source coverage 单独触发无意义扩检；先保证内容质量，再把跨源作为可解释状态。
+  - 进一步清理 facts 里的低上下文片段（半句、流程图字符、短语残片）。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`
+    - 新增 `diversity_score_gap`（默认 `0.12`），bucket/source/补位阶段仅允许选择与当前分数带宽接近的候选，防止“为了多样性捞低分”。
+    - source coverage 不再单独触发扩检；需与 pass 数/证据质量/bucket 覆盖等核心质量条件联动触发。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - 过滤低价值证据 URL（`github user-attachments`、`.git` 等），防止噪声链接抬高 evidence 质量。
+    - GitHub 新增 low-traction 门禁：低 stars/forks 且缺少 release/bench/non-repo technical evidence 时不再默认 pass（`github_traction_weak/github_traction_unproven`）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - 收紧 `relevance=1.0` 条件：要求高价值词 + 实质内容 + engagement/corroboration 信号，降低“关键词堆叠即满分”。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`
+    - 增强低上下文句过滤（流程图字符、无主语短句、残片），减少 facts/how/proof 中的语义断裂。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - `candidate_rows` 追加 `stars/forks/hn_points/hn_comments`，便于诊断“为什么这个条目被选中”。
+- 测试更新：
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_quality_trigger_expansion.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+  - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_script_storyboard_prompt.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 重点观察：
+    - Top picks 不再被低 traction 条目轻易占位；
+    - `quality_triggered_expansion` 不会只因 `source_coverage_lt_2` 单独触发；
+    - `facts.json` 中 `how_it_works/proof` 不再出现半句或流程图噪声残片。
+- 风险与回滚：
+  - 风险：low-traction 门禁会降低“超新项目”通过率，可能导致部分时段 `<top_k`。
+  - 风险：diversity score-band 会让强多样性偏好场景下结果更“同质但稳健”。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Cross-source Soft Bonus + Dynamic HN/HF Audit Thresholds + Relevance De-saturation (New)
 - 本次目标：
   - 提升 AI agent 主题 live 结果的“内容产品感”：允许单源强趋势稳定返回，不再把多源覆盖当成硬失败；同时补上跨源佐证加分、HN/HF 动态审计、relevance 满分去饱和。
