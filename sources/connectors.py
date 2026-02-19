@@ -100,9 +100,9 @@ def _matches_topic_constraints(
 def _parse_window_days(time_window: str) -> int:
     token = str(time_window or "").strip().lower()
     if not token:
-        return 3
+        return 1
     if token == "today":
-        return 3
+        return 1
     if token.endswith("d"):
         try:
             return max(1, int(token[:-1]))

@@ -107,3 +107,9 @@ def test_safe_truncate_preserves_newline_structure() -> None:
     value = connectors._safe_truncate(raw, max_len=200)
     assert "\n" in value
     assert "line one with details" in value
+
+
+def test_parse_window_days_today_maps_to_1_day() -> None:
+    assert connectors._parse_window_days("today") == 1
+    assert connectors._parse_window_days("24h") == 1
+    assert connectors._parse_window_days("7d") == 7

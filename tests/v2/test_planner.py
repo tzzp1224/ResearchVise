@@ -23,3 +23,19 @@ def test_retrieval_plan_contains_source_weights_and_policies() -> None:
     assert set(plan.source_weights.keys()) == {"github", "hackernews", "huggingface"}
     assert any(rule.phase == "query_expanded" and rule.expanded_queries for rule in plan.time_window_policy)
     assert plan.source_limit_for_phase(source="github", phase="base", fallback=8) >= 1
+
+
+def test_retrieval_plan_for_7d_never_shrinks_to_3d_window() -> None:
+    plan = build_retrieval_plan("AI agent", time_window="7d")
+    windows = [str(rule.window or "") for rule in list(plan.time_window_policy or [])]
+    assert "3d" not in windows
+    assert all(not str(rule.phase or "").startswith("window_3d") for rule in list(plan.time_window_policy or []))
+    assert windows[0] == "7d"
+
+
+def test_retrieval_plan_today_expands_to_3d_then_7d() -> None:
+    plan = build_retrieval_plan("AI agent", time_window="today")
+    windows = [str(rule.window or "") for rule in list(plan.time_window_policy or [])]
+    assert windows[:2] == ["today", "today"]
+    assert "3d" in windows
+    assert "7d" in windows

@@ -1,6 +1,31 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Time-Window Integrity Fix (No Reverse Narrowing + Correct Today Semantics) (New)
+- 本次目标：
+  - 修复 `time_window=7d` 却被扩检阶段反向缩窄到 `3d` 的策略错误，避免 7 天查询与 today 产物高度同质。
+  - 修复 connector 时间窗语义偏差（`today` 被当成 `3d`）。
+- 根因定位：
+  - `pipeline_v2/planner.py` 的固定 phase policy 无论请求窗口为何，都会插入 `window_3d`，导致 `7d` 请求在质量触发扩检时回退到 `3d`。
+  - `sources/connectors.py::_parse_window_days` 将 `today` 映射为 `3` 天，和上面的反向缩窗叠加后，today 与 7d 易落到同一检索区间。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/planner.py`
+    - 新增窗口解析/构造函数，按请求窗口动态生成单调扩窗策略。
+    - `7d` 策略不再包含 `window_3d`；仅允许同级或扩窗（如 `7d -> 14d/query_expanded`）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`
+    - `today` 统一映射为 `1` 天，恢复用户语义直觉。
+  - 更新测试：
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_planner.py`
+    - `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_connectors.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window 7d --tz Asia/Singapore --targets web --top-k 3`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 预期：`7d` run 的 attempts 不再出现 `window_3d`；today 与 7d 的 selected phase/候选集有可解释差异。
+- 风险与回滚：
+  - 风险：today 由 3 天收紧到 1 天后，弱信号时段候选可能变少（会走扩窗 phase 补偿）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Live Relevance Guardrails (Attempt Priority + Agent Semantic Depth + Selection Floor) (New)
 - 本次目标：
   - 修复 `AI agent` live 结果里“base 阶段跨源但语义弱内容”覆盖后续高质量阶段的问题，避免 onepager 出现非 agent 核心条目。

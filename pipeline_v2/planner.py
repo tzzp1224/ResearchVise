@@ -192,6 +192,37 @@ def _normalize_window(time_window: Optional[str]) -> str:
     return "today"
 
 
+def _window_to_days(time_window: str) -> int:
+    token = str(time_window or "").strip().lower()
+    if not token:
+        return 1
+    if token in {"today", "24h", "1d"}:
+        return 1
+    if token.endswith("d"):
+        try:
+            return max(1, int(token[:-1]))
+        except Exception:
+            return 1
+    if token.endswith("h"):
+        try:
+            hours = int(token[:-1])
+            return max(1, int((hours + 23) // 24))
+        except Exception:
+            return 1
+    if token in {"past_week", "last_week", "weekly"}:
+        return 7
+    if token in {"past_month", "monthly"}:
+        return 30
+    return 1
+
+
+def _days_to_window(days: int) -> str:
+    value = max(1, int(days))
+    if value <= 1:
+        return "today"
+    return f"{value}d"
+
+
 def _build_plan(topic: str, *, time_window: Optional[str] = None) -> RetrievalPlan:
     topic_text = str(topic or "").strip()
     profile = TopicProfile.for_topic(topic_text)
@@ -208,13 +239,40 @@ def _build_plan(topic: str, *, time_window: Optional[str] = None) -> RetrievalPl
         "huggingface": {"base": 8, "limit_x2": 14, "window_3d": 16, "window_7d": 16, "query_expanded": 18},
     }
 
-    policy = [
-        PlanPhase(phase="base", window=normalized_window, expanded_queries=False, limit_multiplier=1),
-        PlanPhase(phase="limit_x2", window=normalized_window, expanded_queries=False, limit_multiplier=2),
-        PlanPhase(phase="window_3d", window="3d", expanded_queries=False, limit_multiplier=2),
-        PlanPhase(phase="window_7d", window="7d", expanded_queries=False, limit_multiplier=2),
-        PlanPhase(phase="query_expanded", window="7d", expanded_queries=True, limit_multiplier=2),
+    base_days = _window_to_days(normalized_window)
+    base_window = _days_to_window(base_days)
+    policy: List[PlanPhase] = [
+        PlanPhase(phase="base", window=base_window, expanded_queries=False, limit_multiplier=1),
+        PlanPhase(phase="limit_x2", window=base_window, expanded_queries=False, limit_multiplier=2),
     ]
+    if base_days <= 1:
+        policy.extend(
+            [
+                PlanPhase(phase="window_3d", window="3d", expanded_queries=False, limit_multiplier=2),
+                PlanPhase(phase="window_7d", window="7d", expanded_queries=False, limit_multiplier=2),
+                PlanPhase(phase="query_expanded", window="7d", expanded_queries=True, limit_multiplier=2),
+            ]
+        )
+    elif base_days <= 3:
+        policy.extend(
+            [
+                PlanPhase(phase="window_7d", window="7d", expanded_queries=False, limit_multiplier=2),
+                PlanPhase(phase="query_expanded", window="7d", expanded_queries=True, limit_multiplier=2),
+            ]
+        )
+    else:
+        widened_days = min(30, max(base_days + 3, base_days * 2))
+        widened_window = _days_to_window(widened_days)
+        if widened_days > base_days:
+            policy.append(
+                PlanPhase(
+                    phase=f"window_{widened_days}d",
+                    window=widened_window,
+                    expanded_queries=False,
+                    limit_multiplier=2,
+                )
+            )
+        policy.append(PlanPhase(phase="query_expanded", window=widened_window, expanded_queries=True, limit_multiplier=2))
 
     bucket_terms = {bucket.name: list(bucket.terms) for bucket in list(profile.buckets or ())}
     bucket_queries_by_source: Dict[str, Dict[str, List[str]]] = {"github": {}, "hackernews": {}, "huggingface": {}}
