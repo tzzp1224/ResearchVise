@@ -340,6 +340,58 @@ def test_controller_never_selects_zero_relevance_or_zero_body_even_with_downgrad
     assert "bad_hard" not in selected_ids
 
 
+def test_controller_keeps_filling_pass_rows_even_when_source_coverage_short() -> None:
+    from types import SimpleNamespace
+
+    def _row(item_id: str, buckets: list[str]):
+        item = SimpleNamespace(
+            id=item_id,
+            source="github",
+            metadata={"bucket_hits": buckets, "body_len": 1200, "topic_hard_match_pass": True},
+            body_md="x" * 1200,
+        )
+        return SimpleNamespace(item=item, relevance_score=0.92)
+
+    rows = [
+        _row("p1", ["Ops & runtime", "Protocols & tool use"]),
+        _row("p2", ["Frameworks"]),
+        _row("p3", ["Evaluation"]),
+    ]
+    records = [
+        AuditRecord(
+            item_id=item_id,
+            title=item_id,
+            source="github",
+            rank=idx,
+            verdict="pass",
+            reasons=[],
+            used_evidence_urls=["https://github.com/acme/repo"],
+            evidence_domains=["github.com"],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=3,
+            body_len=1200,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "pass", "reason_code": "ok", "human_reason": "ok"},
+        )
+        for idx, item_id in enumerate(["p1", "p2", "p3"], start=1)
+    ]
+    controller = SelectionController(requested_top_k=3, min_source_coverage=2)
+    outcome = controller.evaluate(
+        ranked_rows=rows,
+        audit_records=records,
+        allow_downgrade_fill=False,
+        min_relevance_for_selection=0.55,
+    )
+    selected_ids = [str(getattr(row.item, "id", "") or "") for row in list(outcome.selected_rows or [])]
+    assert selected_ids == ["p1", "p2", "p3"]
+    assert int(outcome.source_coverage) == 1
+
+    decision = controller.expansion_decision(outcome=outcome)
+    assert bool(decision.should_expand) is True
+    assert any("source_coverage_lt_2" in reason for reason in list(decision.reasons or []))
+
+
 def test_controller_applies_downgrade_fill_cap_and_returns_shortage() -> None:
     from types import SimpleNamespace
 

@@ -162,9 +162,6 @@ class SelectionController:
                 continue
             _add(row)
 
-        if len([token for token in used_sources if token]) < int(self._min_source_coverage):
-            return selected[:target_count]
-
         for row in list(rows or []):
             if len(selected) >= target_count:
                 break

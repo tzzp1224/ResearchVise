@@ -1,6 +1,30 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: SelectionController Pass-Fill Fix (Avoid Single-Item Collapse Under Source Diversity Pressure) (New)
+- 本次目标：
+  - 修复 live 产物中“候选很多、pass 很多，但 Top picks 经常只剩 1-2 条”的选择器退化。
+  - 保持 source coverage 扩检策略不变，仅修复 pass-first 选取阶段的提前返回缺陷。
+- 根因定位：
+  - `pipeline_v2/retrieval_controller.py::_select_diverse` 在 source diversity 阶段若发现 `source_coverage < min_source_coverage` 会直接 `return`。
+  - 当 pass 候选几乎都来自同一 source（常见于 AI agent 主题的 GitHub 主导场景）时，会导致：
+    - pass-first 每轮只选到 1 条；
+    - 后续只能靠 downgrade 补 1 条（受 cap 限制），最终常见 `TopPicksCount=2`。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`
+    - 删除 `_select_diverse` 的“source coverage 不达标即提前返回”逻辑。
+    - 改为：先尽量增 source，再继续用 pass 行填满 `target_count`；source coverage 是否达标由扩检决策层处理。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_quality_trigger_expansion.py`
+    - 新增回归：单源 pass 池下也要填满 pass（不应塌缩到 1 条），且仍应触发 `source_coverage_lt_2` 扩检原因。
+- 如何验证：
+  - `pytest -q tests/v2/test_quality_trigger_expansion.py`
+  - `pytest -q tests/v2`
+  - `ARA_V2_CONNECTOR_TIMEOUT_SEC=60 python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 重点看 `retrieval_diagnosis.json`：各 attempt 的 `selected_pass_count/top_picks_count` 不应在单源 pass 场景下长期卡在 1。
+- 风险与回滚：
+  - 风险：在严格 source diversity 场景下，最终 Top picks 可能来自单一 source（但比“单条塌缩+降级拼接”更稳定可用）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Dedup Cluster Identity Guard (Stop Cross-item Body/Citation Contamination) (New)
 - 本次目标：
   - 修复 live 产物中“Top pick 标题正确但正文/证据被其他候选污染”的问题（表现为 evidence URLs 与项目无关、relevance 异常打满、facts/script 语义漂移）。
