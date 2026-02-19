@@ -6,8 +6,10 @@ import hashlib
 import math
 import re
 from typing import List, Sequence
+from urllib.parse import parse_qs, urlparse
 
 from core import CanonicalItem, Citation, NormalizedItem
+from pipeline_v2.sanitize import canonicalize_url
 
 
 def dedup_exact(items: Sequence[NormalizedItem]) -> List[NormalizedItem]:
@@ -71,6 +73,48 @@ def _centroid(vectors: Sequence[Sequence[float]]) -> List[float]:
     return merged
 
 
+def _strict_cluster_identity(item: NormalizedItem) -> str:
+    source = str(item.source or "").strip().lower()
+    metadata = dict(item.metadata or {})
+    item_type = str(metadata.get("item_type") or "").strip().lower() or "unknown"
+    normalized_url = canonicalize_url(str(item.url or "").strip())
+    if not normalized_url:
+        return ""
+
+    parsed = urlparse(normalized_url)
+    host = str(parsed.netloc or "").strip().lower()
+    path_tokens = [token for token in str(parsed.path or "").split("/") if token]
+
+    if source == "github" and host in {"github.com", "www.github.com"} and len(path_tokens) >= 2:
+        owner = path_tokens[0].strip().lower()
+        repo = path_tokens[1].strip().lower()
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        if owner and repo:
+            return f"{source}:{item_type}:repo:{owner}/{repo}"
+
+    if source == "huggingface" and host.endswith("huggingface.co"):
+        if len(path_tokens) >= 3 and path_tokens[0] in {"datasets", "spaces"}:
+            scope = path_tokens[0].strip().lower()
+            owner = path_tokens[1].strip().lower()
+            name = path_tokens[2].strip().lower()
+            if owner and name:
+                return f"{source}:{item_type}:{scope}:{owner}/{name}"
+        if len(path_tokens) >= 2:
+            owner = path_tokens[0].strip().lower()
+            name = path_tokens[1].strip().lower()
+            if owner and name:
+                return f"{source}:{item_type}:model:{owner}/{name}"
+
+    if source == "hackernews":
+        query = parse_qs(str(parsed.query or ""))
+        item_ids = [str(value).strip() for value in list(query.get("id") or []) if str(value).strip()]
+        if item_ids:
+            return f"{source}:{item_type}:story:{item_ids[0]}"
+
+    return ""
+
+
 def cluster(
     items: Sequence[NormalizedItem],
     embeddings: Sequence[Sequence[float]],
@@ -83,13 +127,22 @@ def cluster(
     threshold = max(0.0, min(1.0, float(similarity_threshold)))
     grouped_items: List[List[NormalizedItem]] = []
     grouped_vectors: List[List[List[float]]] = []
+    grouped_identities: List[str] = []
 
     for item, vector in zip(items, embeddings):
+        current_identity = _strict_cluster_identity(item)
         best_idx = -1
         best_score = -1.0
+
         for idx, vectors in enumerate(grouped_vectors):
-            center = _centroid(vectors)
-            score = _cosine(center, vector)
+            existing_identity = str(grouped_identities[idx] or "").strip()
+            if current_identity or existing_identity:
+                if not current_identity or not existing_identity or current_identity != existing_identity:
+                    continue
+                score = 1.0
+            else:
+                center = _centroid(vectors)
+                score = _cosine(center, vector)
             if score > best_score:
                 best_idx = idx
                 best_score = score
@@ -100,6 +153,7 @@ def cluster(
         else:
             grouped_items.append([item])
             grouped_vectors.append([list(vector)])
+            grouped_identities.append(current_identity)
 
     return grouped_items
 

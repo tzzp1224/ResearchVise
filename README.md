@@ -1,6 +1,33 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Dedup Cluster Identity Guard (Stop Cross-item Body/Citation Contamination) (New)
+- 本次目标：
+  - 修复 live 产物中“Top pick 标题正确但正文/证据被其他候选污染”的问题（表现为 evidence URLs 与项目无关、relevance 异常打满、facts/script 语义漂移）。
+  - 仅修复根因段：`normalize -> dedup_cluster -> merge_cluster` 聚类边界，不改 retrieval/auditor 主策略。
+- 根因定位：
+  - 旧版 `pipeline_v2/dedup_cluster.py` 仅依赖低维语义向量（32d）+ 余弦阈值聚类，在 AI agent 大盘文本下出现超大误聚类（实测某簇 `cluster_size=70`，混入 GitHub/HF/HN 多源候选）。
+  - `merge_cluster` 会把簇内 citation 全量并入 canonical item，导致单条 Top pick 带入其他候选的证据 URL，直接污染 onepager/facts/script。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/dedup_cluster.py`
+    - 新增 strict identity（source-aware）：
+      - GitHub：`source + item_type + owner/repo`
+      - HuggingFace：`source + item_type + (model|dataset|space) repo_id`
+      - HackerNews：`source + item_type + hn item id`
+    - 聚类时优先按 identity 约束：identity 不同的候选禁止进入同一簇；仅 identity 相同才允许合并。
+    - 无 strict identity 的候选，保持原有语义聚类逻辑（兼容历史行为）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_dedup_cluster.py`
+    - 新增回归：不同 GitHub repo 即使文本高度相似也不可合簇。
+    - 新增回归：同一 repo URL 变体（含 `.git`）仍可合簇。
+- 如何验证：
+  - `pytest -q tests/v2/test_dedup_cluster.py`
+  - `pytest -q tests/v2`
+  - `ARA_V2_CONNECTOR_TIMEOUT_SEC=60 python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 对比 `onepager.md` / `evidence_audit.json`：Top picks 的 evidence URL 应与 item 语义一致，不再出现跨项目污染链接。
+- 风险与回滚：
+  - 风险：跨源“语义近似但非同资源”候选不再被去重合并，候选总量可能上升（这是有意为之，用于保证证据归属正确）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Quality Close-loop Hardening (Facts Sentence Safety + Evidence Alignment + Downgrade Cap) (New)
 - 本次目标：
   - 基于 `run_20260219_083239_36265b5a` 真实产物修复质量偏差：facts 语义截断、onepager/evidence_audit 证据口径漂移、relevance 过度打满、downgrade 兜底过宽、分镜资产错配。
