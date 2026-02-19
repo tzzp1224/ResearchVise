@@ -338,3 +338,48 @@ def test_controller_never_selects_zero_relevance_or_zero_body_even_with_downgrad
     assert "bad_rel" not in selected_ids
     assert "bad_body" not in selected_ids
     assert "bad_hard" not in selected_ids
+
+
+def test_controller_applies_downgrade_fill_cap_and_returns_shortage() -> None:
+    from types import SimpleNamespace
+
+    def _row(item_id: str, source: str, relevance: float, verdict: str):
+        item = SimpleNamespace(
+            id=item_id,
+            source=source,
+            metadata={"bucket_hits": ["Frameworks"], "body_len": 900, "topic_hard_match_pass": True},
+            body_md="agent runtime orchestration quickstart benchmark",
+        )
+        row = SimpleNamespace(item=item, relevance_score=relevance)
+        record = AuditRecord(
+            item_id=item_id,
+            title=item_id,
+            source=source,
+            rank=1,
+            verdict=verdict,
+            reasons=([] if verdict == "pass" else ["weak_evidence"]),
+            used_evidence_urls=["https://docs.acme.dev/agent-runtime"],
+            evidence_domains=["docs.acme.dev"],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=(2 if verdict == "pass" else 1),
+            body_len=900,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": verdict, "reason_code": ("ok" if verdict == "pass" else "weak_evidence"), "human_reason": verdict},
+        )
+        return row, record
+
+    pass_row, pass_record = _row("pass_1", "github", 0.92, "pass")
+    dg_row_1, dg_record_1 = _row("dg_1", "huggingface", 0.88, "downgrade")
+    dg_row_2, dg_record_2 = _row("dg_2", "hackernews", 0.87, "downgrade")
+
+    controller = SelectionController(requested_top_k=3)
+    outcome = controller.evaluate(
+        ranked_rows=[pass_row, dg_row_1, dg_row_2],
+        audit_records=[pass_record, dg_record_1, dg_record_2],
+        allow_downgrade_fill=True,
+        min_relevance_for_selection=0.55,
+    )
+    assert len(list(outcome.selected_rows or [])) == 2
+    assert outcome.max_downgrade_allowed == 1
+    assert outcome.downgrade_cap_reached is True

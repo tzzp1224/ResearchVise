@@ -24,6 +24,7 @@ _FACT_NOISE_PATTERNS = (
     re.compile(r"\b(?:important|warning)\b.*\b(?:impersonation|official website)\b", re.IGNORECASE),
     re.compile(r"\brust toolchain\b", re.IGNORECASE),
     re.compile(r"\bcurl\s+.*(?:proto|tlsv1)\b", re.IGNORECASE),
+    re.compile(r"\b(?:windows|linux|macos)\s+required\b", re.IGNORECASE),
 )
 _HN_META_LINE = re.compile(
     r"^\s*Points:\s*\d+\s*(?:\|\s*Comments:\s*\d+)?(?:\|\s*ItemType:\s*[a-z0-9_-]+)?\s*$",
@@ -61,6 +62,26 @@ _HYPE_PATTERN = re.compile(
     r"\b(best|most|ultimate|revolutionary|amazing|world[- ]class|ever built|game[- ]changing)\b",
     re.IGNORECASE,
 )
+_TRAILING_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "from",
+    "by",
+    "at",
+    "as",
+    "into",
+    "is",
+    "are",
+}
 
 
 def _compact_text(value: str, max_len: int) -> str:
@@ -235,11 +256,27 @@ def _is_fact_noise(sentence: str) -> bool:
         return True
     if _HN_META_LINE.match(text):
         return True
+    if _looks_like_heading_fragment(text):
+        return True
     lowered = text.lower()
     if lowered in {"---", "*", "-"}:
         return True
     if any(pattern.search(text) for pattern in _FACT_NOISE_PATTERNS):
         return True
+    return False
+
+
+def _looks_like_heading_fragment(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    lowered = value.lower()
+    if re.search(
+        r"^(overview|what(?:\s+it\s+is)?|features?|quickstart|get(?:ting)?\s+started|usage|how\s+it\s+works|examples?|prerequisites?|requirements?|installation)(\s+[a-z0-9._-]+){0,7}$",
+        lowered,
+    ):
+        if not _has_verifiable_signal(value):
+            return True
     return False
 
 
@@ -351,12 +388,63 @@ def _why_now(item: NormalizedItem) -> str:
 
 
 def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
-    value = _clean_sentence(text, max_len=max_len)
+    value = _clean_sentence(text, max_len=max(240, max_len * 2))
     value = re.sub(r"^(?:[-*•]+\s*)", "", value).strip()
     value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return ""
+    value = _trim_to_complete_sentence(value, max_len=max_len)
+    if not value:
+        return ""
     if value and re.search(r"[a-zA-Z0-9]$", value) and not re.search(r"[.!?。！？]$", value):
         value = value + "."
     return value
+
+
+def _trim_to_complete_sentence(value: str, *, max_len: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -:;,")
+    if not text:
+        return ""
+    if len(text) <= max_len and not _ends_with_stopword(text):
+        return text
+
+    sentence_parts = [
+        token.strip()
+        for token in re.split(r"(?<=[.!?。！？;；])\s+", text)
+        if token and token.strip()
+    ]
+    for part in sentence_parts:
+        if len(part) <= max_len and len(part) >= 16 and not _ends_with_stopword(part):
+            return part
+
+    clause_parts = [
+        token.strip()
+        for token in re.split(r"[,:，、]\s*", text)
+        if token and token.strip()
+    ]
+    for part in clause_parts:
+        if len(part) <= max_len and len(part) >= 16 and not _ends_with_stopword(part):
+            return part
+
+    trimmed = text[:max_len].rstrip()
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0].rstrip()
+    while trimmed:
+        token = re.findall(r"[a-zA-Z]+", trimmed.lower())
+        if token and token[-1] in _TRAILING_STOPWORDS:
+            trimmed = re.sub(r"\b[a-zA-Z]+\s*$", "", trimmed).rstrip()
+            continue
+        break
+    if len(trimmed) < 10:
+        return ""
+    return trimmed
+
+
+def _ends_with_stopword(value: str) -> bool:
+    tokens = [token for token in re.findall(r"[a-zA-Z]+", str(value or "").lower()) if token]
+    if not tokens:
+        return False
+    return tokens[-1] in _TRAILING_STOPWORDS
 
 
 def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[str, object]:
@@ -505,7 +593,7 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
     return {
         "topic": topic_text or None,
         "hook": _clean_sentence(hook, max_len=170),
-        "what_it_is": _clean_sentence(what_it_is, max_len=150),
+        "what_it_is": _clean_fact_point(what_it_is, max_len=150),
         "why_now": _clean_sentence(_why_now(item), max_len=190),
         "how_it_works": [_clean_fact_point(point, max_len=88) for point in how_it_works[:3]],
         "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],

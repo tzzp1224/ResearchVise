@@ -207,7 +207,23 @@ def _evidence_rank(url: str) -> int:
     return 60
 
 
-def _item_evidence_urls(item: NormalizedItem) -> List[str]:
+def _item_evidence_urls(item: NormalizedItem, *, audit_urls_by_item: dict[str, list[str]] | None = None) -> List[str]:
+    audit_map = dict(audit_urls_by_item or {})
+    audit_urls = list(audit_map.get(str(item.id), []) or [])
+    if audit_urls:
+        deduped: List[str] = []
+        for raw in audit_urls:
+            token = canonicalize_url(str(raw or "").strip())
+            if not token or token in deduped:
+                continue
+            if classify_link(token) != "evidence":
+                continue
+            deduped.append(token)
+            if len(deduped) >= _MAX_EVIDENCE_PER_ITEM:
+                break
+        if deduped:
+            return deduped
+
     metadata = dict(item.metadata or {})
     candidates: List[str] = []
     for raw in list(metadata.get("evidence_links") or []):
@@ -328,6 +344,10 @@ def generate_onepager(
     ]
     top_verdicts = {str(k): str(v).strip().lower() for k, v in dict(ranking_stats.get("top_evidence_audit_verdicts") or {}).items()}
     top_reasons = {str(k): list(v or []) for k, v in dict(ranking_stats.get("top_evidence_audit_reasons") or {}).items()}
+    top_evidence_urls = {
+        str(k): [str(url).strip() for url in list(v or []) if str(url).strip()]
+        for k, v in dict(ranking_stats.get("top_evidence_urls") or {}).items()
+    }
     diagnosis_path = str(
         retrieval.get("diagnosis_path")
         or context.get("diagnosis_path")
@@ -451,7 +471,7 @@ def generate_onepager(
     lines.extend(["## Evidence", ""])
     global_evidence = 0
     for idx, item in enumerate(normalized_items, start=1):
-        urls = _item_evidence_urls(item)
+        urls = _item_evidence_urls(item, audit_urls_by_item=top_evidence_urls)
         if not urls:
             continue
         lines.append(f"### Evidence for {item.id}: {item.title}")

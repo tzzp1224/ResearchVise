@@ -127,9 +127,8 @@ _AGENT_HIGH_VALUE_TERMS = {
     "crewai",
     "agent eval",
     "agent benchmark",
-    "benchmark",
-    "inspect",
     "agent runtime",
+    "inspect",
 }
 
 
@@ -237,7 +236,7 @@ def evaluate_relevance(
     if str(profile.key or "").strip().lower() == "ai_agent":
         for term in hard_terms:
             lowered = str(term).strip().lower()
-            if lowered and lowered not in _AGENT_GENERIC_TERMS:
+            if lowered and lowered not in _AGENT_GENERIC_TERMS and not _contains_negated_term(topic_text, lowered):
                 agent_non_generic_hits.append(term)
         for term in _AGENT_HIGH_VALUE_TERMS:
             if _contains_term(topic_text, term) and not _contains_negated_term(topic_text, term):
@@ -248,6 +247,9 @@ def evaluate_relevance(
         if score >= 0.8 and not (has_high_value or non_generic_count >= 2):
             score = 0.79
             agent_score_cap = "cap_lt_0.8_requires_non_generic_or_high_value"
+        elif score >= 0.9 and not has_high_value:
+            score = 0.89
+            agent_score_cap = "cap_lt_0.9_requires_high_value_agent_term"
 
         signals = _quality_signals(item)
         has_substantive_content = bool(

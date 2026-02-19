@@ -190,7 +190,7 @@ class RunPipelineRuntime:
             retrieval_plan = planner.plan(topic_value, time_window=request.time_window)
 
         top_count = self._top_n(request)
-        controller = self._build_selection_controller(request, top_count=top_count)
+        controller = self._build_selection_controller(request, top_count=top_count, data_mode=data_mode)
         auditor = self._resolve_evidence_auditor(request, topic_profile=topic_profile)
         recall_profiles = self._recall_profiles(request, data_mode=data_mode, retrieval_plan=retrieval_plan)
         budget = dict(request.budget or {})
@@ -565,6 +565,8 @@ class RunPipelineRuntime:
         selected_downgrade_count = int(
             sum(1 for verdict in list(selected_verdicts.values()) if str(verdict).strip().lower() == "downgrade")
         )
+        max_downgrade_allowed = int(getattr(selection_outcome, "max_downgrade_allowed", 0) or 0)
+        downgrade_cap_reached = bool(getattr(selection_outcome, "downgrade_cap_reached", False))
         why_not_more: List[str] = []
         if len(picks) < top_count:
             why_not_more.append(f"top_picks_lt_{top_count}")
@@ -578,6 +580,8 @@ class RunPipelineRuntime:
             why_not_more.append("source_diversity_lt_2")
         if selected_bucket_coverage < 2 and (topic_profile and topic_profile.minimum_bucket_coverage >= 2):
             why_not_more.append("bucket_coverage_lt_2")
+        if downgrade_cap_reached:
+            why_not_more.append(f"downgrade_fill_cap_reached:{max_downgrade_allowed}")
 
         retrieval_diagnosis = {
             "run_id": run_id,
@@ -606,6 +610,8 @@ class RunPipelineRuntime:
             "selected_pass_count": selected_pass_count,
             "selected_downgrade_count": selected_downgrade_count,
             "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
+            "max_downgrade_allowed": max_downgrade_allowed,
+            "downgrade_cap_reached": downgrade_cap_reached,
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
             "why_not_more": why_not_more,
@@ -634,6 +640,8 @@ class RunPipelineRuntime:
             "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
             "selected_pass_count": selected_pass_count,
             "selected_downgrade_count": selected_downgrade_count,
+            "max_downgrade_allowed": max_downgrade_allowed,
+            "downgrade_cap_reached": downgrade_cap_reached,
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
             "why_not_more": why_not_more,
@@ -683,6 +691,7 @@ class RunPipelineRuntime:
         top_verdicts = {}
         top_reason_codes = {}
         top_reasons = {}
+        top_evidence_urls = {}
         for entry in picks:
             item_id = str(entry.item.id)
             record = audit_by_item.get(item_id)
@@ -690,6 +699,7 @@ class RunPipelineRuntime:
             machine_action = dict((record.machine_action if record else {}) or {})
             top_reason_codes[item_id] = str(machine_action.get("reason_code") or "")
             top_reasons[item_id] = list(record.reasons or []) if record else []
+            top_evidence_urls[item_id] = list(record.used_evidence_urls or []) if record else []
         run_context["ranking_stats"] = {
             "topic": str(request.topic or "").strip() or None,
             "candidate_count": len(ranked),
@@ -711,6 +721,7 @@ class RunPipelineRuntime:
             "top_evidence_audit_verdicts": top_verdicts,
             "top_evidence_audit_reason_codes": top_reason_codes,
             "top_evidence_audit_reasons": top_reasons,
+            "top_evidence_urls": top_evidence_urls,
             "min_body_len_for_top_picks": 300,
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
@@ -720,6 +731,8 @@ class RunPipelineRuntime:
             "selected_pass_count": selected_pass_count,
             "selected_downgrade_count": selected_downgrade_count,
             "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
+            "max_downgrade_allowed": max_downgrade_allowed,
+            "downgrade_cap_reached": downgrade_cap_reached,
             "bucket_coverage": selected_bucket_coverage,
             "selected_source_coverage": int(selected_attempt_payload.get("source_coverage", quality_snapshot.get("source_coverage", 0)) or 0),
             "top_bucket_hits": sorted(
@@ -1387,7 +1400,7 @@ class RunPipelineRuntime:
             topic_profile=topic_profile,
         )
 
-    def _build_selection_controller(self, request: RunRequest, *, top_count: int) -> SelectionController:
+    def _build_selection_controller(self, request: RunRequest, *, top_count: int, data_mode: str = "live") -> SelectionController:
         budget = dict(request.budget or {})
 
         def _float(key: str, env_name: str, default: float) -> float:
@@ -1423,12 +1436,27 @@ class RunPipelineRuntime:
             "ARA_V2_MIN_BUCKET_COVERAGE",
             2 if int(top_count) >= 2 else 1,
         )
+        explicit_downgrade_ratio = ("max_downgrade_ratio" in budget) or (os.getenv("ARA_V2_MAX_DOWNGRADE_RATIO") is not None)
+        explicit_downgrade_count = ("max_downgrade_count" in budget) or (os.getenv("ARA_V2_MAX_DOWNGRADE_COUNT") is not None)
+        if str(data_mode or "").strip().lower() == "smoke" and not explicit_downgrade_ratio and not explicit_downgrade_count:
+            max_downgrade_ratio = 1.0
+            max_downgrade_count = int(max(1, top_count))
+        else:
+            max_downgrade_ratio = _float("max_downgrade_ratio", "ARA_V2_MAX_DOWNGRADE_RATIO", 0.34)
+            max_downgrade_count = (
+                None
+                if str(budget.get("max_downgrade_count", "")).strip() == ""
+                and os.getenv("ARA_V2_MAX_DOWNGRADE_COUNT") is None
+                else _int("max_downgrade_count", "ARA_V2_MAX_DOWNGRADE_COUNT", 1)
+            )
         return SelectionController(
             requested_top_k=int(max(1, top_count)),
             min_pass_ratio=_float("min_pass_ratio", "ARA_V2_MIN_PASS_RATIO", 0.30),
             min_evidence_quality=_float("min_evidence_quality", "ARA_V2_MIN_EVIDENCE_QUALITY", 2.0),
             min_bucket_coverage=max(1, min_bucket),
             min_source_coverage=max(1, _int("min_source_coverage", "ARA_V2_MIN_SOURCE_COVERAGE", 2)),
+            max_downgrade_ratio=max_downgrade_ratio,
+            max_downgrade_count=max_downgrade_count,
         )
 
     @staticmethod
@@ -1842,11 +1870,9 @@ class RunPipelineRuntime:
     def _attach_reference_assets(*, board: Any, materials: Dict[str, Any]) -> Any:
         ref_map = {normalize_url(str(key)): str(value) for key, value in dict(materials.get("reference_asset_map") or {}).items()}
         local_assets = [str(path) for path in list(materials.get("local_assets") or []) if str(path).strip()]
+        primary_asset = local_assets[0] if local_assets else ""
         for idx, shot in enumerate(list(board.shots or []), start=1):
-            local_pref = local_assets[(idx - 1) % len(local_assets)] if local_assets else ""
             refs: List[str] = []
-            if local_pref and idx <= 3:
-                refs.append(local_pref)
             for raw_ref in list(shot.reference_assets or []):
                 normalized = normalize_url(str(raw_ref or ""))
                 mapped = ref_map.get(normalized)
@@ -1856,8 +1882,11 @@ class RunPipelineRuntime:
                 elif normalized and is_allowed_citation_url(normalized):
                     if normalized not in refs:
                         refs.append(normalized)
+            has_local_asset = any(Path(str(ref)).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".webm"} for ref in refs)
+            if not has_local_asset and primary_asset:
+                refs.insert(0, primary_asset)
             if not refs and local_assets:
-                refs = [local_assets[(idx - 1) % len(local_assets)]]
+                refs = [primary_asset or local_assets[0]]
             shot.reference_assets = refs
         return board
 

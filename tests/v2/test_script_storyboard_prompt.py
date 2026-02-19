@@ -204,3 +204,34 @@ def test_build_facts_filters_hn_meta_and_keeps_sentence_boundaries() -> None:
         text = str(sentence).strip()
         assert text
         assert text.endswith((".", "!", "?", "。", "！", "？"))
+
+
+def test_build_facts_avoids_heading_fragments_and_trailing_stopword_clauses() -> None:
+    item = _sample_item()
+    body = (
+        "## Features\n"
+        "Using OAuth tokens from hosted plans in third-party tools is not permitted and may violate the service policy terms.\n"
+        "## Prerequisites\n"
+        "Windows Required 1\n"
+        "## Quickstart\n"
+        "pip install acme-agent && acme-agent run --topic \"AI agent\" --dry-run\n"
+        "## Evidence\n"
+        "Benchmark report shows 31% lower tool-routing latency with deterministic orchestration checkpoints.\n"
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    what = str(facts.get("what_it_is") or "")
+    merged = " ".join(
+        [what]
+        + [str(v) for v in list(facts.get("how_it_works") or [])]
+        + [str(v) for v in list(facts.get("proof") or [])]
+    )
+    assert "##" not in merged
+    assert "Prerequisites" not in merged
+    assert "Windows Required 1" not in merged
+    assert not what.lower().rstrip(".").endswith((" the", " a", " an", " and", " or", " to", " of"))
+    for sentence in list(facts.get("how_it_works") or []) + list(facts.get("proof") or []):
+        text = str(sentence).strip()
+        assert text
+        assert text.endswith((".", "!", "?", "。", "！", "？"))

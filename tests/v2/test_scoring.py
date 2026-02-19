@@ -200,7 +200,7 @@ def test_agent_generic_term_alone_cannot_reach_perfect_relevance() -> None:
         "No tool calling, no orchestration details, and no benchmark numbers are provided."
     )
     score = score_relevance(item, "AI agent")
-    assert score < 1.0
+    assert score <= 0.79
 
 
 def test_source_query_terms_do_not_bypass_hard_relevance_gate() -> None:

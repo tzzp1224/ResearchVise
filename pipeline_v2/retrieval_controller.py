@@ -21,6 +21,8 @@ class AttemptOutcome:
     source_coverage: int
     used_downgrade: bool
     all_selected_downgrade: bool
+    max_downgrade_allowed: int
+    downgrade_cap_reached: bool
 
 
 @dataclass
@@ -40,12 +42,20 @@ class SelectionController:
         min_evidence_quality: float = 2.0,
         min_bucket_coverage: int = 2,
         min_source_coverage: int = 2,
+        max_downgrade_ratio: float = 0.34,
+        max_downgrade_count: int | None = None,
     ) -> None:
         self._requested_top_k = max(1, int(requested_top_k))
         self._min_pass_ratio = max(0.0, min(1.0, float(min_pass_ratio)))
         self._min_evidence_quality = float(max(0.0, min_evidence_quality))
         self._min_bucket_coverage = max(1, int(min_bucket_coverage))
         self._min_source_coverage = max(1, int(min_source_coverage))
+        ratio = max(0.0, min(1.0, float(max_downgrade_ratio)))
+        default_cap = max(1, int(self._requested_top_k * ratio))
+        if max_downgrade_count is None:
+            self._max_downgrade_count = default_cap
+        else:
+            self._max_downgrade_count = max(0, int(max_downgrade_count))
 
     @staticmethod
     def _item_id(row: Any) -> str:
@@ -171,11 +181,13 @@ class SelectionController:
         selected: Sequence[Any],
         downgrade_rows: Sequence[Any],
         target_count: int,
+        max_to_add: int,
     ) -> List[Any]:
         picks: List[Any] = list(selected or [])
         selected_ids = {self._item_id(row) for row in picks if self._item_id(row)}
         used_sources = {self._item_source(row) for row in picks if self._item_source(row)}
         used_buckets = {bucket for row in picks for bucket in self._item_buckets(row)}
+        base_count = len(picks)
 
         def _add(row: Any) -> None:
             item_id = self._item_id(row)
@@ -192,6 +204,8 @@ class SelectionController:
         for row in list(downgrade_rows or []):
             if len(picks) >= target_count:
                 break
+            if (len(picks) - base_count) >= max_to_add:
+                break
             item_id = self._item_id(row)
             if not item_id or item_id in selected_ids:
                 continue
@@ -205,6 +219,8 @@ class SelectionController:
         if len([token for token in used_sources if token]) < int(self._min_source_coverage):
             if not picks:
                 for row in list(downgrade_rows or []):
+                    if (len(picks) - base_count) >= max_to_add:
+                        break
                     item_id = self._item_id(row)
                     if item_id and item_id not in selected_ids:
                         _add(row)
@@ -213,11 +229,12 @@ class SelectionController:
 
         # Stage 2: with source coverage satisfied, continue normal diverse fill.
         remaining = [row for row in list(downgrade_rows or []) if self._item_id(row) not in selected_ids]
-        return self._select_diverse(
+        filled = self._select_diverse(
             remaining,
-            target_count=target_count,
+            target_count=min(target_count, base_count + max_to_add),
             preselected=picks,
         )
+        return filled[:target_count]
 
     def evaluate(
         self,
@@ -248,12 +265,14 @@ class SelectionController:
 
         selected = self._select_diverse(pass_rows, target_count=self._requested_top_k)
         used_downgrade = False
+        max_downgrade_allowed = max(0, min(self._max_downgrade_count, self._requested_top_k - len(selected)))
         if allow_downgrade_fill and len(selected) < self._requested_top_k:
             used_downgrade = True
             selected = self._fill_with_downgrade(
                 selected=selected,
                 downgrade_rows=downgrade_rows,
                 target_count=self._requested_top_k,
+                max_to_add=max_downgrade_allowed,
             )
 
         selected_verdicts: Dict[str, str] = {}
@@ -262,6 +281,7 @@ class SelectionController:
         selected_buckets = set()
         selected_sources = set()
         all_selected_downgrade = bool(selected)
+        selected_downgrade_total = 0
         for row in list(selected or []):
             item_id = self._item_id(row)
             record = records_by_id.get(item_id)
@@ -270,6 +290,7 @@ class SelectionController:
             if verdict != "downgrade":
                 all_selected_downgrade = False
             if verdict == "downgrade":
+                selected_downgrade_total += 1
                 selected_downgrade_reasons[item_id] = [
                     str(reason) for reason in list(getattr(record, "reasons", []) or []) if str(reason).strip()
                 ]
@@ -296,6 +317,11 @@ class SelectionController:
         candidate_count = len(eligible_rows)
         pass_ratio = float(pass_count) / float(max(1, candidate_count))
         min_evidence_quality = min(evidence_qualities) if evidence_qualities else 0.0
+        downgrade_cap_reached = bool(
+            allow_downgrade_fill
+            and len(selected) < self._requested_top_k
+            and selected_downgrade_total >= max_downgrade_allowed
+        )
 
         return AttemptOutcome(
             selected_rows=selected,
@@ -311,6 +337,8 @@ class SelectionController:
             source_coverage=int(len([source for source in selected_sources if source])),
             used_downgrade=bool(used_downgrade),
             all_selected_downgrade=bool(all_selected_downgrade),
+            max_downgrade_allowed=int(max_downgrade_allowed),
+            downgrade_cap_reached=bool(downgrade_cap_reached),
         )
 
     def expansion_decision(self, *, outcome: AttemptOutcome) -> ExpansionDecision:

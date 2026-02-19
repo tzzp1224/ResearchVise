@@ -1,6 +1,49 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Quality Close-loop Hardening (Facts Sentence Safety + Evidence Alignment + Downgrade Cap) (New)
+- 本次目标：
+  - 基于 `run_20260219_083239_36265b5a` 真实产物修复质量偏差：facts 语义截断、onepager/evidence_audit 证据口径漂移、relevance 过度打满、downgrade 兜底过宽、分镜资产错配。
+  - 保持 deterministic 策略，不引入 LLM 强依赖。
+- 根因定位（对应产物）：
+  - `facts.json` / `script.json`：`what_it_is/how_it_works/proof` 存在半句结尾与 heading 碎片进入成品，来源是字符截断优先而非句边界优先。
+  - `onepager.md` vs `evidence_audit.json`：Evidence 区块按 item 二次聚合 URL，未直接消费 audit 的 `used_evidence_urls`，导致同一条 Top pick 的证据列表不一致。
+  - `retrieval_diagnosis.json` / `run_context.json`：`rel=1.00 | hard=agent` 说明 generic 词命中仍可高分，1.0 上限约束不够严格。
+  - `onepager.md`：`SelectedPassCount=1 / SelectedDowngradeCount=2`，兜底比例偏高，缺少降级上限。
+  - `prompt_bundle.json` / `storyboard.json`：shot 资产按序号轮换注入，未优先按引用 URL 映射，造成文案语义与渲染资产错位。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`
+    - 新增“句边界优先 + 子句回退”裁剪逻辑，`what_it_is/how_it_works/proof` 强制输出完整句，避免尾词截断。
+    - 增强 heading/元信息噪声识别（如 `Prerequisites` 片段）并阻断进入 facts。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - `used_evidence_urls` 改为 source-aware 排序后截断，优先高可信技术证据，再降级社媒/聚合链接。
+    - 新增 pass 门槛：GitHub/HF 若缺少高可信技术证据，不得 `pass`，降级并打 `evidence_high_trust_missing`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`
+    - onepager Evidence 区块优先使用 `ranking_stats.top_evidence_urls`（来自 audit），确保与 `evidence_audit.json` 证据集合一致。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - 收紧 AI agent 相关性上限：generic `agent` 命中不再进入 0.9+ / 1.0；`1.0` 仅在高价值 agent 术语 + 实质内容信号成立时出现。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py` 与 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - 新增 downgrade 填充上限（默认按比例，Top3 默认最多 1 条，可通过 env/budget 覆盖）。
+    - 上限触发时允许 shortage，并在 `why_not_more` 记录 `downgrade_fill_cap_reached:*`。
+    - `run_context.ranking_stats` 新增 `top_evidence_urls/max_downgrade_allowed/downgrade_cap_reached`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - `_attach_reference_assets` 从“序号轮换本地素材”改为“URL 映射优先 + primary fallback”，减少 shot 文案与素材语义错配。
+- 测试更新：
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_script_storyboard_prompt.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_report_export_notification.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_quality_trigger_expansion.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 重点验收：facts 不含半句截断；onepager Evidence 与 audit 证据一致；`rel=1.00` 不再由 generic `agent` 触发；downgrade 不再大比例凑满。
+- 风险与回滚：
+  - 风险：downgrade 上限收紧后，弱信号窗口可能更常出现 `<top_k`（会在 Why not more? 解释）。
+  - 风险：高可信证据门槛会降低部分“社媒驱动项目”的通过率。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Live Quality Stabilization (Sanitization + Citation Context + Best Attempt Selection) (New)
 - 本次目标：
   - 修复 live 质量持续退化的三类主因：正文被误清空、证据重复误判、扩检后被最后 phase 低质量结果覆盖。

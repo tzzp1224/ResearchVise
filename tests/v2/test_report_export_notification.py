@@ -106,3 +106,33 @@ def test_notifications_write_jsonl(tmp_path: Path) -> None:
     log_path = out_dir / "notifications.jsonl"
     lines = log_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3
+
+
+def test_onepager_evidence_section_prefers_audit_urls(tmp_path: Path) -> None:
+    item = _item()
+    item.id = "audit_1"
+    item.citations = [
+        Citation(
+            title="fallback",
+            url="https://fallback.example.com/weak",
+            snippet="fallback evidence",
+            source="web",
+        )
+    ]
+    run_context = {
+        "ranking_stats": {
+            "requested_top_k": 1,
+            "top_evidence_urls": {
+                "audit_1": [
+                    "https://github.com/acme/agent-runtime/releases/tag/v1.0.0",
+                    "https://docs.acme.dev/agent-runtime",
+                ]
+            },
+            "top_evidence_audit_verdicts": {"audit_1": "pass"},
+            "top_evidence_audit_reasons": {"audit_1": []},
+        }
+    }
+    onepager = generate_onepager([item], item.citations, out_dir=tmp_path, run_context=run_context)
+    text = Path(onepager).read_text(encoding="utf-8")
+    assert "https://github.com/acme/agent-runtime/releases/tag/v1.0.0" in text
+    assert "https://docs.acme.dev/agent-runtime" in text

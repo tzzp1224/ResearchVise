@@ -119,6 +119,49 @@ class AuditSelection:
 
 
 def _collect_evidence_urls(item: NormalizedItem) -> List[str]:
+    def _evidence_rank(url: str, *, source_hint: str) -> float:
+        parsed = urlparse(str(url or ""))
+        host = str(parsed.netloc or "").strip().lower()
+        path = str(parsed.path or "").strip().lower()
+        source = str(source_hint or "").strip().lower()
+
+        score = 0.0
+        if host in {"arxiv.org", "openreview.net", "docs.python.org"}:
+            score += 10.0
+        if host in {"github.com"}:
+            score += 8.0
+            if "/releases/" in path:
+                score += 2.0
+            if "/wiki" in path or "/issues/" in path:
+                score += 1.2
+        if host.endswith("huggingface.co"):
+            score += 8.0
+            if "/datasets/" in path or "/models/" in path:
+                score += 1.2
+        if "docs" in host or "/docs" in path or "/documentation" in path:
+            score += 7.0
+        if host in {"news.ycombinator.com"} and "item" in parsed.query:
+            score += 6.0
+
+        if source == "github" and host == "github.com":
+            score += 1.0
+        if source == "huggingface" and host.endswith("huggingface.co"):
+            score += 1.0
+
+        if host in {
+            "x.com",
+            "twitter.com",
+            "mobile.twitter.com",
+            "xiaohongshu.com",
+            "www.xiaohongshu.com",
+            "weibo.com",
+            "www.weibo.com",
+            "t.co",
+            "refactoringenglish.com",
+        }:
+            score -= 4.5
+        return score
+
     urls: List[str] = []
     metadata = dict(item.metadata or {})
     for raw in list(metadata.get("evidence_links") or []):
@@ -132,7 +175,12 @@ def _collect_evidence_urls(item: NormalizedItem) -> List[str]:
     item_url = canonicalize_url(str(item.url or ""))
     if item_url and is_allowed_citation_url(item_url) and item_url not in urls:
         urls.append(item_url)
-    return urls[:12]
+    ranked = sorted(
+        list(urls),
+        key=lambda token: (_evidence_rank(token, source_hint=str(item.source or "")), token),
+        reverse=True,
+    )
+    return ranked[:12]
 
 
 def _source_min_body_len(source: str) -> int:
@@ -208,6 +256,27 @@ def _repo_self_only(urls: Sequence[str]) -> bool:
     has_demo = any("demo" in path for path in paths)
     has_path_diversity = len(set(paths)) >= 2
     return not (has_release or has_docs or has_demo or has_path_diversity)
+
+
+def _has_high_trust_technical_evidence(urls: Sequence[str]) -> bool:
+    for raw in list(urls or []):
+        token = canonicalize_url(str(raw or "").strip())
+        if not token:
+            continue
+        parsed = urlparse(token)
+        host = str(parsed.netloc or "").strip().lower()
+        path = str(parsed.path or "").strip().lower()
+        if host in {"arxiv.org", "openreview.net", "docs.python.org"}:
+            return True
+        if host in {"github.com"} and (
+            path.count("/") >= 2 or "/releases/" in path or "/wiki" in path or "/issues/" in path
+        ):
+            return True
+        if host.endswith("huggingface.co") and ("/datasets/" in path or "/models/" in path):
+            return True
+        if "docs" in host or "/docs" in path or "/documentation" in path:
+            return True
+    return False
 
 
 def _is_evergreen_source(source: str) -> bool:
@@ -428,6 +497,15 @@ class EvidenceAuditor:
                     reasons=reasons,
                     target=VERDICT_REJECT,
                     reason="hf_missing_agent_signals",
+                )
+
+        if source_key in {"github", "huggingface"} and verdict == VERDICT_PASS:
+            if not _has_high_trust_technical_evidence(urls):
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_DOWNGRADE,
+                    reason="evidence_high_trust_missing",
                 )
 
         primary_code = _reason_code(reasons[0] if reasons else "")

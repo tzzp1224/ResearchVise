@@ -159,3 +159,68 @@ def test_evidence_auditor_rejects_zero_body_and_hard_gate_fail() -> None:
     assert "topic_relevance_zero" in reasons
     assert "topic_hard_gate_fail" in reasons
     assert "body_len_zero" in reasons
+
+
+def test_evidence_auditor_downgrades_pass_without_high_trust_technical_evidence() -> None:
+    row = _row(
+        "social_only",
+        source="github",
+        body=("agent runtime workflow and orchestration notes " * 80).strip(),
+        citations=[
+            Citation(title="x", url="https://x.com/acme/status/1", snippet="launch note", source="web"),
+            Citation(
+                title="xhs",
+                url="https://xiaohongshu.com/user/profile/abc",
+                snippet="thread notes",
+                source="web",
+            ),
+        ],
+        metadata={
+            "body_len": 1200,
+            "quality_signals": {"evidence_links_quality": 2, "publish_or_update_time": "2026-02-18T10:00:00Z"},
+            "topic_hard_match_pass": True,
+            "evidence_links": ["https://x.com/acme/status/1", "https://xiaohongshu.com/user/profile/abc"],
+            "stars": 120,
+            "forks": 20,
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == VERDICT_DOWNGRADE
+    assert any("evidence_high_trust_missing" in reason for reason in list(record.reasons or []))
+
+
+def test_evidence_auditor_sorts_high_trust_urls_before_social_urls() -> None:
+    row = _row(
+        "ranked_evidence",
+        source="github",
+        body=("agent runtime orchestration quickstart benchmark " * 80).strip(),
+        citations=[
+            Citation(title="social", url="https://x.com/acme/status/2", snippet="social", source="web"),
+            Citation(
+                title="release",
+                url="https://github.com/acme/agent-runtime/releases/tag/v1.0.0",
+                snippet="release notes",
+                source="github",
+            ),
+            Citation(title="docs", url="https://docs.acme.dev/agent-runtime", snippet="docs", source="docs"),
+        ],
+        metadata={
+            "body_len": 1400,
+            "quality_signals": {"evidence_links_quality": 3, "publish_or_update_time": "2026-02-18T10:00:00Z"},
+            "topic_hard_match_pass": True,
+            "evidence_links": [
+                "https://x.com/acme/status/2",
+                "https://github.com/acme/agent-runtime/releases/tag/v1.0.0",
+                "https://docs.acme.dev/agent-runtime",
+            ],
+            "stars": 160,
+            "forks": 30,
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.used_evidence_urls
+    assert "x.com" not in record.used_evidence_urls[0]
