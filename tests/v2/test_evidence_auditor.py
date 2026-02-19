@@ -193,6 +193,38 @@ def test_evidence_auditor_allows_high_discussion_hn_with_single_evidence_link() 
     assert all("single_domain_repo_self_evidence" not in reason for reason in list(record.reasons or []))
 
 
+def test_evidence_auditor_rejects_hn_semantic_weak_item_for_agent_topic() -> None:
+    row = _row(
+        "hn_semantic_weak",
+        source="hackernews",
+        body=("foundation model launch notes with generic agent mention and API announcement " * 80).strip(),
+        citations=[
+            Citation(
+                title="blog",
+                url="https://static.stepfun.com/blog/step-3.5-flash",
+                snippet="model launch summary",
+                source="web",
+            ),
+        ],
+        metadata={
+            "body_len": 980,
+            "points": 180,
+            "comment_count": 22,
+            "quality_signals": {"evidence_links_quality": 1, "publish_or_update_time": "2026-02-19T10:00:00Z"},
+            "topic_hard_match_pass": True,
+            "topic_hard_match_terms": ["agent"],
+            "topic_agent_non_generic_hits": [],
+            "topic_agent_high_value_hits": [],
+            "bucket_hits": [],
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == VERDICT_REJECT
+    assert any("agent_semantic_weak" in reason for reason in list(record.reasons or []))
+
+
 def test_evidence_auditor_rejects_zero_body_and_hard_gate_fail() -> None:
     row = _row(
         "bad_core",

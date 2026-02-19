@@ -64,6 +64,10 @@ class SelectionController:
         else:
             self._max_downgrade_count = max(0, int(max_downgrade_count))
 
+    @property
+    def selection_relevance_floor(self) -> float:
+        return float(self._min_top_relevance)
+
     @staticmethod
     def _item_id(row: Any) -> str:
         return str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()

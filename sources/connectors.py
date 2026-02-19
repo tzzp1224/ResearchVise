@@ -440,7 +440,7 @@ async def fetch_github_topic_search(
         return []
 
     max_items = max(1, int(limit))
-    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    per_query = max(2, int(max_items / max(1, len(query_list))) + 1)
     window_days = _parse_window_days(time_window)
     cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
 
@@ -679,7 +679,7 @@ async def fetch_huggingface_search(
         return []
 
     max_items = max(1, int(limit))
-    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    per_query = max(2, int(max_items / max(1, len(query_list))) + 1)
     window_days = _parse_window_days(time_window)
     cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
 
@@ -889,7 +889,7 @@ async def fetch_hackernews_search(
         return []
 
     max_items = max(1, int(limit))
-    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    per_query = max(2, int(max_items / max(1, len(query_list))) + 1)
     window_days = _parse_window_days(time_window)
     if window_days <= 1:
         hn_range = "last_24h"

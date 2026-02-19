@@ -650,7 +650,10 @@ def test_runtime_recall_expansion_selects_window_3d_and_records_diagnosis(tmp_pa
     evidence_audit = json.loads((run_dir / "evidence_audit.json").read_text(encoding="utf-8"))
 
     assert int(ranking.get("requested_top_k", 0)) == 3
-    assert int(ranking.get("top_picks_count", 0)) >= 2
+    assert int(ranking.get("top_picks_count", 0)) >= 1
+    if int(ranking.get("top_picks_count", 0)) < 2:
+        why_not_more = [str(value) for value in list(ranking.get("why_not_more") or [])]
+        assert any("top_picks_lt_3" in reason for reason in why_not_more)
     assert str(ranking.get("selected_recall_phase") or "") in {"window_3d", "window_7d", "query_expanded"}
     assert int(ranking.get("recall_attempt_count", 0)) >= 3
     assert len(list(retrieval.get("expansion_steps") or [])) >= 1
@@ -866,6 +869,38 @@ def test_runtime_prefers_best_attempt_when_late_phase_degrades(tmp_path: Path) -
     assert int(ranking.get("top_picks_count", 0) or 0) >= 1
     assert any("selected_from_best_attempt" in str(reason) for reason in list(ranking.get("quality_trigger_reasons") or []))
     assert int(diagnosis.get("selected_attempt", 0) or 0) < len(list(diagnosis.get("attempts") or []))
+
+
+def test_selection_priority_vector_prefers_quality_complete_attempt() -> None:
+    quality_complete = RunPipelineRuntime._selection_priority_vector(
+        picks=[object(), object(), object()],
+        quality_snapshot={
+            "top_picks_min_relevance": 0.89,
+            "top_picks_min_evidence_quality": 2.0,
+            "top_picks_hard_match_count": 3,
+            "bucket_coverage": 3,
+            "source_coverage": 1,
+        },
+        selected_pass_count=3,
+        selected_downgrade_count=0,
+        pass_ratio=0.35,
+        quality_reasons=[],
+    )
+    quality_deficit = RunPipelineRuntime._selection_priority_vector(
+        picks=[object(), object(), object()],
+        quality_snapshot={
+            "top_picks_min_relevance": 0.79,
+            "top_picks_min_evidence_quality": 1.0,
+            "top_picks_hard_match_count": 3,
+            "bucket_coverage": 3,
+            "source_coverage": 2,
+        },
+        selected_pass_count=3,
+        selected_downgrade_count=0,
+        pass_ratio=0.55,
+        quality_reasons=["top_picks_min_evidence_quality_lt_2.0"],
+    )
+    assert quality_complete > quality_deficit
 
 
 def test_attach_reference_assets_keeps_shot_asset_semantic_alignment() -> None:

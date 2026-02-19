@@ -129,6 +129,12 @@ _AGENT_HIGH_VALUE_TERMS = {
     "agent benchmark",
     "agent runtime",
     "inspect",
+    "computer use",
+    "browser agent",
+    "agent memory",
+    "planning",
+    "plan-and-execute",
+    "task decomposition",
 }
 
 
@@ -234,6 +240,13 @@ def evaluate_relevance(
     agent_high_value_hits: List[str] = []
     agent_score_cap = ""
     if str(profile.key or "").strip().lower() == "ai_agent":
+        metadata = dict(item.metadata or {})
+        bucket_hits = [
+            str(value).strip()
+            for value in list(metadata.get("bucket_hits") or [])
+            if str(value).strip()
+        ]
+        has_bucket_signal = bool(bucket_hits)
         for term in hard_terms:
             lowered = str(term).strip().lower()
             if lowered and lowered not in _AGENT_GENERIC_TERMS and not _contains_negated_term(topic_text, lowered):
@@ -247,9 +260,13 @@ def evaluate_relevance(
             {str(term).strip().lower() for term in agent_high_value_hits if str(term).strip()}
         )
         non_generic_count = len({str(term).strip().lower() for term in agent_non_generic_hits if str(term).strip()})
-        if score >= 0.8 and not (has_high_value or non_generic_count >= 2):
-            score = 0.79
-            agent_score_cap = "cap_lt_0.8_requires_non_generic_or_high_value"
+        has_semantic_depth = bool(has_high_value or non_generic_count >= 1 or has_bucket_signal)
+        if score >= 0.75 and not has_semantic_depth:
+            score = 0.74
+            agent_score_cap = "cap_lt_0.75_requires_semantic_depth"
+        elif score >= 0.85 and not (has_high_value or non_generic_count >= 2):
+            score = 0.84
+            agent_score_cap = "cap_lt_0.85_requires_non_generic_or_high_value"
         elif score >= 0.9 and not (has_high_value and non_generic_count >= 2):
             score = 0.89
             agent_score_cap = "cap_lt_0.9_requires_high_value_and_non_generic_depth"
@@ -464,6 +481,9 @@ def rank_items(
         metadata["topic_hard_match_terms"] = hard_terms
         metadata["topic_soft_boost_terms"] = boost_terms
         metadata["topic_soft_penalty_terms"] = penalty_terms
+        metadata["topic_agent_non_generic_hits"] = list(agent_non_generic_hits)
+        metadata["topic_agent_high_value_hits"] = list(agent_high_value_hits)
+        metadata["topic_agent_score_cap"] = agent_score_cap
         item.metadata = metadata
         gate_on_relevance = bool(topic and float(relevance_threshold) > 0.0)
         relevance_eligible = bool(relevance_score >= float(relevance_threshold)) if gate_on_relevance else True

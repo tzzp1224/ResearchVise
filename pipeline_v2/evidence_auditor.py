@@ -60,7 +60,12 @@ _AGENT_HIGH_VALUE_TOKENS = (
     "crewai",
     "agent eval",
     "benchmark",
+    "computer use",
+    "browser agent",
+    "agent runtime",
+    "agent memory",
 )
+_AGENT_GENERIC_TOKENS = ("agent", "agents", "assistant", "copilot")
 
 
 @dataclass
@@ -545,6 +550,48 @@ class EvidenceAuditor:
             )
 
         text = " ".join([str(item.title or ""), clean_text]).lower()
+        hard_terms = [str(value).strip().lower() for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()]
+        agent_non_generic_hits = [
+            str(value).strip().lower()
+            for value in list(metadata.get("topic_agent_non_generic_hits") or [])
+            if str(value).strip()
+        ]
+        agent_high_value_hits = [
+            str(value).strip().lower()
+            for value in list(metadata.get("topic_agent_high_value_hits") or [])
+            if str(value).strip()
+        ]
+        bucket_hits = [str(value).strip() for value in list(metadata.get("bucket_hits") or []) if str(value).strip()]
+        text_has_high_value = _contains_any(text, _AGENT_HIGH_VALUE_TOKENS)
+        text_has_generic_agent = _contains_any(text, _AGENT_GENERIC_TOKENS)
+        has_agent_semantic_depth = bool(
+            agent_high_value_hits
+            or agent_non_generic_hits
+            or bucket_hits
+            or text_has_high_value
+            or (
+                hard_terms
+                and any(token not in _AGENT_GENERIC_TOKENS for token in hard_terms)
+            )
+        )
+        if (
+            not has_agent_semantic_depth
+            and text_has_generic_agent
+            and (
+                bool(signals.get("has_quickstart"))
+                or bool(signals.get("has_results_or_bench"))
+                or evidence_links_quality >= max(2, effective_min_evidence)
+            )
+        ):
+            has_agent_semantic_depth = True
+        if self._is_agent_topic() and not has_agent_semantic_depth:
+            semantic_target = VERDICT_REJECT if source_key == "hackernews" else VERDICT_DOWNGRADE
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=semantic_target,
+                reason="agent_semantic_weak",
+            )
         has_quickstart = bool(signals.get("has_quickstart"))
         has_results = bool(signals.get("has_results_or_bench"))
         has_multi_domain_evidence = len(domains) >= 2
@@ -699,6 +746,7 @@ class EvidenceAuditor:
                 "body_len_zero",
                 "hf_cv_offtopic_for_agent_topic",
                 "hn_low_engagement",
+                "agent_semantic_weak",
             }
             reason_codes = {_reason_code(reason) for reason in list(reasons or [])}
             if not reason_codes.intersection(hard_reject_reasons) and "evidence_high_trust_missing" not in reason_codes:

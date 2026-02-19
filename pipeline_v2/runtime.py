@@ -207,7 +207,7 @@ class RunPipelineRuntime:
         attempts: List[Dict[str, Any]] = []
         selected: Optional[Dict[str, Any]] = None
         best_selected: Optional[Dict[str, Any]] = None
-        best_priority = float("-inf")
+        best_priority_vector: tuple[float, ...] = tuple()
         quality_triggered_any = False
         recent_topic_entity_counts = self._recent_topic_entity_counts(topic=topic_value, data_mode=data_mode)
 
@@ -249,12 +249,19 @@ class RunPipelineRuntime:
             ranked = list(rank_pack["ranked"] or [])
             relevance_eligible = list(rank_pack["relevance_eligible"] or [])
             audit_records = auditor.audit_rows(ranked_rows=ranked)
+            if str(data_mode or "").strip().lower() == "smoke":
+                selection_relevance_floor = float(rank_pack["relevance_threshold"])
+            else:
+                selection_relevance_floor = max(
+                    float(rank_pack["relevance_threshold"]),
+                    float(controller.selection_relevance_floor),
+                )
 
             pass_first_outcome = controller.evaluate(
                 ranked_rows=relevance_eligible,
                 audit_records=audit_records,
                 allow_downgrade_fill=False,
-                min_relevance_for_selection=float(rank_pack["relevance_threshold"]),
+                min_relevance_for_selection=float(selection_relevance_floor),
             )
             expansion_decision = controller.expansion_decision(outcome=pass_first_outcome)
             quality_reasons = [str(value).strip() for value in list(expansion_decision.reasons or []) if str(value).strip()]
@@ -268,7 +275,7 @@ class RunPipelineRuntime:
                     ranked_rows=relevance_eligible,
                     audit_records=audit_records,
                     allow_downgrade_fill=True,
-                    min_relevance_for_selection=float(rank_pack["relevance_threshold"]),
+                    min_relevance_for_selection=float(selection_relevance_floor),
                 )
 
             picks = list(final_outcome.selected_rows or [])
@@ -324,6 +331,13 @@ class RunPipelineRuntime:
                 "selected_source_coverage": int(quality_snapshot.get("source_coverage", 0) or 0),
                 "selected_all_downgrade": bool(final_outcome.all_selected_downgrade),
                 "quality_trigger_reasons": list(quality_reasons),
+                "quality_deficit_count": int(len(quality_reasons)),
+                "selection_quality_ok": bool(not quality_reasons),
+                "selected_item_ids": [
+                    str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "")
+                    for row in list(picks or [])
+                    if str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+                ],
                 "quality_triggered_expansion": bool(quality_triggered_expansion),
                 "next_phase_reason": list(quality_reasons),
                 "expansion_applied": idx > 1,
@@ -343,19 +357,28 @@ class RunPipelineRuntime:
                 "selection_outcome": final_outcome,
                 "audit_records": audit_records,
                 "selection_priority": float("-inf"),
+                "selection_priority_vector": tuple(),
             }
             if picks:
+                attempt_priority_vector = self._selection_priority_vector(
+                    picks=picks,
+                    quality_snapshot=quality_snapshot,
+                    selected_pass_count=selected_pass_count,
+                    selected_downgrade_count=selected_downgrade_count,
+                    pass_ratio=float(final_outcome.pass_ratio),
+                    quality_reasons=quality_reasons,
+                )
                 attempt_priority = (
                     self._selection_priority(picks=picks, quality_snapshot=quality_snapshot)
                     + float(selected_pass_count) * 200.0
-                    + float(int(quality_snapshot.get("source_coverage", 0) or 0)) * 40.0
                     + float(final_outcome.pass_ratio) * 20.0
                     - float(selected_downgrade_count) * 25.0
                 )
                 attempt_selection_payload["selection_priority"] = float(attempt_priority)
-                if best_selected is None or float(attempt_priority) > float(best_priority):
+                attempt_selection_payload["selection_priority_vector"] = tuple(attempt_priority_vector)
+                if best_selected is None or tuple(attempt_priority_vector) > tuple(best_priority_vector):
                     best_selected = dict(attempt_selection_payload)
-                    best_priority = float(attempt_priority)
+                    best_priority_vector = tuple(attempt_priority_vector)
 
             if quality_triggered_expansion:
                 continue
@@ -376,7 +399,14 @@ class RunPipelineRuntime:
 
         if best_selected is not None:
             selected_priority = float(selected.get("selection_priority", float("-inf")) or float("-inf"))
-            if float(best_priority) > selected_priority + 1e-9:
+            selected_priority_vector = tuple(selected.get("selection_priority_vector") or ())
+            if tuple(best_priority_vector) > tuple(selected_priority_vector):
+                selected = dict(best_selected)
+                reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
+                if "selected_from_best_attempt" not in reasons:
+                    reasons.append("selected_from_best_attempt")
+                selected["quality_reasons"] = reasons
+            elif float(best_selected.get("selection_priority", float("-inf")) or float("-inf")) > selected_priority + 1e-9:
                 selected = dict(best_selected)
                 reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
                 if "selected_from_best_attempt" not in reasons:
@@ -1886,6 +1916,29 @@ class RunPipelineRuntime:
             + float(int(quality_snapshot.get("top_picks_hard_match_count", 0) or 0)) * 50.0
             + float(int(quality_snapshot.get("bucket_coverage", 0) or 0)) * 30.0
             + float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0)
+        )
+
+    @staticmethod
+    def _selection_priority_vector(
+        *,
+        picks: Sequence[Any],
+        quality_snapshot: Mapping[str, Any],
+        selected_pass_count: int,
+        selected_downgrade_count: int,
+        pass_ratio: float,
+        quality_reasons: Sequence[str],
+    ) -> tuple[float, ...]:
+        return (
+            float(1 if not list(quality_reasons or []) else 0),
+            float(max(0, int(selected_pass_count))),
+            float(len(list(picks or []))),
+            float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0),
+            float(quality_snapshot.get("top_picks_min_evidence_quality", 0.0) or 0.0),
+            float(int(quality_snapshot.get("top_picks_hard_match_count", 0) or 0)),
+            float(int(quality_snapshot.get("bucket_coverage", 0) or 0)),
+            float(max(0.0, pass_ratio)),
+            float(-max(0, int(selected_downgrade_count))),
+            float(int(quality_snapshot.get("source_coverage", 0) or 0)),
         )
 
     def _connector_exists(self, name: str) -> bool:

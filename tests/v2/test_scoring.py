@@ -203,6 +203,33 @@ def test_agent_generic_term_alone_cannot_reach_perfect_relevance() -> None:
     assert score <= 0.79
 
 
+def test_agent_generic_term_without_semantic_depth_is_capped_below_selection_floor() -> None:
+    item = _item(
+        "agent_generic_only",
+        tier="A",
+        source="github",
+        title="Agent update digest",
+        metadata={
+            "credibility": "high",
+            "body_len": 900,
+            "citation_count": 2,
+            "bucket_hits": [],
+            "quality_signals": {
+                "content_density": 0.16,
+                "has_quickstart": False,
+                "has_results_or_bench": False,
+                "evidence_links_quality": 1,
+            },
+        },
+    )
+    item.body_md = (
+        "This post summarizes agent updates and generic assistant examples for teams. "
+        "It focuses on general status notes without implementation details or protocol specifics."
+    )
+    score = score_relevance(item, "AI agent")
+    assert score <= 0.74
+
+
 def test_source_query_terms_do_not_bypass_hard_relevance_gate() -> None:
     item = _item(
         "offtopic_source_query",

@@ -1,6 +1,42 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Live Relevance Guardrails (Attempt Priority + Agent Semantic Depth + Selection Floor) (New)
+- 本次目标：
+  - 修复 `AI agent` live 结果里“base 阶段跨源但语义弱内容”覆盖后续高质量阶段的问题，避免 onepager 出现非 agent 核心条目。
+  - 把 `agent` 泛词命中的上限继续收紧，防止 generic 词命中就稳定入选。
+  - 让 auditor 对“agent 语义弱”条目给出硬动作（尤其 HN），不再仅靠热度放行。
+- 关键改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - attempt 选择改为 quality-first 优先级向量（`selection_priority_vector`），质量达标 attempt 优先于仅 source 覆盖高的 attempt。
+    - 每个 attempt 落盘 `quality_deficit_count/selection_quality_ok/selected_item_ids`，便于诊断“为何选这个 phase”。
+    - 最终选取相关性下限改为 `max(relevance_threshold, SelectionController.selection_relevance_floor)`，防止 relaxed recall 低相关条目进入最终 Top picks。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - AI agent 语义深度不足（仅 generic `agent` 且无高价值词/非泛词/bucket）时相关性上限降为 `<0.75`。
+    - 评分元数据新增 `topic_agent_non_generic_hits/topic_agent_high_value_hits/topic_agent_score_cap`，供 auditor 与 diagnosis 复用。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - 新增 `agent_semantic_weak` 规则：AI agent 主题下语义弱候选，HN 默认 reject，GitHub/HF 默认 downgrade。
+    - 语义判定支持 metadata + 文本高价值词双通道，避免仅依赖单一字段。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`
+    - 新增 `selection_relevance_floor` 暴露接口，统一控制层 relevance 选择门槛。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`
+    - 修复 topic search `per_query` 使用 `len(queries)` 的健壮性问题，统一改为 `len(query_list)`。
+- 测试更新：
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_scoring.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_evidence_auditor.py`
+  - 更新 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/tests/v2/test_runtime_integration.py`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+  - 预期：
+    - 不再优先回退到“质量缺口 attempt”（诊断中 `selected_from_best_attempt` 出现频率下降）；
+    - onepager Top picks 中 generic/non-agent-core 条目显著减少；
+    - `TopPicksMinRelevance` 不会再被泛词条目拖到低质量区间。
+- 风险与回滚：
+  - 风险：语义门槛变严后，某些“早期新项目”可能由 pass 变 downgrade/shortage。
+  - 风险：当日信号弱时，结果更可能 `<top_k`，但会通过 `Why not more?` 诚实说明。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Live Quality Stabilization v2 (Source Unlock + Facts Cleanup + Repeat Suppression) (New)
 - 本次目标：
   - 解决 live 下长期“GitHub 单源占满 + 固定项目反复入选 + facts/script 仍有导航碎句”的组合退化。

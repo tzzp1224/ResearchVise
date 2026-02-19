@@ -293,6 +293,10 @@ class TopicProfile:
                     "retrieval": 0.10,
                     "reranker": 0.14,
                     "colbert": 0.18,
+                    "foundation model": 0.08,
+                    "reasoning model": 0.08,
+                    "vision-language model": 0.16,
+                    "vl model": 0.16,
                 },
                 source_filters={
                     "github": {
