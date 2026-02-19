@@ -302,6 +302,9 @@ def generate_onepager(
         ranking_stats.get("top_picks_hard_match_count", retrieval.get("top_picks_hard_match_count", 0)) or 0
     )
     bucket_coverage = int(ranking_stats.get("bucket_coverage", retrieval.get("bucket_coverage", 0)) or 0)
+    selected_source_coverage = int(
+        ranking_stats.get("selected_source_coverage", retrieval.get("source_coverage", 0)) or 0
+    )
     quality_triggered_expansion = bool(
         ranking_stats.get("quality_triggered_expansion", retrieval.get("quality_triggered_expansion", False))
     )
@@ -365,6 +368,7 @@ def generate_onepager(
         f"- SelectedPassCount: `{selected_pass_count}`",
         f"- SelectedDowngradeCount: `{selected_downgrade_count}`",
         f"- BucketCoverage: `{bucket_coverage}`",
+        f"- SelectedSourceCoverage: `{selected_source_coverage}`",
         f"- QualityTriggeredExpansion: `{str(quality_triggered_expansion).lower()}`",
         f"- QualityTriggerReasons: `{','.join(quality_trigger_reasons) if quality_trigger_reasons else 'N/A'}`",
         f"- WhyNotMoreReasons: `{','.join(why_not_more_reasons) if why_not_more_reasons else 'N/A'}`",

@@ -284,9 +284,15 @@ class TopicProfile:
                     "clip": 0.16,
                     "vit": 0.16,
                     "vision transformer": 0.16,
+                    "vision-language": 0.14,
                     "diffusion": 0.12,
                     "image classification": 0.16,
                     "text-to-image": 0.10,
+                    "embedding": 0.10,
+                    "retriever": 0.14,
+                    "retrieval": 0.10,
+                    "reranker": 0.14,
+                    "colbert": 0.18,
                 },
                 source_filters={
                     "github": {
@@ -322,6 +328,12 @@ class TopicProfile:
                             "diffusion",
                             "image classification",
                             "text-to-image",
+                            "vision-language",
+                            "vision model",
+                            "embedding model",
+                            "retriever",
+                            "reranker",
+                            "colbert",
                         ),
                     },
                     "hackernews": {

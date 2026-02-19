@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -285,6 +286,91 @@ def _expansion_connectors() -> dict:
     }
 
 
+def _single_source_only_connectors() -> dict:
+    github_body = (
+        "AI agent orchestration runtime with MCP tool calling. "
+        "Quickstart: pip install acme-agent && acme-agent run. "
+        "Includes deterministic evidence audit and deployment workflow checkpoints. "
+    ) * 20
+
+    async def _github_topic_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        return [
+            RawItem(
+                id="ss_gh_1",
+                source="github",
+                title="acme/agent-runtime",
+                url="https://github.com/acme/agent-runtime",
+                body=github_body,
+                tier="A",
+                metadata={
+                    "stars": 1800,
+                    "forks": 200,
+                    "item_type": "repo",
+                    "updated_at": "2026-02-18T09:00:00Z",
+                    "citations": [
+                        {
+                            "title": "Runtime docs",
+                            "url": "https://docs.acme.dev/agent-runtime",
+                            "snippet": "Docs include runtime topology and MCP tool-routing examples.",
+                            "source": "docs",
+                        },
+                        {
+                            "title": "Benchmark report",
+                            "url": "https://acme.dev/agent-runtime-benchmark",
+                            "snippet": "Benchmark report compares orchestration latency and rollback outcomes.",
+                            "source": "web",
+                        },
+                    ],
+                },
+            ),
+            RawItem(
+                id="ss_gh_2",
+                source="github",
+                title="acme/agent-orchestration-kit",
+                url="https://github.com/acme/agent-orchestration-kit",
+                body=github_body,
+                tier="A",
+                metadata={
+                    "stars": 1200,
+                    "forks": 120,
+                    "item_type": "repo",
+                    "updated_at": "2026-02-17T09:00:00Z",
+                    "citations": [
+                        {
+                            "title": "Ops docs",
+                            "url": "https://docs.acme.dev/agent-ops",
+                            "snippet": "Ops docs show deployment stages and workflow orchestration controls.",
+                            "source": "docs",
+                        },
+                        {
+                            "title": "Postmortem",
+                            "url": "https://acme.dev/agent-runtime-postmortem",
+                            "snippet": "Postmortem summarizes failure handling and tool-calling recovery paths.",
+                            "source": "web",
+                        },
+                    ],
+                },
+            ),
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _github_topic_search,
+        "fetch_huggingface_search": _none,
+        "fetch_hackernews_search": _none,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -498,3 +584,82 @@ def test_runtime_recall_expansion_selects_window_3d_and_records_diagnosis(tmp_pa
     if expanded_queries:
         assert expanded_queries != base_queries
     assert list(evidence_audit.get("records") or [])
+
+
+def test_runtime_returns_shortage_with_reason_when_source_coverage_cannot_reach_two(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_single_source_only_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_single_source",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="today",
+            tz="UTC",
+            budget={"top_k": 3, "include_tier_b": False, "render_enabled": False},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_single_source:ai-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+    diagnosis = json.loads((run_dir / "retrieval_diagnosis.json").read_text(encoding="utf-8"))
+    onepager = (run_dir / "onepager.md").read_text(encoding="utf-8")
+
+    assert int(ranking.get("top_picks_count", 0)) < 3
+    assert int(ranking.get("selected_source_coverage", 0) or 0) < 2
+    assert int(ranking.get("recall_attempt_count", 0) or 0) >= 2
+    reasons = [str(value) for value in list(ranking.get("why_not_more") or [])]
+    assert any("source_diversity_lt_2" in reason for reason in reasons)
+    assert "## Why not more?" in onepager
+    assert len(list(diagnosis.get("attempts") or [])) >= 2
+    assert any("source_coverage_lt_2" in str(reason) for item in list(diagnosis.get("attempts") or []) for reason in list(item.get("quality_trigger_reasons") or []))
+
+
+def test_hf_metadata_only_item_triggers_deep_fetch_and_updates_body(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides={},
+    )
+
+    async def _fake_hf_fetch(_item):
+        return (
+            "## Overview\nAgent runtime supports tool calling and orchestration workflows.\nQuickstart: pip install acme-agent",
+            "hf_raw_readme",
+            "",
+        )
+
+    runtime._fetch_huggingface_deep_body = _fake_hf_fetch  # type: ignore[attr-defined]
+
+    raw = RawItem(
+        id="hf_meta_only",
+        source="huggingface",
+        title="acme/agent-runtime",
+        url="https://huggingface.co/acme/agent-runtime",
+        body="",
+        tier="A",
+        metadata={"repo_id": "acme/agent-runtime", "item_type": "model", "extraction_method": "hf_metadata"},
+    )
+
+    refreshed, applied, deep_count, details = asyncio.run(runtime._apply_deep_extraction([raw], max_items=1))
+    assert applied is True
+    assert deep_count == 1
+    assert len(refreshed) == 1
+    assert len(str(refreshed[0].body or "").strip()) > 0
+    assert bool((refreshed[0].metadata or {}).get("deep_fetch_applied")) is True
+    assert details and bool(details[0].get("accepted")) is True

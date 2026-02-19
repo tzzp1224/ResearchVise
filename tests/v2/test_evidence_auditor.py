@@ -121,3 +121,26 @@ def test_evidence_auditor_rejects_low_engagement_hn_item() -> None:
     record = auditor.audit_row(row, rank=1)
     assert record.verdict == VERDICT_REJECT
     assert any("hn_low_engagement" in reason for reason in list(record.reasons or []))
+
+
+def test_evidence_auditor_rejects_zero_body_and_hard_gate_fail() -> None:
+    row = _row(
+        "bad_core",
+        source="huggingface",
+        body="",
+        citations=[],
+        metadata={
+            "body_len": 0,
+            "topic_hard_match_pass": False,
+            "quality_signals": {"evidence_links_quality": 2, "publish_or_update_time": "2026-02-18T10:00:00Z"},
+        },
+        rank=1,
+    )
+    row.relevance_score = 0.0
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == VERDICT_REJECT
+    reasons = " ".join([str(reason) for reason in list(record.reasons or [])]).lower()
+    assert "topic_relevance_zero" in reasons
+    assert "topic_hard_gate_fail" in reasons
+    assert "body_len_zero" in reasons

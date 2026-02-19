@@ -347,6 +347,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 
     onepager_urls: List[str] = []
     onepager_has_why_not_more = False
+    report["checks"]["candidate_shortage_explained"] = True
     if onepager_path.exists():
         onepager = onepager_path.read_text(encoding="utf-8")
         urls = _extract_urls(onepager)
@@ -363,9 +364,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         block_hits = _contains_blocklist(onepager)
         bad_urls = [url for url in urls if not is_allowed_citation_url(url)]
         report["checks"]["onepager_url_count_ge_3"] = len(urls) >= 3
-        report["checks"]["onepager_top_picks_ge_3"] = (
-            len(top_pick_headings) >= max(1, requested_top_k if data_mode == "live" else 3)
-        )
+        report["checks"]["onepager_top_picks_ge_3"] = len(top_pick_headings) >= (1 if data_mode == "live" else 3)
         report["checks"]["onepager_domain_rows_ge_3"] = len(domain_rows) >= 3 if data_mode != "live" else len(domain_rows) >= 1
         report["checks"]["onepager_top_count_consistent"] = bool(
             header_top_count == len(top_pick_headings) == expected_top_count
@@ -430,9 +429,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["details"]["onepager_evidence_issues"] = evidence_issues
         if evidence_issues:
             report["errors"].append("evidence_dedup:" + ",".join(evidence_issues[:6]))
-        if data_mode == "live" and requested_top_k > 0 and len(top_pick_headings) < requested_top_k:
+        shortage_detected = bool(data_mode == "live" and requested_top_k > 0 and len(top_pick_headings) < requested_top_k)
+        shortage_reasons = list(retrieval_ctx.get("why_not_more") or [])
+        shortage_explained = bool((onepager_has_why_not_more or shortage_reasons) and shortage_detected) or (not shortage_detected)
+        report["checks"]["candidate_shortage_explained"] = shortage_explained
+        report["details"]["candidate_shortage_detected"] = shortage_detected
+        report["details"]["candidate_shortage_reasons"] = shortage_reasons
+        if shortage_detected and not shortage_explained:
             report["errors"].append(
-                f"candidate_shortage:requested_top_k={requested_top_k},actual_top_picks={len(top_pick_headings)}"
+                f"candidate_shortage_without_explanation:requested_top_k={requested_top_k},actual_top_picks={len(top_pick_headings)}"
             )
         if not report["checks"]["onepager_top_count_consistent"]:
             report["errors"].append(
@@ -444,10 +449,16 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             )
 
     diagnosis_payload: Dict = {}
+    diagnosis_candidate_map: Dict[str, Dict] = {}
     if diagnosis_path.exists():
         try:
             diagnosis_payload = _load_json(diagnosis_path)
             attempts = list(diagnosis_payload.get("attempts") or [])
+            diagnosis_candidate_map = {
+                str((row or {}).get("item_id") or "").strip(): dict(row or {})
+                for row in list(diagnosis_payload.get("candidate_rows") or [])
+                if str((row or {}).get("item_id") or "").strip()
+            }
             report["checks"]["retrieval_diagnosis_parse_ok"] = True
             report["checks"]["retrieval_diagnosis_attempts_present"] = len(attempts) >= 1
             required_attempt_fields = {
@@ -469,10 +480,12 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["checks"]["retrieval_attempt_quality_fields_present"] = False
             report["errors"].append(f"retrieval_diagnosis_parse:{exc}")
             diagnosis_payload = {}
+            diagnosis_candidate_map = {}
     else:
         report["checks"]["retrieval_diagnosis_parse_ok"] = False
         report["checks"]["retrieval_diagnosis_attempts_present"] = False
         report["checks"]["retrieval_attempt_quality_fields_present"] = False
+        diagnosis_candidate_map = {}
 
     evidence_audit_payload: Dict = {}
     if evidence_audit_path.exists():
@@ -519,6 +532,40 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
     else:
         report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] = False
         report["checks"]["citations_not_mostly_duplicate"] = False
+        record_map = {}
+
+    top_relevance_scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
+    relevance_by_item_id: Dict[str, float] = {}
+    if top_item_ids and top_relevance_scores and len(top_item_ids) == len(top_relevance_scores):
+        relevance_by_item_id = {item_id: top_relevance_scores[idx] for idx, item_id in enumerate(top_item_ids)}
+
+    invariant_violations: List[str] = []
+    for item_id in top_item_ids:
+        audit_row = dict(record_map.get(item_id) or {})
+        diag_row = dict(diagnosis_candidate_map.get(item_id) or {})
+
+        body_len = int(float(audit_row.get("body_len", 0) or 0))
+        if body_len <= 0:
+            invariant_violations.append(f"{item_id}:body_len_zero")
+
+        relevance_value = diag_row.get("relevance_score")
+        if relevance_value in (None, ""):
+            relevance_value = relevance_by_item_id.get(item_id)
+        try:
+            relevance_float = float(relevance_value)
+        except Exception:
+            relevance_float = -1.0
+        if relevance_float <= 0.0:
+            invariant_violations.append(f"{item_id}:relevance_zero")
+
+        hard_match_pass = diag_row.get("hard_match_pass")
+        if hard_match_pass is False:
+            invariant_violations.append(f"{item_id}:hard_gate_fail")
+
+    report["checks"]["top_picks_hard_relevance_invariants"] = len(invariant_violations) == 0
+    report["details"]["top_pick_invariant_violations"] = invariant_violations
+    if invariant_violations:
+        report["errors"].append("top_picks_hard_invariant_failed:" + ",".join(invariant_violations[:8]))
 
     if facts_path.exists():
         facts_payload = _load_json(facts_path)

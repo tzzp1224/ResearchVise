@@ -177,7 +177,6 @@ def _topic_text(item: NormalizedItem) -> str:
             str(metadata.get("clean_text") or item.body_md or ""),
             " ".join(str(tag) for tag in list(metadata.get("topics") or [])),
             str(metadata.get("item_type") or ""),
-            str(metadata.get("source_query") or ""),
         ]
     ).lower()
 

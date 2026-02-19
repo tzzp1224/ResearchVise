@@ -193,6 +193,17 @@ class RunPipelineRuntime:
         controller = self._build_selection_controller(request, top_count=top_count)
         auditor = self._resolve_evidence_auditor(request, topic_profile=topic_profile)
         recall_profiles = self._recall_profiles(request, data_mode=data_mode, retrieval_plan=retrieval_plan)
+        budget = dict(request.budget or {})
+        max_recall_attempts_raw = budget.get(
+            "max_recall_attempts",
+            os.getenv("ARA_V2_MAX_RECALL_ATTEMPTS", len(recall_profiles)),
+        )
+        try:
+            max_recall_attempts = max(1, int(float(max_recall_attempts_raw)))
+        except Exception:
+            max_recall_attempts = max(1, int(len(recall_profiles)))
+        if len(recall_profiles) > max_recall_attempts:
+            recall_profiles = list(recall_profiles)[:max_recall_attempts]
         attempts: List[Dict[str, Any]] = []
         selected: Optional[Dict[str, Any]] = None
         quality_triggered_any = False
@@ -232,9 +243,10 @@ class RunPipelineRuntime:
             audit_records = auditor.audit_rows(ranked_rows=ranked)
 
             pass_first_outcome = controller.evaluate(
-                ranked_rows=ranked,
+                ranked_rows=relevance_eligible,
                 audit_records=audit_records,
                 allow_downgrade_fill=False,
+                min_relevance_for_selection=float(rank_pack["relevance_threshold"]),
             )
             expansion_decision = controller.expansion_decision(outcome=pass_first_outcome)
             quality_reasons = [str(value).strip() for value in list(expansion_decision.reasons or []) if str(value).strip()]
@@ -245,9 +257,10 @@ class RunPipelineRuntime:
             final_outcome = pass_first_outcome
             if not quality_triggered_expansion and not has_next_attempt:
                 final_outcome = controller.evaluate(
-                    ranked_rows=ranked,
+                    ranked_rows=relevance_eligible,
                     audit_records=audit_records,
                     allow_downgrade_fill=True,
+                    min_relevance_for_selection=float(rank_pack["relevance_threshold"]),
                 )
 
             picks = list(final_outcome.selected_rows or [])
@@ -284,9 +297,11 @@ class RunPipelineRuntime:
                 "must_exclude_terms": list(collect_diag.get("must_exclude_terms") or []),
                 "deep_fetch_applied": bool(collect_diag.get("deep_fetch_applied")),
                 "deep_fetch_count": int(collect_diag.get("deep_fetch_count", 0) or 0),
+                "deep_fetch_details": list(collect_diag.get("deep_fetch_details") or []),
                 "bucket_queries": dict(collect_diag.get("bucket_queries") or {}),
                 "bucket_hits_summary": dict(quality_snapshot.get("bucket_hits_summary") or {}),
                 "bucket_coverage": int(quality_snapshot.get("bucket_coverage", 0) or 0),
+                "source_coverage": int(quality_snapshot.get("source_coverage", 0) or 0),
                 "hard_match_terms_used": list(quality_snapshot.get("hard_match_terms_used") or []),
                 "hard_match_pass_count": int(quality_snapshot.get("hard_match_pass_count", 0) or 0),
                 "top_picks_min_relevance": float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0),
@@ -468,6 +483,8 @@ class RunPipelineRuntime:
             sum(1 for verdict in list(selected_verdicts.values()) if str(verdict).strip().lower() == "downgrade")
         )
         why_not_more: List[str] = []
+        if len(picks) < top_count:
+            why_not_more.append(f"top_picks_lt_{top_count}")
         if selected_pass_count < top_count:
             why_not_more.append(f"pass_count_lt_{top_count}")
         if selected_downgrade_count > 0:
@@ -501,6 +518,7 @@ class RunPipelineRuntime:
             "top_picks_min_relevance": top_picks_min_relevance,
             "top_picks_hard_match_count": top_picks_hard_match_count,
             "bucket_coverage": selected_bucket_coverage,
+            "source_coverage": int(selected_attempt_payload.get("source_coverage", quality_snapshot.get("source_coverage", 0)) or 0),
             "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
             "selected_pass_count": selected_pass_count,
             "selected_downgrade_count": selected_downgrade_count,
@@ -529,6 +547,7 @@ class RunPipelineRuntime:
             "top_picks_min_relevance": top_picks_min_relevance,
             "top_picks_hard_match_count": top_picks_hard_match_count,
             "bucket_coverage": selected_bucket_coverage,
+            "source_coverage": int(selected_attempt_payload.get("source_coverage", quality_snapshot.get("source_coverage", 0)) or 0),
             "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
             "selected_pass_count": selected_pass_count,
             "selected_downgrade_count": selected_downgrade_count,
@@ -546,9 +565,12 @@ class RunPipelineRuntime:
                     "hard_match_pass_count": int(item.get("hard_match_pass_count", 0) or 0),
                     "top_picks_min_relevance": float(item.get("top_picks_min_relevance", 0.0) or 0.0),
                     "top_picks_hard_match_count": int(item.get("top_picks_hard_match_count", 0) or 0),
+                    "source_coverage": int(item.get("source_coverage", 0) or 0),
                     "quality_triggered_expansion": bool(item.get("quality_triggered_expansion")),
                     "quality_trigger_reasons": list(item.get("quality_trigger_reasons") or []),
                     "deep_fetch_applied": bool(item.get("deep_fetch_applied")),
+                    "deep_fetch_count": int(item.get("deep_fetch_count", 0) or 0),
+                    "deep_fetch_details": list(item.get("deep_fetch_details") or []),
                 }
                 for item in attempts
                 if bool(item.get("expansion_applied"))
@@ -616,6 +638,7 @@ class RunPipelineRuntime:
             "selected_downgrade_count": selected_downgrade_count,
             "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
             "bucket_coverage": selected_bucket_coverage,
+            "selected_source_coverage": int(selected_attempt_payload.get("source_coverage", quality_snapshot.get("source_coverage", 0)) or 0),
             "top_bucket_hits": sorted(
                 {
                     str(bucket).strip()
@@ -829,6 +852,50 @@ class RunPipelineRuntime:
         queries_by_source: Dict[str, List[str]] = {}
         include_terms_by_source: Dict[str, List[str]] = {}
         exclude_terms_by_source: Dict[str, List[str]] = {}
+        budget = dict(request.budget or {})
+
+        def _resolve_int_budget(name: str, *, env_name: str, default: int, minimum: int = 1) -> int:
+            raw = budget.get(name, None)
+            if raw in (None, ""):
+                raw = os.getenv(env_name)
+            try:
+                value = int(float(raw))
+            except Exception:
+                value = int(default)
+            return max(minimum, value)
+
+        def _resolve_float_budget(name: str, *, env_name: str, default: float, minimum: float = 1.0) -> float:
+            raw = budget.get(name, None)
+            if raw in (None, ""):
+                raw = os.getenv(env_name)
+            try:
+                value = float(raw)
+            except Exception:
+                value = float(default)
+            return max(float(minimum), float(value))
+
+        base_query_cap = _resolve_int_budget(
+            "query_cap_base",
+            env_name="ARA_V2_QUERY_CAP_BASE",
+            default=8,
+            minimum=1,
+        )
+        expanded_query_cap = _resolve_int_budget(
+            "query_cap_expanded",
+            env_name="ARA_V2_QUERY_CAP_EXPANDED",
+            default=12,
+            minimum=1,
+        )
+        query_cap = expanded_query_cap if bool(phase.expanded_queries) else base_query_cap
+        connector_timeout_sec = _resolve_float_budget(
+            "connector_timeout_sec",
+            env_name="ARA_V2_CONNECTOR_TIMEOUT_SEC",
+            default=20.0,
+            minimum=5.0,
+        )
+
+        def _trim_queries(values: Sequence[str]) -> List[str]:
+            return self._dedupe_tokens(list(values or []))[: max(1, int(query_cap))]
 
         def _source_constraints(source: str) -> tuple[List[str], List[str]]:
             include_terms = list(plan.must_include_terms) if plan else []
@@ -856,7 +923,7 @@ class RunPipelineRuntime:
                 )
                 return []
             try:
-                payload = await self._invoke_connector(name, **kwargs)
+                payload = await asyncio.wait_for(self._invoke_connector(name, **kwargs), timeout=connector_timeout_sec)
                 duration_ms = int((perf_counter() - started) * 1000)
                 connector_calls.append(
                     {
@@ -868,6 +935,19 @@ class RunPipelineRuntime:
                     }
                 )
                 return payload
+            except asyncio.TimeoutError:
+                duration_ms = int((perf_counter() - started) * 1000)
+                connector_calls.append(
+                    {
+                        "name": name,
+                        "count": 0,
+                        "duration_ms": duration_ms,
+                        "status": "timeout",
+                        "error": f"timeout>{connector_timeout_sec:.1f}s",
+                        "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
+                    }
+                )
+                return []
             except Exception as exc:
                 duration_ms = int((perf_counter() - started) * 1000)
                 connector_calls.append(
@@ -883,13 +963,23 @@ class RunPipelineRuntime:
                 return []
 
         if data_mode == "live" and topic:
-            github_queries = plan.queries_for_phase(phase.phase, source="github") if plan else phase_queries
+            github_queries = _trim_queries(plan.queries_for_phase(phase.phase, source="github") if plan else phase_queries)
             github_include_terms, github_exclude_terms = _source_constraints("github")
             queries_by_source["github"] = list(github_queries or [])
             include_terms_by_source["github"] = list(github_include_terms or [])
             exclude_terms_by_source["github"] = list(github_exclude_terms or [])
-            raw_items.extend(
-                await _call(
+            hf_queries = _trim_queries(plan.queries_for_phase(phase.phase, source="huggingface") if plan else phase_queries)
+            hf_include_terms, hf_exclude_terms = _source_constraints("huggingface")
+            queries_by_source["huggingface"] = list(hf_queries or [])
+            include_terms_by_source["huggingface"] = list(hf_include_terms or [])
+            exclude_terms_by_source["huggingface"] = list(hf_exclude_terms or [])
+            hn_queries = _trim_queries(plan.queries_for_phase(phase.phase, source="hackernews") if plan else phase_queries)
+            hn_include_terms, hn_exclude_terms = _source_constraints("hackernews")
+            queries_by_source["hackernews"] = list(hn_queries or [])
+            include_terms_by_source["hackernews"] = list(hn_include_terms or [])
+            exclude_terms_by_source["hackernews"] = list(hn_exclude_terms or [])
+            topic_tasks: List[Awaitable[List[RawItem]]] = [
+                _call(
                     "fetch_github_topic_search",
                     topic=topic,
                     time_window=phase_window,
@@ -902,15 +992,8 @@ class RunPipelineRuntime:
                     queries=github_queries,
                     must_include_terms=github_include_terms,
                     must_exclude_terms=github_exclude_terms,
-                )
-            )
-            hf_queries = plan.queries_for_phase(phase.phase, source="huggingface") if plan else phase_queries
-            hf_include_terms, hf_exclude_terms = _source_constraints("huggingface")
-            queries_by_source["huggingface"] = list(hf_queries or [])
-            include_terms_by_source["huggingface"] = list(hf_include_terms or [])
-            exclude_terms_by_source["huggingface"] = list(hf_exclude_terms or [])
-            raw_items.extend(
-                await _call(
+                ),
+                _call(
                     "fetch_huggingface_search",
                     topic=topic,
                     time_window=phase_window,
@@ -923,15 +1006,8 @@ class RunPipelineRuntime:
                     queries=hf_queries,
                     must_include_terms=hf_include_terms,
                     must_exclude_terms=hf_exclude_terms,
-                )
-            )
-            hn_queries = plan.queries_for_phase(phase.phase, source="hackernews") if plan else phase_queries
-            hn_include_terms, hn_exclude_terms = _source_constraints("hackernews")
-            queries_by_source["hackernews"] = list(hn_queries or [])
-            include_terms_by_source["hackernews"] = list(hn_include_terms or [])
-            exclude_terms_by_source["hackernews"] = list(hn_exclude_terms or [])
-            raw_items.extend(
-                await _call(
+                ),
+                _call(
                     "fetch_hackernews_search",
                     topic=topic,
                     time_window=phase_window,
@@ -944,8 +1020,13 @@ class RunPipelineRuntime:
                     queries=hn_queries,
                     must_include_terms=hn_include_terms,
                     must_exclude_terms=hn_exclude_terms,
-                )
-            )
+                ),
+            ]
+            topic_results = await asyncio.gather(*topic_tasks, return_exceptions=True)
+            for result in topic_results:
+                if isinstance(result, Exception):
+                    continue
+                raw_items.extend(list(result or []))
 
         tasks: List[Awaitable[List[RawItem]]] = [
             _call("fetch_github_trending", max_results=base_limit),
@@ -984,8 +1065,9 @@ class RunPipelineRuntime:
 
         deep_fetch_applied = False
         deep_fetch_count = 0
+        deep_fetch_details: List[Dict[str, Any]] = []
         if data_mode == "live" and raw_items:
-            raw_items, deep_fetch_applied, deep_fetch_count = await self._apply_deep_extraction(
+            raw_items, deep_fetch_applied, deep_fetch_count, deep_fetch_details = await self._apply_deep_extraction(
                 raw_items,
                 max_items=2,
             )
@@ -1003,6 +1085,8 @@ class RunPipelineRuntime:
                 "expanded_queries": bool(phase.expanded_queries),
             }
             diagnostics["queries"] = phase_queries
+            diagnostics["query_cap"] = int(query_cap)
+            diagnostics["connector_timeout_sec"] = float(connector_timeout_sec)
             diagnostics["queries_by_source"] = queries_by_source
             diagnostics["bucket_queries"] = bucket_queries
             diagnostics["must_include_terms"] = self._dedupe_tokens(
@@ -1015,6 +1099,7 @@ class RunPipelineRuntime:
             diagnostics["must_exclude_terms_by_source"] = exclude_terms_by_source
             diagnostics["deep_fetch_applied"] = deep_fetch_applied
             diagnostics["deep_fetch_count"] = deep_fetch_count
+            diagnostics["deep_fetch_details"] = deep_fetch_details
             diagnostics["connector_calls"] = connector_calls
 
         if not raw_items and data_mode == "live":
@@ -1029,54 +1114,158 @@ class RunPipelineRuntime:
         raw_items: Sequence[RawItem],
         *,
         max_items: int = 2,
-    ) -> tuple[List[RawItem], bool, int]:
+    ) -> tuple[List[RawItem], bool, int, List[Dict[str, Any]]]:
         refreshed: List[RawItem] = [item if isinstance(item, RawItem) else RawItem(**item) for item in list(raw_items or [])]
-        candidates: List[int] = []
+        candidates: List[tuple[int, str]] = []
 
         for idx, item in enumerate(refreshed):
             source = str(item.source or "").strip().lower()
-            if source not in {"hackernews", "web_article"}:
-                continue
             body_len = len(re.sub(r"\s+", " ", str(item.body or "").strip()))
-            if body_len >= 600:
+            if source == "huggingface":
+                metadata = dict(item.metadata or {})
+                extraction_method = str(metadata.get("extraction_method") or "").strip().lower()
+                metadata_only = "metadata" in extraction_method
+                if body_len <= 0 or (metadata_only and body_len < 180):
+                    candidates.append((idx, "hf_raw_card"))
+            elif source in {"hackernews", "web_article"}:
+                if body_len >= 600:
+                    continue
+                url = str(item.url or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                host = str(urlparse(url).netloc or "").strip().lower()
+                if host in {"news.ycombinator.com", "github.com", "huggingface.co"}:
+                    continue
+                candidates.append((idx, "web_article"))
+            else:
                 continue
-            url = str(item.url or "").strip()
-            if not url.startswith(("http://", "https://")):
-                continue
-            host = str(urlparse(url).netloc or "").strip().lower()
-            if host in {"news.ycombinator.com", "github.com", "huggingface.co"}:
-                continue
-            candidates.append(idx)
             if len(candidates) >= max(1, int(max_items)):
                 break
 
         applied = False
         deep_fetch_count = 0
-        for idx in candidates:
+        details: List[Dict[str, Any]] = []
+        for idx, mode in candidates:
             item = refreshed[idx]
-            try:
-                payload = await self._invoke_connector("fetch_web_article", url=str(item.url))
-            except Exception:
-                continue
-            if not payload:
-                continue
-            deep_item = payload[0]
-            old_len = len(str(item.body or ""))
-            new_len = len(str(deep_item.body or ""))
-            if new_len <= old_len + 80:
-                continue
-            metadata = dict(item.metadata or {})
-            deep_meta = dict(deep_item.metadata or {})
-            metadata["deep_fetch_applied"] = True
-            metadata["deep_fetch_method"] = deep_meta.get("extraction_method")
-            metadata["deep_fetch_error"] = deep_meta.get("extraction_error")
-            item.body = str(deep_item.body or item.body)
-            item.metadata = metadata
-            refreshed[idx] = item
-            applied = True
-            deep_fetch_count += 1
+            old_len = len(re.sub(r"\s+", " ", str(item.body or "").strip()))
+            deep_body = ""
+            deep_method = ""
+            deep_error = ""
 
-        return refreshed, applied, deep_fetch_count
+            if mode == "hf_raw_card":
+                deep_body, deep_method, deep_error = await self._fetch_huggingface_deep_body(item)
+            elif mode == "web_article":
+                try:
+                    payload = await self._invoke_connector("fetch_web_article", url=str(item.url))
+                except Exception as exc:
+                    payload = []
+                    deep_error = str(exc)
+                if payload:
+                    deep_item = payload[0]
+                    deep_body = str(deep_item.body or "")
+                    deep_meta = dict(deep_item.metadata or {})
+                    deep_method = str(deep_meta.get("extraction_method") or "web_article")
+                    if not deep_error:
+                        deep_error = str(deep_meta.get("extraction_error") or "")
+
+            new_len = len(re.sub(r"\s+", " ", str(deep_body or "").strip()))
+            accepted = False
+            if new_len > 0 and (
+                old_len <= 0
+                or new_len >= old_len + 80
+                or (mode == "hf_raw_card" and old_len < 200 and new_len >= 160)
+            ):
+                accepted = True
+            if accepted:
+                merged_body = str(deep_body or "").strip()
+                if len(merged_body) > 9000:
+                    merged_body = merged_body[:8997].rstrip() + "..."
+
+                metadata = dict(item.metadata or {})
+                metadata["deep_fetch_applied"] = True
+                metadata["deep_fetch_method"] = deep_method or mode
+                metadata["deep_fetch_error"] = deep_error or ""
+                metadata["deep_fetch_before_body_len"] = int(old_len)
+                metadata["deep_fetch_after_body_len"] = int(new_len)
+                item.body = merged_body
+                item.metadata = metadata
+                refreshed[idx] = item
+                applied = True
+                deep_fetch_count += 1
+
+            details.append(
+                {
+                    "item_id": str(item.id or ""),
+                    "source": str(item.source or ""),
+                    "url": str(item.url or ""),
+                    "mode": mode,
+                    "method": deep_method or mode,
+                    "before_body_len": int(old_len),
+                    "after_body_len": int(new_len),
+                    "accepted": bool(accepted),
+                    "error": deep_error or "",
+                }
+            )
+
+        return refreshed, applied, deep_fetch_count, details
+
+    async def _fetch_huggingface_deep_body(self, item: RawItem) -> tuple[str, str, str]:
+        metadata = dict(item.metadata or {})
+        item_url = str(item.url or "").strip()
+        repo_id = str(metadata.get("repo_id") or "").strip()
+        repo_type = str(metadata.get("item_type") or "").strip().lower()
+
+        if not repo_id and item_url:
+            parsed = urlparse(item_url)
+            path_parts = [part for part in str(parsed.path or "").split("/") if part]
+            if path_parts:
+                if path_parts[0] == "datasets" and len(path_parts) >= 3:
+                    repo_type = "dataset"
+                    repo_id = "/".join(path_parts[1:3])
+                elif len(path_parts) >= 2:
+                    repo_id = "/".join(path_parts[:2])
+
+        if not repo_id:
+            return "", "hf_raw_card", "repo_id_missing"
+
+        prefix = "datasets/" if repo_type == "dataset" else ""
+        raw_urls = [
+            f"https://huggingface.co/{prefix}{repo_id}/raw/main/README.md",
+            f"https://huggingface.co/{prefix}{repo_id}/resolve/main/README.md?download=true",
+            f"https://huggingface.co/{prefix}{repo_id}/raw/main/README.md?download=true",
+        ]
+
+        headers = {
+            "User-Agent": "AcademicResearchAgent/2.0",
+            "Accept": "text/plain, text/markdown, */*",
+        }
+        timeout = httpx.Timeout(10.0)
+        errors: List[str] = []
+        for raw_url in raw_urls:
+            try:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                    response = await client.get(raw_url, headers=headers)
+                    response.raise_for_status()
+                    text = str(response.text or "").strip()
+                if len(re.sub(r"\s+", " ", text)) >= 120:
+                    return text, "hf_raw_readme", ""
+            except Exception as exc:
+                errors.append(str(exc))
+
+        # Fallback: try extracting the model card page as generic web article.
+        if item_url.startswith(("http://", "https://")):
+            try:
+                payload = await self._invoke_connector("fetch_web_article", url=item_url)
+                if payload:
+                    deep_item = payload[0]
+                    deep_text = str(deep_item.body or "").strip()
+                    if len(re.sub(r"\s+", " ", deep_text)) >= 120:
+                        deep_meta = dict(deep_item.metadata or {})
+                        return deep_text, str(deep_meta.get("extraction_method") or "hf_web_article"), ""
+            except Exception as exc:
+                errors.append(str(exc))
+
+        return "", "hf_raw_card", " | ".join([token for token in errors if token][:3])
 
     @staticmethod
     def _dedupe_tokens(values: Sequence[str]) -> List[str]:
@@ -1189,7 +1378,6 @@ class RunPipelineRuntime:
                     [
                         str(item.title or ""),
                         str(item.body or ""),
-                        str(metadata.get("source_query") or ""),
                     ]
                 )
                 bucket_hits.update(topic_profile.bucket_hits(topic_text))

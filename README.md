@@ -1,6 +1,54 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Hard Invariants + Source-Coverage Shortage Policy (New)
+- 本次目标：
+  - 修复 `topic="AI agent"` 下扩检后仍混入非 agent 条目（如 Qwen-VL/ColBERT）的问题。
+  - 把“不相关/空正文候选”从 `ranking/audit` 层上升为 `SelectionController` 的硬不变量，任何阶段不可绕过。
+  - 在 source coverage 无法达标时，执行“宁缺毋滥”策略：允许 `<top_k` 并强制解释 `Why not more?`。
+- 根因回顾（本次落地修复）：
+  - relevance 语义污染：`source_query` 曾参与 topic 语义匹配，导致检索词命中可“借道”通过 hard gate。
+  - 选择层兜底过宽：最后阶段 downgrade fallback 未统一执行 hard relevance/body gate，出现 `relevance=0/body_len=0` 入选。
+  - HF metadata-only 场景：正文为空时未强制补抓 model card，导致弱证据候选被 downgrade 填充。
+- 关键策略改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`
+    - relevance/hard gate 文本不再包含 `source_query`，避免“查询词借道命中”。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`
+    - 新增 controller 统一硬过滤：`relevance<=0` / `topic_hard_match_pass=false` / `body_len<=0` 一律不可入选。
+    - downgrade fallback 仅在满足 `min_relevance_for_selection` 且硬过滤通过的候选上执行。
+    - source diversity 成为硬约束：当 `source_coverage < min_source_coverage` 时不再盲目补满 top_k，返回 shortage。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`
+    - 新增硬拒绝：`topic_relevance_zero`、`topic_hard_gate_fail`、`body_len_zero`。
+    - 保持 machine_action（`action/reason_code/human_reason`）供 controller/diagnosis 追踪。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`
+    - controller 评估改为使用 `relevance_eligible`，并传入当次 `relevance_threshold`。
+    - quality trigger 新增 `source_coverage_lt_2` 可观测触发原因。
+    - HF deep fetch 增强：metadata-only/短正文候选优先抓 `raw/README.md`，回填后重走 normalize/scoring/audit。
+    - diagnosis attempt 新增 `source_coverage`、`deep_fetch_details`（method/before/after/accepted/error）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/topic_profile.py`
+    - AI agent 话题增强 HF 排除词：`vision-language/embedding/retriever/reranker/colbert` 等。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`
+    - onepager header 新增 `SelectedSourceCoverage`，配合 `Why not more?` 解释不足而非凑数。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`
+    - 新增 `top_picks_hard_relevance_invariants` 门禁（Top picks 禁止 `relevance<=0/hard_gate_fail/body_len<=0`）。
+    - 候选不足策略升级：`candidate_shortage_explained`，live 下允许 `<top_k` 但必须有 `Why not more?` 解释。
+- 测试更新：
+  - `tests/v2/test_scoring.py`：新增“source_query 不能绕过 hard gate”回归。
+  - `tests/v2/test_quality_trigger_expansion.py`：新增“controller 永不选入 relevance=0/body_len=0/hard_gate_fail”回归。
+  - `tests/v2/test_runtime_integration.py`：
+    - 新增“单源不可扩展时返回 shortage + Why not more”回归。
+    - 新增“HuggingFace metadata-only 触发 deep fetch 并补正文”回归。
+  - `tests/v2/test_evidence_auditor.py`：新增硬拒绝规则回归。
+  - `tests/v2/test_validate_artifacts_v2.py`：新增 shortage 解释门禁回归。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知限制与未来扩展：
+  - 当数据窗口天然稀疏且可用源单一时，Top picks 可能小于 `requested_top_k`（这是设计上的“诚实输出”）。
+  - LLM Planner/Auditor 仍可通过 `budget.use_llm_planner` / `budget.use_llm_auditor` 挂载，默认 deterministic。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Close-the-loop Selection + Audit-driven Expansion (New)
 - 本次目标：
   - 把 `planner + auditor` 从“仅产出报告”改为“闭环控制器”，保证 Top picks 优先由 `PASS` 候选构成，质量不足时自动扩检。

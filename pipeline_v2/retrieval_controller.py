@@ -61,6 +61,47 @@ class SelectionController:
         metadata = dict((getattr(item, "metadata", None) or {}) if item else {})
         return [str(value).strip() for value in list(metadata.get("bucket_hits") or []) if str(value).strip()]
 
+    @staticmethod
+    def _item_metadata(row: Any) -> Mapping[str, Any]:
+        item = getattr(row, "item", None)
+        return dict((getattr(item, "metadata", None) or {}) if item else {})
+
+    @staticmethod
+    def _relevance(row: Any) -> float:
+        try:
+            return float(getattr(row, "relevance_score", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _body_len(row: Any) -> int:
+        metadata = SelectionController._item_metadata(row)
+        raw = metadata.get("body_len")
+        if raw not in (None, ""):
+            try:
+                return max(0, int(float(raw)))
+            except Exception:
+                pass
+        item = getattr(row, "item", None)
+        body = str((getattr(item, "body_md", None) if item else "") or "")
+        return max(0, len(body.strip()))
+
+    @staticmethod
+    def _hard_match_pass(row: Any) -> bool:
+        metadata = SelectionController._item_metadata(row)
+        return bool(metadata.get("topic_hard_match_pass", True))
+
+    def _is_selection_eligible(self, row: Any, *, min_relevance: float) -> bool:
+        if self._relevance(row) <= 0.0:
+            return False
+        if self._relevance(row) + 1e-9 < float(max(0.0, min_relevance)):
+            return False
+        if not self._hard_match_pass(row):
+            return False
+        if self._body_len(row) <= 0:
+            return False
+        return True
+
     def _select_diverse(
         self,
         rows: Sequence[Any],
@@ -111,6 +152,9 @@ class SelectionController:
                 continue
             _add(row)
 
+        if len([token for token in used_sources if token]) < int(self._min_source_coverage):
+            return selected[:target_count]
+
         for row in list(rows or []):
             if len(selected) >= target_count:
                 break
@@ -121,12 +165,67 @@ class SelectionController:
 
         return selected[:target_count]
 
+    def _fill_with_downgrade(
+        self,
+        *,
+        selected: Sequence[Any],
+        downgrade_rows: Sequence[Any],
+        target_count: int,
+    ) -> List[Any]:
+        picks: List[Any] = list(selected or [])
+        selected_ids = {self._item_id(row) for row in picks if self._item_id(row)}
+        used_sources = {self._item_source(row) for row in picks if self._item_source(row)}
+        used_buckets = {bucket for row in picks for bucket in self._item_buckets(row)}
+
+        def _add(row: Any) -> None:
+            item_id = self._item_id(row)
+            if not item_id or item_id in selected_ids:
+                return
+            picks.append(row)
+            selected_ids.add(item_id)
+            source = self._item_source(row)
+            if source:
+                used_sources.add(source)
+            used_buckets.update(self._item_buckets(row))
+
+        # Stage 1: prefer rows that increase source diversity.
+        for row in list(downgrade_rows or []):
+            if len(picks) >= target_count:
+                break
+            item_id = self._item_id(row)
+            if not item_id or item_id in selected_ids:
+                continue
+            source = self._item_source(row)
+            if source and source not in used_sources:
+                _add(row)
+                if len([token for token in used_sources if token]) >= int(self._min_source_coverage):
+                    break
+
+        # If we still do not satisfy source coverage, stop and return shortage.
+        if len([token for token in used_sources if token]) < int(self._min_source_coverage):
+            if not picks:
+                for row in list(downgrade_rows or []):
+                    item_id = self._item_id(row)
+                    if item_id and item_id not in selected_ids:
+                        _add(row)
+                        break
+            return picks[:target_count]
+
+        # Stage 2: with source coverage satisfied, continue normal diverse fill.
+        remaining = [row for row in list(downgrade_rows or []) if self._item_id(row) not in selected_ids]
+        return self._select_diverse(
+            remaining,
+            target_count=target_count,
+            preselected=picks,
+        )
+
     def evaluate(
         self,
         *,
         ranked_rows: Sequence[Any],
         audit_records: Sequence[Any],
         allow_downgrade_fill: bool,
+        min_relevance_for_selection: float = 0.0,
     ) -> AttemptOutcome:
         records_by_id = {
             str(getattr(record, "item_id", "") or "").strip(): record
@@ -135,19 +234,26 @@ class SelectionController:
         }
 
         ranked_list = [row for row in list(ranked_rows or []) if self._item_id(row)]
-        pass_rows = [row for row in ranked_list if str(getattr(records_by_id.get(self._item_id(row)), "verdict", "")).lower() == "pass"]
+        eligible_rows = [
+            row
+            for row in ranked_list
+            if self._is_selection_eligible(row, min_relevance=float(min_relevance_for_selection))
+        ]
+        pass_rows = [
+            row for row in eligible_rows if str(getattr(records_by_id.get(self._item_id(row)), "verdict", "")).lower() == "pass"
+        ]
         downgrade_rows = [
-            row for row in ranked_list if str(getattr(records_by_id.get(self._item_id(row)), "verdict", "")).lower() == "downgrade"
+            row for row in eligible_rows if str(getattr(records_by_id.get(self._item_id(row)), "verdict", "")).lower() == "downgrade"
         ]
 
         selected = self._select_diverse(pass_rows, target_count=self._requested_top_k)
         used_downgrade = False
         if allow_downgrade_fill and len(selected) < self._requested_top_k:
             used_downgrade = True
-            selected = self._select_diverse(
-                downgrade_rows,
+            selected = self._fill_with_downgrade(
+                selected=selected,
+                downgrade_rows=downgrade_rows,
                 target_count=self._requested_top_k,
-                preselected=selected,
             )
 
         selected_verdicts: Dict[str, str] = {}
@@ -174,7 +280,11 @@ class SelectionController:
         pass_count = 0
         downgrade_count = 0
         reject_count = 0
+        eligible_ids = {self._item_id(row) for row in list(eligible_rows or []) if self._item_id(row)}
         for record in list(audit_records or []):
+            item_id = str(getattr(record, "item_id", "") or "").strip()
+            if not item_id or item_id not in eligible_ids:
+                continue
             verdict = str(getattr(record, "verdict", "") or "").strip().lower()
             if verdict == "pass":
                 pass_count += 1
@@ -183,7 +293,7 @@ class SelectionController:
             else:
                 reject_count += 1
 
-        candidate_count = len(ranked_list)
+        candidate_count = len(eligible_rows)
         pass_ratio = float(pass_count) / float(max(1, candidate_count))
         min_evidence_quality = min(evidence_qualities) if evidence_qualities else 0.0
 
@@ -214,10 +324,8 @@ class SelectionController:
             reasons.append(f"top_picks_min_evidence_quality_lt_{self._min_evidence_quality:.1f}")
         if int(outcome.bucket_coverage) < int(self._min_bucket_coverage):
             reasons.append(f"bucket_coverage_lt_{self._min_bucket_coverage}")
-
-        # Force diversity: must cover >=2 sources OR >=2 buckets.
-        if max(int(outcome.source_coverage), int(outcome.bucket_coverage)) < max(self._min_source_coverage, self._min_bucket_coverage):
-            reasons.append("diversity_lt_2_sources_or_buckets")
+        if int(outcome.source_coverage) < int(self._min_source_coverage):
+            reasons.append(f"source_coverage_lt_{self._min_source_coverage}")
 
         return ExpansionDecision(
             should_expand=bool(reasons),

@@ -233,3 +233,108 @@ def test_controller_triggers_expansion_when_all_candidates_downgraded() -> None:
     decision = controller.expansion_decision(outcome=outcome)
     assert decision.should_expand is True
     assert any("pass_count_lt_2" in reason for reason in list(decision.reasons or []))
+
+
+def test_controller_never_selects_zero_relevance_or_zero_body_even_with_downgrade_fill() -> None:
+    from types import SimpleNamespace
+
+    def _row(
+        item_id: str,
+        *,
+        source: str,
+        relevance: float,
+        body_len: int,
+        hard_pass: bool,
+    ):
+        item = SimpleNamespace(
+            id=item_id,
+            source=source,
+            metadata={"bucket_hits": ["Frameworks"], "body_len": body_len, "topic_hard_match_pass": hard_pass},
+            body_md="x" * max(0, body_len),
+        )
+        return SimpleNamespace(item=item, relevance_score=relevance)
+
+    rows = [
+        _row("bad_rel", source="github", relevance=0.0, body_len=900, hard_pass=True),
+        _row("bad_body", source="huggingface", relevance=0.86, body_len=0, hard_pass=True),
+        _row("bad_hard", source="hackernews", relevance=0.88, body_len=900, hard_pass=False),
+        _row("good_dg", source="github", relevance=0.81, body_len=900, hard_pass=True),
+    ]
+    records = [
+        AuditRecord(
+            item_id="bad_rel",
+            title="bad_rel",
+            source="github",
+            rank=1,
+            verdict="downgrade",
+            reasons=["topic_relevance_zero"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=2,
+            body_len=900,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "reject", "reason_code": "topic_relevance_zero", "human_reason": "bad"},
+        ),
+        AuditRecord(
+            item_id="bad_body",
+            title="bad_body",
+            source="huggingface",
+            rank=2,
+            verdict="downgrade",
+            reasons=["body_len_zero"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=2,
+            body_len=0,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "reject", "reason_code": "body_len_zero", "human_reason": "bad"},
+        ),
+        AuditRecord(
+            item_id="bad_hard",
+            title="bad_hard",
+            source="hackernews",
+            rank=3,
+            verdict="downgrade",
+            reasons=["topic_hard_gate_fail"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=2,
+            body_len=900,
+            min_body_len=600,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "reject", "reason_code": "topic_hard_gate_fail", "human_reason": "bad"},
+        ),
+        AuditRecord(
+            item_id="good_dg",
+            title="good_dg",
+            source="github",
+            rank=4,
+            verdict="downgrade",
+            reasons=["weak_evidence"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=2,
+            body_len=900,
+            min_body_len=400,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "downgrade", "reason_code": "weak_evidence", "human_reason": "weak"},
+        ),
+    ]
+    controller = SelectionController(requested_top_k=3)
+    outcome = controller.evaluate(
+        ranked_rows=rows,
+        audit_records=records,
+        allow_downgrade_fill=True,
+        min_relevance_for_selection=0.55,
+    )
+    selected_ids = [str(getattr(row.item, "id", "") or "") for row in list(outcome.selected_rows or [])]
+    assert "good_dg" in selected_ids
+    assert "bad_rel" not in selected_ids
+    assert "bad_body" not in selected_ids
+    assert "bad_hard" not in selected_ids

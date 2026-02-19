@@ -40,9 +40,14 @@ _CV_OFFTOPIC_TOKENS = (
     "clip",
     "vit",
     "vision transformer",
+    "vision-language",
     "diffusion",
     "image classification",
     "text-to-image",
+    "embedding",
+    "retriever",
+    "reranker",
+    "colbert",
 )
 _AGENT_HIGH_VALUE_TOKENS = (
     "mcp",
@@ -276,6 +281,8 @@ class EvidenceAuditor:
         metadata = dict(item.metadata or {})
         signals = dict(metadata.get("quality_signals") or {})
         body_len = int(float(metadata.get("body_len", len(str(item.body_md or ""))) or 0))
+        relevance_score = float(getattr(row, "relevance_score", 0.0) or 0.0)
+        hard_gate_fail = not bool(metadata.get("topic_hard_match_pass", True))
         min_body_len = _source_min_body_len(item.source)
         evidence_links_quality = int(float(signals.get("evidence_links_quality", 0) or 0))
         publish_or_update_time = str(signals.get("publish_or_update_time") or metadata.get("publish_or_update_time") or "").strip()
@@ -285,6 +292,30 @@ class EvidenceAuditor:
 
         verdict = VERDICT_PASS
         reasons: List[str] = []
+
+        if relevance_score <= 0.0:
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_REJECT,
+                reason="topic_relevance_zero",
+            )
+
+        if hard_gate_fail:
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_REJECT,
+                reason="topic_hard_gate_fail",
+            )
+
+        if body_len <= 0:
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_REJECT,
+                reason="body_len_zero",
+            )
 
         if body_len < min_body_len:
             verdict = self._apply_rule(

@@ -201,3 +201,20 @@ def test_agent_generic_term_alone_cannot_reach_perfect_relevance() -> None:
     )
     score = score_relevance(item, "AI agent")
     assert score < 1.0
+
+
+def test_source_query_terms_do_not_bypass_hard_relevance_gate() -> None:
+    item = _item(
+        "offtopic_source_query",
+        tier="A",
+        source="huggingface",
+        title="Qwen2.5-VL-3B-Instruct model card",
+        metadata={
+            "credibility": "high",
+            "citation_count": 2,
+            "source_query": "agent orchestration tool calling mcp",
+        },
+    )
+    item.body_md = "Vision-language model card with OCR, image understanding, and video reasoning examples."
+    score = score_relevance(item, "AI agent")
+    assert score == 0.0

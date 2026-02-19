@@ -57,6 +57,7 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["top_picks_not_all_downgrade"] is True
     assert report["checks"]["retrieval_quality_triggered_expansion_recorded"] is True
     assert report["checks"]["facts_no_truncated_words"] is True
+    assert report["checks"]["top_picks_hard_relevance_invariants"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:
@@ -109,7 +110,11 @@ def test_validate_artifacts_v2_fails_when_live_top_picks_below_requested(tmp_pat
     ranking = dict(run_context.get("ranking_stats") or {})
     ranking["requested_top_k"] = 5
     ranking["top_picks_count"] = 2
+    ranking["why_not_more"] = []
     run_context["ranking_stats"] = ranking
+    retrieval = dict(run_context.get("retrieval") or {})
+    retrieval["why_not_more"] = []
+    run_context["retrieval"] = retrieval
     run_context_path.write_text(json.dumps(run_context, ensure_ascii=False, indent=2), encoding="utf-8")
 
     onepager_path = run_dir / "onepager.md"
@@ -117,6 +122,7 @@ def test_validate_artifacts_v2_fails_when_live_top_picks_below_requested(tmp_pat
     text = text.replace("DataMode: `smoke`", "DataMode: `live`")
     text = re.sub(r"^- RequestedTopK:\s*`?\d+`?\s*$", "- RequestedTopK: `5`", text, flags=re.MULTILINE)
     text = re.sub(r"^- TopPicksCount:\s*`?\d+`?\s*$", "- TopPicksCount: `2`", text, flags=re.MULTILINE)
+    text = re.sub(r"\n## Why not more\?\s*[\s\S]*?(?=\n## |\Z)", "\n", text, flags=re.MULTILINE)
     onepager_path.write_text(text, encoding="utf-8")
 
     validated = subprocess.run(
@@ -135,4 +141,61 @@ def test_validate_artifacts_v2_fails_when_live_top_picks_below_requested(tmp_pat
     assert validated.returncode == 1
     report = json.loads(validated.stdout)
     assert report["ok"] is False
-    assert any(str(err).startswith("candidate_shortage:") for err in report["errors"])
+    assert any(str(err).startswith("candidate_shortage_without_explanation:") for err in report["errors"])
+
+
+def test_validate_artifacts_v2_allows_live_shortage_when_why_not_more_present(tmp_path: Path) -> None:
+    smoke_dir = tmp_path / "smoke_shortage_allowed"
+    payload = json.loads(
+        subprocess.run([sys.executable, "scripts/e2e_smoke_v2.py", "--out-dir", str(smoke_dir)], check=True, capture_output=True, text=True).stdout
+    )
+    run_id = str(payload["run_id"])
+    render_job_id = str(payload["render_job_id"])
+    run_dir = smoke_dir / "runs" / run_id
+    render_dir = smoke_dir / "render_jobs" / render_job_id
+
+    run_context_path = run_dir / "run_context.json"
+    run_context = json.loads(run_context_path.read_text(encoding="utf-8"))
+    run_context["data_mode"] = "live"
+    ranking = dict(run_context.get("ranking_stats") or {})
+    ranking["requested_top_k"] = 5
+    ranking["top_picks_count"] = 2
+    ranking["why_not_more"] = ["top_picks_lt_5", "source_diversity_lt_2"]
+    run_context["ranking_stats"] = ranking
+    retrieval = dict(run_context.get("retrieval") or {})
+    retrieval["why_not_more"] = ["top_picks_lt_5", "source_diversity_lt_2"]
+    run_context["retrieval"] = retrieval
+    run_context_path.write_text(json.dumps(run_context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Live mode gate rejects smoke tokens, so remove "-smoke" markers in text artifacts.
+    for name in ["script.json", "onepager.md", "storyboard.json", "materials.json", "facts.json"]:
+        path = run_dir / name
+        content = path.read_text(encoding="utf-8")
+        content = content.replace("-smoke", "-live")
+        path.write_text(content, encoding="utf-8")
+
+    onepager_path = run_dir / "onepager.md"
+    text = onepager_path.read_text(encoding="utf-8")
+    text = text.replace("DataMode: `smoke`", "DataMode: `live`")
+    text = re.sub(r"^- RequestedTopK:\s*`?\d+`?\s*$", "- RequestedTopK: `5`", text, flags=re.MULTILINE)
+    text = re.sub(r"^- TopPicksCount:\s*`?\d+`?\s*$", "- TopPicksCount: `2`", text, flags=re.MULTILINE)
+    if "## Why not more?" not in text:
+        text += "\n## Why not more?\n\n- top_picks_lt_5\n- source_diversity_lt_2\n"
+    onepager_path.write_text(text, encoding="utf-8")
+
+    validated = subprocess.run(
+        [
+            sys.executable,
+            "scripts/validate_artifacts_v2.py",
+            "--run-dir",
+            str(run_dir),
+            "--render-dir",
+            str(render_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(validated.stdout)
+    assert report["checks"]["candidate_shortage_explained"] is True
+    assert not any(str(err).startswith("candidate_shortage_without_explanation:") for err in list(report.get("errors") or []))

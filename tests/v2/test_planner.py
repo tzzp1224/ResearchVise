@@ -11,6 +11,7 @@ def test_retrieval_plan_builds_distinct_expanded_queries_for_ai_agent() -> None:
     assert set(map(str.lower, plan.expanded_queries)) != set(map(str.lower, plan.base_queries))
     assert "mcp" in " ".join(map(str.lower, plan.expanded_queries))
     assert "vscode theme" in [item.lower() for item in plan.must_exclude_terms]
+    assert "retriever" in [item.lower() for item in plan.must_exclude_terms]
     assert {"Frameworks", "Protocols & tool use", "Ops & runtime", "Evaluation"}.issubset(set(plan.query_buckets.keys()))
     github_bucket_queries = dict(plan.bucket_queries_by_source.get("github") or {})
     assert "Frameworks" in github_bucket_queries
