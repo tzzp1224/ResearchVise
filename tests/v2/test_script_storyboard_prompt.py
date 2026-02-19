@@ -159,3 +159,25 @@ def test_build_facts_strips_url_fragments_and_quote_tokens() -> None:
     ).lower()
     assert "com/s/" not in joined
     assert ">" not in joined
+
+
+def test_build_facts_prefers_feature_and_quickstart_over_slogans() -> None:
+    item = _sample_item()
+    body = (
+        "# Overview\n"
+        "The most revolutionary system ever built for all teams.\n"
+        "## Features\n"
+        "Provides MCP tool-calling orchestration with retry-safe workflow checkpoints.\n"
+        "Exports evidence audit JSON and validator-ready artifacts for deployment review.\n"
+        "## Quickstart\n"
+        "pip install acme-agent && acme-agent run --topic \"AI agent\".\n"
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    what = str(facts.get("what_it_is") or "").lower()
+    how = " ".join([str(v).lower() for v in list(facts.get("how_it_works") or [])])
+    assert "revolutionary" not in what
+    assert "most" not in what
+    assert "tool-calling" in (what + " " + how) or "orchestration" in (what + " " + how)
+    assert "pip install" in (what + " " + how) or "quickstart" in (what + " " + how)

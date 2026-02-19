@@ -44,6 +44,16 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["storyboard_overlay_safe"] is True
     assert report["checks"]["urls_valid"] is True
     assert report["checks"]["evidence_dedup_ok"] is True
+    assert report["checks"]["retrieval_diagnosis_parse_ok"] is True
+    assert report["checks"]["retrieval_diagnosis_attempts_present"] is True
+    assert report["checks"]["retrieval_attempt_quality_fields_present"] is True
+    assert report["checks"]["onepager_diagnosis_path_present"] is True
+    assert report["checks"]["onepager_evidence_audit_path_present"] is True
+    assert report["checks"]["onepager_relevance_summary_fields_present"] is True
+    assert report["checks"]["evidence_audit_exists"] is True
+    assert report["checks"]["evidence_audit_parse_ok"] is True
+    assert report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] is True
+    assert report["checks"]["citations_not_mostly_duplicate"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:

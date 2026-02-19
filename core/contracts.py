@@ -28,6 +28,7 @@ class ArtifactType(str, Enum):
     ZIP = "zip"
     AUDIO = "audio"
     SRT = "srt"
+    DIAGNOSIS = "diagnosis"
 
 
 class StatusTimestamps(BaseModel):

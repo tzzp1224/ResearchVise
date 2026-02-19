@@ -41,6 +41,106 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 
 _HN_FIREBASE = "https://hacker-news.firebaseio.com/v0"
+_HN_ALGOLIA_SEARCH = "https://hn.algolia.com/api/v1/search"
+
+_TOPIC_EXPANSION_TERMS = [
+    "agentic",
+    "autonomous agent",
+    "multi-agent",
+    "tool calling",
+    "function calling",
+    "orchestration",
+    "workflow",
+    "mcp",
+    "langchain",
+    "langgraph",
+    "autogen",
+    "crewai",
+    "openhands",
+    "swe-agent",
+    "rag agent",
+]
+
+
+def _normalize_queries(topic: str, *, expanded: bool = False, queries: Optional[List[str]] = None) -> List[str]:
+    provided = [str(item or "").strip() for item in list(queries or []) if str(item or "").strip()]
+    if provided:
+        deduped: List[str] = []
+        seen = set()
+        for query in provided:
+            key = query.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(query)
+        return deduped
+    return _topic_queries(topic, expanded=expanded)
+
+
+def _matches_topic_constraints(
+    *,
+    text: str,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+
+    include_tokens = [str(item or "").strip().lower() for item in list(must_include_terms or []) if str(item or "").strip()]
+    exclude_tokens = [str(item or "").strip().lower() for item in list(must_exclude_terms or []) if str(item or "").strip()]
+
+    if include_tokens and not any(token in lowered for token in include_tokens):
+        return False
+    if exclude_tokens and any(token in lowered for token in exclude_tokens):
+        return False
+    return True
+
+
+def _parse_window_days(time_window: str) -> int:
+    token = str(time_window or "").strip().lower()
+    if not token:
+        return 3
+    if token == "today":
+        return 3
+    if token.endswith("d"):
+        try:
+            return max(1, int(token[:-1]))
+        except Exception:
+            return 3
+    if token.endswith("h"):
+        try:
+            hours = int(token[:-1])
+            return max(1, int((hours + 23) // 24))
+        except Exception:
+            return 1
+    if token in {"past_week", "last_week", "weekly"}:
+        return 7
+    if token in {"past_month", "monthly"}:
+        return 30
+    return 3
+
+
+def _topic_queries(topic: str, *, expanded: bool = False) -> List[str]:
+    seed = str(topic or "").strip()
+    if not seed:
+        return []
+    queries: List[str] = [seed]
+    lowered = seed.lower()
+    if "agent" in lowered or "copilot" in lowered or "assistant" in lowered:
+        queries.extend(["agent framework", "agent orchestration", "tool-calling agent"])
+    if expanded:
+        queries.extend(_TOPIC_EXPANSION_TERMS)
+    deduped: List[str] = []
+    seen = set()
+    for query in queries:
+        token = str(query or "").strip()
+        key = token.lower()
+        if not token or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(token)
+    return deduped
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -321,6 +421,106 @@ async def fetch_github_trending(
     return items
 
 
+async def fetch_github_topic_search(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    expanded: bool = False,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+) -> List[RawItem]:
+    """Topic-first GitHub repo retrieval for live mode."""
+    query_list = _normalize_queries(topic, expanded=expanded, queries=queries)
+    if not query_list:
+        return []
+
+    max_items = max(1, int(limit))
+    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    window_days = _parse_window_days(time_window)
+    cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
+
+    token = str(get_settings().github.token or os.getenv("GITHUB_TOKEN") or "").strip() or None
+    repos_by_full_name: Dict[str, Tuple[Any, str]] = {}
+    async with GitHubScraper() as scraper:
+        for query in query_list:
+            repos = await scraper.search_repos(query=query, max_results=per_query, sort="updated", order="desc")
+            for repo in list(repos or []):
+                full_name = str(getattr(repo, "full_name", "") or "").strip()
+                if not full_name:
+                    continue
+                relevance_text = " ".join(
+                    [
+                        full_name,
+                        str(getattr(repo, "description", "") or ""),
+                        " ".join([str(tag) for tag in list(getattr(repo, "topics", []) or [])]),
+                    ]
+                )
+                if not _matches_topic_constraints(
+                    text=relevance_text,
+                    must_include_terms=must_include_terms,
+                    must_exclude_terms=must_exclude_terms,
+                ):
+                    continue
+                updated_dt = _parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None))
+                if updated_dt and updated_dt.timestamp() < cutoff:
+                    continue
+                if full_name not in repos_by_full_name:
+                    repos_by_full_name[full_name] = (repo, query)
+                if len(repos_by_full_name) >= max_items * 2:
+                    break
+            if len(repos_by_full_name) >= max_items * 2:
+                break
+
+    items: List[RawItem] = []
+    for full_name, (repo, query) in list(repos_by_full_name.items())[:max_items]:
+        readme = await _fetch_github_readme(full_name, token)
+        body = _safe_truncate(
+            "\n\n".join(
+                [
+                    _coalesce_text(getattr(repo, "description", ""), ""),
+                    (
+                        f"Stars: {int(getattr(repo, 'stars', 0) or 0)} | "
+                        f"Forks: {int(getattr(repo, 'forks', 0) or 0)} | "
+                        f"LastPush: {getattr(repo, 'updated_at', '') or 'unknown'}"
+                    ),
+                    readme,
+                ]
+            ),
+            max_len=9000,
+        )
+        items.append(
+            RawItem(
+                id=f"github_topic_{getattr(repo, 'id', full_name)}",
+                source="github",
+                title=full_name,
+                url=_coalesce_text(getattr(repo, "url", ""), f"https://github.com/{full_name}"),
+                body=body,
+                author=getattr(repo, "owner", None),
+                published_at=_parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None)),
+                tier="A",
+                metadata={
+                    "stars": int(getattr(repo, "stars", 0) or 0),
+                    "forks": int(getattr(repo, "forks", 0) or 0),
+                    "watchers": int(getattr(repo, "watchers", 0) or 0),
+                    "last_push": str(getattr(repo, "updated_at", "") or ""),
+                    "language": getattr(repo, "language", None),
+                    "topics": list(getattr(repo, "topics", []) or []),
+                    "item_type": "repo",
+                    "retrieval_mode": "topic_search",
+                    "source_query": query,
+                    "window_days": window_days,
+                    "search_endpoint": "github_search_repositories",
+                    "extraction_method": "github_topic_search_readme" if readme else "github_topic_search_metadata",
+                    "extraction_failed": bool(not readme),
+                    "readme_len": len(readme),
+                },
+            )
+        )
+    return items
+
+
 async def fetch_github_releases(
     repo_full_names: List[str],
     max_results_per_repo: int = 2,
@@ -460,6 +660,168 @@ async def fetch_huggingface_trending(max_results: int = 20) -> List[RawItem]:
     return items
 
 
+async def fetch_huggingface_search(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    expanded: bool = False,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+) -> List[RawItem]:
+    """Topic-first Hugging Face retrieval using model/dataset search."""
+    query_list = _normalize_queries(topic, expanded=expanded, queries=queries)
+    if not query_list:
+        return []
+
+    max_items = max(1, int(limit))
+    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    window_days = _parse_window_days(time_window)
+    cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
+
+    by_key: Dict[str, Tuple[str, Any, str]] = {}
+    async with HuggingFaceScraper() as scraper:
+        for query in query_list:
+            models = await scraper.search_models(query=query, max_results=per_query, sort="lastModified")
+            for model in list(models or []):
+                model_id = str(getattr(model, "id", "") or "").strip()
+                if not model_id:
+                    continue
+                relevance_text = " ".join(
+                    [
+                        str(getattr(model, "name", "") or ""),
+                        str(getattr(model, "description", "") or ""),
+                        " ".join([str(tag) for tag in list(getattr(model, "tags", []) or [])]),
+                    ]
+                )
+                if not _matches_topic_constraints(
+                    text=relevance_text,
+                    must_include_terms=must_include_terms,
+                    must_exclude_terms=must_exclude_terms,
+                ):
+                    continue
+                updated_dt = _parse_datetime(getattr(model, "updated_at", None) or getattr(model, "created_at", None))
+                if updated_dt and updated_dt.timestamp() < cutoff:
+                    continue
+                key = f"model:{model_id}"
+                if key not in by_key:
+                    by_key[key] = ("model", model, query)
+            datasets = await scraper.search_datasets(query=query, max_results=max(1, per_query // 2))
+            for dataset in list(datasets or []):
+                dataset_id = str(getattr(dataset, "id", "") or "").strip()
+                if not dataset_id:
+                    continue
+                relevance_text = " ".join(
+                    [
+                        str(getattr(dataset, "name", "") or ""),
+                        str(getattr(dataset, "description", "") or ""),
+                        " ".join([str(tag) for tag in list(getattr(dataset, "tags", []) or [])]),
+                    ]
+                )
+                if not _matches_topic_constraints(
+                    text=relevance_text,
+                    must_include_terms=must_include_terms,
+                    must_exclude_terms=must_exclude_terms,
+                ):
+                    continue
+                updated_dt = _parse_datetime((getattr(dataset, "extra", {}) or {}).get("last_modified"))
+                if updated_dt and updated_dt.timestamp() < cutoff:
+                    continue
+                key = f"dataset:{dataset_id}"
+                if key not in by_key:
+                    by_key[key] = ("dataset", dataset, query)
+            if len(by_key) >= max_items * 2:
+                break
+
+    items: List[RawItem] = []
+    for key, (item_type, payload, query) in list(by_key.items())[:max_items]:
+        if item_type == "model":
+            model = payload
+            card = await _fetch_hf_card(model.id, repo_type="model")
+            body = _safe_truncate(
+                "\n\n".join(
+                    [
+                        _coalesce_text(getattr(model, "description", ""), ""),
+                        (
+                            f"Downloads: {int(getattr(model, 'downloads', 0) or 0)} | "
+                            f"Likes: {int(getattr(model, 'likes', 0) or 0)} | "
+                            f"LastModified: {getattr(model, 'updated_at', '') or 'unknown'}"
+                        ),
+                        card,
+                    ]
+                ),
+                max_len=9000,
+            )
+            items.append(
+                RawItem(
+                    id=f"hf_search_{key}",
+                    source="huggingface",
+                    title=getattr(model, "name", None) or getattr(model, "id", "hf-model"),
+                    url=getattr(model, "url", f"https://huggingface.co/{model.id}"),
+                    body=body,
+                    author=getattr(model, "author", None),
+                    published_at=_parse_datetime(getattr(model, "updated_at", None) or getattr(model, "created_at", None)),
+                    tier="A",
+                    metadata={
+                        "repo_id": getattr(model, "id", ""),
+                        "downloads": int(getattr(model, "downloads", 0) or 0),
+                        "likes": int(getattr(model, "likes", 0) or 0),
+                        "tags": list(getattr(model, "tags", []) or []),
+                        "last_modified": str(getattr(model, "updated_at", "") or ""),
+                        "item_type": "model",
+                        "retrieval_mode": "topic_search",
+                        "source_query": query,
+                        "window_days": window_days,
+                        "search_endpoint": "huggingface_search_models",
+                        "extraction_method": "hf_card" if card else "hf_metadata",
+                        "extraction_failed": bool(not card),
+                        "card_len": len(card),
+                    },
+                )
+            )
+        else:
+            dataset = payload
+            card = await _fetch_hf_card(dataset.id, repo_type="dataset")
+            body = _safe_truncate(
+                "\n\n".join(
+                    [
+                        _coalesce_text(getattr(dataset, "description", ""), ""),
+                        f"Downloads: {int(getattr(dataset, 'downloads', 0) or 0)} | DatasetID: {dataset.id}",
+                        card,
+                    ]
+                ),
+                max_len=9000,
+            )
+            items.append(
+                RawItem(
+                    id=f"hf_search_{key}",
+                    source="huggingface",
+                    title=f"dataset/{getattr(dataset, 'name', None) or dataset.id}",
+                    url=getattr(dataset, "url", f"https://huggingface.co/datasets/{dataset.id}"),
+                    body=body,
+                    author=getattr(dataset, "author", None),
+                    published_at=_parse_datetime((getattr(dataset, "extra", {}) or {}).get("last_modified")),
+                    tier="A",
+                    metadata={
+                        "repo_id": getattr(dataset, "id", ""),
+                        "downloads": int(getattr(dataset, "downloads", 0) or 0),
+                        "tags": list(getattr(dataset, "tags", []) or []),
+                        "item_type": "dataset",
+                        "retrieval_mode": "topic_search",
+                        "source_query": query,
+                        "window_days": window_days,
+                        "search_endpoint": "huggingface_search_datasets",
+                        "extraction_method": "hf_card" if card else "hf_metadata",
+                        "extraction_failed": bool(not card),
+                        "card_len": len(card),
+                    },
+                )
+            )
+
+    return items
+
+
 async def fetch_hackernews_top(max_results: int = 20) -> List[RawItem]:
     """Fetch Hacker News top stories + optional top comments (Tier A)."""
     async with HackerNewsScraper() as scraper:
@@ -501,6 +863,104 @@ async def fetch_hackernews_top(max_results: int = 20) -> List[RawItem]:
                     "item_type": story.item_type or "story",
                     "top_comments": comments,
                     "extraction_method": "hn_story_plus_comments",
+                    "extraction_failed": False,
+                },
+            )
+        )
+    return items
+
+
+async def fetch_hackernews_search(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    expanded: bool = False,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+) -> List[RawItem]:
+    """Topic-first Hacker News recall via Algolia query search."""
+    query_list = _normalize_queries(topic, expanded=expanded, queries=queries)
+    if not query_list:
+        return []
+
+    max_items = max(1, int(limit))
+    per_query = max(2, int(max_items / max(1, len(queries))) + 1)
+    window_days = _parse_window_days(time_window)
+    if window_days <= 1:
+        hn_range = "last_24h"
+    elif window_days <= 7:
+        hn_range = "past_week"
+    elif window_days <= 30:
+        hn_range = "past_month"
+    else:
+        hn_range = "past_year"
+
+    by_id: Dict[str, Tuple[Any, str]] = {}
+    async with HackerNewsScraper() as scraper:
+        for query in query_list:
+            stories = await scraper.search(query=query, max_results=per_query, sort_by="relevance", time_range=hn_range)
+            for story in list(stories or []):
+                sid = str(getattr(story, "id", "") or "").strip()
+                if not sid:
+                    continue
+                relevance_text = " ".join(
+                    [
+                        str(getattr(story, "title", "") or ""),
+                        str(getattr(story, "text", "") or ""),
+                    ]
+                )
+                if not _matches_topic_constraints(
+                    text=relevance_text,
+                    must_include_terms=must_include_terms,
+                    must_exclude_terms=must_exclude_terms,
+                ):
+                    continue
+                if sid not in by_id:
+                    by_id[sid] = (story, query)
+            if len(by_id) >= max_items * 2:
+                break
+
+    items: List[RawItem] = []
+    for sid, (story, query) in list(by_id.items())[:max_items]:
+        comments: List[str] = []
+        try:
+            payload = await _hn_fetch_item(sid)
+            comments = await _hn_fetch_top_comments(payload, max_comments=2)
+        except Exception:
+            comments = []
+        body = _safe_truncate(
+            "\n\n".join(
+                [
+                    _coalesce_text(getattr(story, "text", ""), ""),
+                    f"Points: {int(getattr(story, 'points', 0) or 0)} | Comments: {int(getattr(story, 'comment_count', 0) or 0)}",
+                    "\n".join([f"Top comment: {line}" for line in comments]),
+                ]
+            ),
+            max_len=9000,
+        )
+        items.append(
+            RawItem(
+                id=f"hn_search_{sid}",
+                source="hackernews",
+                title=getattr(story, "title", None) or "HN Story",
+                url=_coalesce_text(getattr(story, "url", ""), getattr(story, "hn_url", "")),
+                body=body,
+                author=getattr(story, "author", None),
+                published_at=getattr(story, "created_at", None),
+                tier="A",
+                metadata={
+                    "points": int(getattr(story, "points", 0) or 0),
+                    "comment_count": int(getattr(story, "comment_count", 0) or 0),
+                    "hn_url": getattr(story, "hn_url", ""),
+                    "item_type": getattr(story, "item_type", "story") or "story",
+                    "top_comments": comments,
+                    "retrieval_mode": "topic_search",
+                    "source_query": query,
+                    "window_days": window_days,
+                    "search_endpoint": _HN_ALGOLIA_SEARCH,
+                    "extraction_method": "hn_algolia_search",
                     "extraction_failed": False,
                 },
             )

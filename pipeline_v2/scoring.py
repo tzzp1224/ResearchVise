@@ -8,6 +8,7 @@ import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from core import NormalizedItem, RankedItem
+from pipeline_v2.topic_profile import TopicProfile
 
 
 def _clamp01(value: float) -> float:
@@ -132,21 +133,48 @@ def _has_token(text: str, token: str) -> bool:
     return re.search(rf"\b{re.escape(token)}\b", text) is not None
 
 
-def score_relevance(item: NormalizedItem, topic: Optional[str]) -> float:
-    """Topic relevance score for top-pick gating (lexical MVP, embedding-ready interface)."""
-    tokens = _topic_tokens(topic)
-    if not tokens:
-        return 1.0
-
+def _topic_text(item: NormalizedItem) -> str:
     metadata = dict(item.metadata or {})
-    topic_text = " ".join(
+    return " ".join(
         [
             str(item.title or ""),
             str(metadata.get("clean_text") or item.body_md or ""),
             " ".join(str(tag) for tag in list(metadata.get("topics") or [])),
             str(metadata.get("item_type") or ""),
+            str(metadata.get("source_query") or ""),
         ]
     ).lower()
+
+
+def evaluate_relevance(
+    item: NormalizedItem,
+    topic: Optional[str],
+    *,
+    topic_profile: Optional[TopicProfile] = None,
+) -> Dict[str, object]:
+    """Deterministic relevance with topic profile hard gate + soft scoring."""
+    tokens = _topic_tokens(topic)
+    if not tokens:
+        return {
+            "score": 1.0,
+            "hard_pass": True,
+            "hard_terms": [],
+            "boost_terms": [],
+            "penalty_terms": [],
+        }
+
+    profile = topic_profile or TopicProfile.for_topic(str(topic or ""))
+    topic_text = _topic_text(item)
+    hard_terms = profile.matched_hard_terms(topic_text)
+    hard_pass = profile.hard_match_pass(topic_text)
+    if not hard_pass:
+        return {
+            "score": 0.0,
+            "hard_pass": False,
+            "hard_terms": hard_terms,
+            "boost_terms": [],
+            "penalty_terms": [],
+        }
 
     matched = sum(1 for token in tokens if _has_token(topic_text, token))
     coverage = float(matched) / float(max(1, len(tokens)))
@@ -165,7 +193,25 @@ def score_relevance(item: NormalizedItem, topic: Optional[str]) -> float:
 
     density = min(1.0, topic_text.count(tokens[0]) / 4.0) if tokens else 0.0
     base = 0.1 if coverage > 0 else 0.0
-    return _clamp01(base + 0.65 * coverage + 0.15 * density + phrase_bonus + proxy_bonus)
+    boost, penalty, boost_terms, penalty_terms = profile.soft_adjustment(topic_text)
+    score = _clamp01(base + 0.65 * coverage + 0.15 * density + phrase_bonus + proxy_bonus + boost - penalty)
+    return {
+        "score": score,
+        "hard_pass": hard_pass,
+        "hard_terms": hard_terms,
+        "boost_terms": boost_terms,
+        "penalty_terms": penalty_terms,
+    }
+
+
+def score_relevance(
+    item: NormalizedItem,
+    topic: Optional[str],
+    *,
+    topic_profile: Optional[TopicProfile] = None,
+) -> float:
+    payload = evaluate_relevance(item, topic, topic_profile=topic_profile)
+    return float(payload.get("score", 0.0) or 0.0)
 
 
 def _is_short_announcement(item: NormalizedItem) -> bool:
@@ -275,6 +321,7 @@ def rank_items(
     tier_b_top3_talkability_threshold: float = 0.88,
     min_body_len_for_top_picks: int = 300,
     topic: Optional[str] = None,
+    topic_profile: Optional[TopicProfile] = None,
     relevance_threshold: float = 0.55,
 ) -> List[RankedItem]:
     """Rank items with explainable subscores and Tier B top3 gate."""
@@ -286,7 +333,19 @@ def rank_items(
             body_len >= int(min_body_len_for_top_picks)
             or (short_announcement and citation_count >= 1 and link_count >= 1)
         )
-        relevance_score = score_relevance(item, topic)
+        relevance_payload = evaluate_relevance(item, topic, topic_profile=topic_profile)
+        relevance_score = float(relevance_payload.get("score", 0.0) or 0.0)
+        hard_match_pass = bool(relevance_payload.get("hard_pass", True))
+        hard_terms = [str(value) for value in list(relevance_payload.get("hard_terms") or []) if str(value).strip()]
+        boost_terms = [str(value) for value in list(relevance_payload.get("boost_terms") or []) if str(value).strip()]
+        penalty_terms = [str(value) for value in list(relevance_payload.get("penalty_terms") or []) if str(value).strip()]
+
+        metadata = dict(item.metadata or {})
+        metadata["topic_hard_match_pass"] = bool(hard_match_pass)
+        metadata["topic_hard_match_terms"] = hard_terms
+        metadata["topic_soft_boost_terms"] = boost_terms
+        metadata["topic_soft_penalty_terms"] = penalty_terms
+        item.metadata = metadata
         gate_on_relevance = bool(topic and float(relevance_threshold) > 0.0)
         relevance_eligible = bool(relevance_score >= float(relevance_threshold)) if gate_on_relevance else True
 
@@ -331,6 +390,10 @@ def rank_items(
                 relevance_score,
                 relevance_eligible,
                 quality_boost,
+                hard_match_pass,
+                hard_terms,
+                boost_terms,
+                penalty_terms,
             )
         )
 
@@ -355,6 +418,10 @@ def rank_items(
             relevance_score,
             relevance_eligible,
             _quality_boost,
+            _hard_match_pass,
+            _hard_terms,
+            _boost_terms,
+            _penalty_terms,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -382,6 +449,10 @@ def rank_items(
         relevance_score,
         relevance_eligible,
         quality_boost,
+        hard_match_pass,
+        hard_terms,
+        boost_terms,
+        penalty_terms,
     ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -396,8 +467,14 @@ def rank_items(
             f"quality.link_count={link_count}",
             f"quality.top_pick_gate={'pass' if quality_eligible else 'deferred'}",
             f"quality.relevance_gate={'pass' if relevance_eligible else 'deferred'}",
+            f"topic.hard_match={'pass' if hard_match_pass else 'deferred'}",
+            f"topic.hard_terms={','.join(hard_terms) if hard_terms else 'none'}",
             f"quality.boost={quality_boost:.2f}",
         ]
+        if boost_terms:
+            reasons.append(f"topic.soft_boost_terms={','.join(boost_terms)}")
+        if penalty_terms:
+            reasons.append(f"topic.soft_penalty_terms={','.join(penalty_terms)}")
         signals = _quality_signals(item)
         reasons.extend(
             [
@@ -421,6 +498,8 @@ def rank_items(
             reasons.append(f"penalty.body_len_lt_{int(min_body_len_for_top_picks)}")
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             reasons.append(f"penalty.relevance_lt_{float(relevance_threshold):.2f}")
+        if topic and not hard_match_pass:
+            reasons.append("topic.hard_gate_fail")
         if int(signals["evidence_links_quality"]) <= 0:
             reasons.append("penalty.no_evidence_links")
         if signals["update_recency_days"] is not None and float(signals["update_recency_days"]) >= 120:

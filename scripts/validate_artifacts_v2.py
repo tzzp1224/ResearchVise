@@ -234,6 +234,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 
     run_context_path = run_dir / "run_context.json"
     run_context = {}
+    ranking_stats: Dict = {}
+    retrieval_ctx: Dict = {}
     if run_context_path.exists():
         try:
             run_context = _load_json(run_context_path)
@@ -241,10 +243,14 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["details"]["data_mode"] = str(run_context.get("data_mode") or "")
             report["details"]["connector_stats"] = run_context.get("connector_stats")
             report["details"]["extraction_stats"] = run_context.get("extraction_stats")
+            ranking_stats = dict(run_context.get("ranking_stats") or {})
+            retrieval_ctx = dict(run_context.get("retrieval") or {})
         except Exception as exc:
             report["checks"]["run_context_exists"] = False
             report["errors"].append(f"run_context_parse:{exc}")
             run_context = {}
+            ranking_stats = {}
+            retrieval_ctx = {}
     else:
         report["checks"]["run_context_exists"] = False
         report["errors"].append(f"missing:run_context:{run_context_path}")
@@ -261,6 +267,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         "storyboard": run_dir / "storyboard.json",
         "prompt_bundle": run_dir / "prompt_bundle.json",
         "materials": run_dir / "materials.json",
+        "diagnosis": run_dir / "retrieval_diagnosis.json",
+        "evidence_audit": run_dir / "evidence_audit.json",
         "mp4": render_dir / "rendered_final.mp4",
     }
     for key, path in required.items():
@@ -274,6 +282,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
     facts_path = required["facts"]
     storyboard_path = required["storyboard"]
     prompt_bundle_path = required["prompt_bundle"]
+    diagnosis_path = required["diagnosis"]
+    evidence_audit_path = required["evidence_audit"]
     mp4_path = required["mp4"]
     if not mp4_path.exists():
         fallback_mp4 = render_dir / "fallback_render.mp4"
@@ -321,7 +331,6 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         header_requested_match = re.search(r"^- RequestedTopK:\s*`?(\d+)`?\s*$", onepager, flags=re.MULTILINE)
         header_top_count = int(header_top_match.group(1)) if header_top_match else len(top_pick_headings)
         header_requested_top_k = int(header_requested_match.group(1)) if header_requested_match else 0
-        ranking_stats = dict(run_context.get("ranking_stats") or {})
         expected_top_count = int(ranking_stats.get("top_picks_count", header_top_count) or header_top_count)
         requested_top_k = int(ranking_stats.get("requested_top_k", header_requested_top_k) or header_requested_top_k)
         block_hits = _contains_blocklist(onepager)
@@ -346,6 +355,37 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["details"]["onepager_header_requested_top_k"] = header_requested_top_k
         report["details"]["requested_top_k"] = requested_top_k
         report["details"]["onepager_relevance_scores"] = relevance_rows
+        diagnosis_match = re.search(r"^- DiagnosisPath:\s*`?([^`\n]+)`?\s*$", onepager, flags=re.MULTILINE)
+        diagnosis_header_path = str(diagnosis_match.group(1) if diagnosis_match else "").strip()
+        evidence_audit_match = re.search(r"^- EvidenceAuditPath:\s*`?([^`\n]+)`?\s*$", onepager, flags=re.MULTILINE)
+        evidence_audit_header_path = str(evidence_audit_match.group(1) if evidence_audit_match else "").strip()
+        hard_match_terms_match = re.search(r"^- HardMatchTermsUsed:\s*`?([^`\n]+)`?\s*$", onepager, flags=re.MULTILINE)
+        hard_match_pass_match = re.search(r"^- HardMatchPassCount:\s*`?(\d+)`?\s*$", onepager, flags=re.MULTILINE)
+        min_relevance_match = re.search(r"^- TopPicksMinRelevance:\s*`?([0-9.]+)`?\s*$", onepager, flags=re.MULTILINE)
+        top_hard_match_match = re.search(r"^- TopPicksHardMatchCount:\s*`?(\d+)`?\s*$", onepager, flags=re.MULTILINE)
+        quality_trigger_match = re.search(r"^- QualityTriggeredExpansion:\s*`?(true|false)`?\s*$", onepager, flags=re.IGNORECASE | re.MULTILINE)
+        report["details"]["onepager_diagnosis_path"] = diagnosis_header_path
+        report["details"]["onepager_evidence_audit_path"] = evidence_audit_header_path
+        report["details"]["onepager_hard_match_terms_used"] = str(hard_match_terms_match.group(1) if hard_match_terms_match else "").strip()
+        report["details"]["onepager_hard_match_pass_count"] = int(hard_match_pass_match.group(1)) if hard_match_pass_match else None
+        report["details"]["onepager_top_picks_min_relevance"] = float(min_relevance_match.group(1)) if min_relevance_match else None
+        report["details"]["onepager_top_picks_hard_match_count"] = int(top_hard_match_match.group(1)) if top_hard_match_match else None
+        report["details"]["onepager_quality_triggered_expansion"] = (
+            str(quality_trigger_match.group(1)).strip().lower() == "true" if quality_trigger_match else None
+        )
+        report["checks"]["onepager_diagnosis_path_present"] = bool(diagnosis_header_path and diagnosis_header_path != "N/A")
+        report["checks"]["onepager_evidence_audit_path_present"] = bool(
+            evidence_audit_header_path and evidence_audit_header_path != "N/A"
+        )
+        report["checks"]["onepager_relevance_summary_fields_present"] = bool(
+            hard_match_terms_match and hard_match_pass_match and min_relevance_match and top_hard_match_match and quality_trigger_match
+        )
+        if data_mode == "live" and not report["checks"]["onepager_diagnosis_path_present"]:
+            report["errors"].append("onepager_missing_diagnosis_path")
+        if data_mode == "live" and not report["checks"]["onepager_evidence_audit_path_present"]:
+            report["errors"].append("onepager_missing_evidence_audit_path")
+        if data_mode == "live" and not report["checks"]["onepager_relevance_summary_fields_present"]:
+            report["errors"].append("onepager_missing_relevance_summary_fields")
         if block_hits:
             report["errors"].append("onepager_blocklist:" + ",".join(block_hits))
         if bad_urls:
@@ -373,6 +413,83 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append(
                 f"onepager_requested_top_k_mismatch:header={header_requested_top_k},context={requested_top_k}"
             )
+
+    diagnosis_payload: Dict = {}
+    if diagnosis_path.exists():
+        try:
+            diagnosis_payload = _load_json(diagnosis_path)
+            attempts = list(diagnosis_payload.get("attempts") or [])
+            report["checks"]["retrieval_diagnosis_parse_ok"] = True
+            report["checks"]["retrieval_diagnosis_attempts_present"] = len(attempts) >= 1
+            required_attempt_fields = {
+                "hard_match_terms_used",
+                "hard_match_pass_count",
+                "top_picks_min_relevance",
+                "top_picks_hard_match_count",
+                "quality_triggered_expansion",
+            }
+            report["checks"]["retrieval_attempt_quality_fields_present"] = bool(
+                attempts and all(required_attempt_fields.issubset(set(dict(item or {}).keys())) for item in attempts)
+            )
+            report["details"]["retrieval_attempt_count"] = len(attempts)
+            report["details"]["retrieval_selected_phase"] = diagnosis_payload.get("selected_phase")
+            report["details"]["retrieval_quality_triggered_expansion"] = diagnosis_payload.get("quality_triggered_expansion")
+        except Exception as exc:
+            report["checks"]["retrieval_diagnosis_parse_ok"] = False
+            report["checks"]["retrieval_diagnosis_attempts_present"] = False
+            report["checks"]["retrieval_attempt_quality_fields_present"] = False
+            report["errors"].append(f"retrieval_diagnosis_parse:{exc}")
+            diagnosis_payload = {}
+    else:
+        report["checks"]["retrieval_diagnosis_parse_ok"] = False
+        report["checks"]["retrieval_diagnosis_attempts_present"] = False
+        report["checks"]["retrieval_attempt_quality_fields_present"] = False
+
+    evidence_audit_payload: Dict = {}
+    if evidence_audit_path.exists():
+        try:
+            evidence_audit_payload = _load_json(evidence_audit_path)
+            records = list(evidence_audit_payload.get("records") or [])
+            report["checks"]["evidence_audit_parse_ok"] = isinstance(records, list)
+            report["details"]["evidence_audit_record_count"] = len(records)
+        except Exception as exc:
+            report["checks"]["evidence_audit_parse_ok"] = False
+            report["errors"].append(f"evidence_audit_parse:{exc}")
+            evidence_audit_payload = {}
+    else:
+        report["checks"]["evidence_audit_parse_ok"] = False
+
+    top_item_ids = [str(value or "").strip() for value in list(ranking_stats.get("top_item_ids") or []) if str(value or "").strip()]
+    if evidence_audit_payload:
+        record_map = {}
+        for row in list(evidence_audit_payload.get("records") or []):
+            item_id = str((row or {}).get("item_id") or "").strip()
+            if not item_id:
+                continue
+            record_map[item_id] = dict(row or {})
+        verdict_ok = True
+        duplicate_ok = True
+        for item_id in top_item_ids:
+            row = dict(record_map.get(item_id) or {})
+            verdict = str(row.get("verdict") or "").strip().lower()
+            reasons = list(row.get("reasons") or [])
+            if verdict not in {"pass", "downgrade"}:
+                verdict_ok = False
+                continue
+            if verdict == "downgrade" and not reasons:
+                verdict_ok = False
+            duplicate_ratio = float(row.get("citation_duplicate_prefix_ratio", 0.0) or 0.0)
+            if duplicate_ratio > 0.6:
+                duplicate_ok = False
+        report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] = verdict_ok
+        report["checks"]["citations_not_mostly_duplicate"] = duplicate_ok
+        if not verdict_ok:
+            report["errors"].append("top_picks_invalid_evidence_verdicts")
+        if not duplicate_ok:
+            report["errors"].append("top_picks_citations_mostly_duplicate")
+    else:
+        report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] = False
+        report["checks"]["citations_not_mostly_duplicate"] = False
 
     if facts_path.exists():
         facts_payload = _load_json(facts_path)
@@ -481,16 +598,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["onepager_bullets_compact_ok"] = True
         report["checks"]["facts_has_why_now_and_proof"] = True
 
-    topic_value = ""
-    ranking_stats = {}
-    if run_context_path.exists():
-        try:
-            run_context = _load_json(run_context_path)
-            topic_value = str(run_context.get("topic") or "").strip()
-            ranking_stats = dict(run_context.get("ranking_stats") or {})
-        except Exception:
-            topic_value = ""
-            ranking_stats = {}
+    topic_value = str(run_context.get("topic") or "").strip()
 
     if topic_value and data_mode == "live":
         threshold = float(ranking_stats.get("relevance_threshold", 0.55) or 0.55)
@@ -526,8 +634,48 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["ranked_items_have_update_signal"] = has_update_signal
         if not has_update_signal:
             report["errors"].append("ranked_items_missing_update_signal")
+
+        diagnosis_attempts = list(diagnosis_payload.get("attempts") or [])
+        selected_phase_diag = str(diagnosis_payload.get("selected_phase") or "").strip()
+        selected_phase_ctx = str(
+            retrieval_ctx.get("selected_phase")
+            or ranking_stats.get("selected_recall_phase")
+            or ""
+        ).strip()
+        report["checks"]["retrieval_selected_phase_consistent"] = bool(
+            not selected_phase_ctx or not selected_phase_diag or selected_phase_ctx == selected_phase_diag
+        )
+        if not report["checks"]["retrieval_selected_phase_consistent"]:
+            report["errors"].append(
+                f"retrieval_selected_phase_mismatch:context={selected_phase_ctx},diagnosis={selected_phase_diag}"
+            )
+
+        attempt_count_ctx = int(retrieval_ctx.get("attempt_count", 0) or 0)
+        attempt_count_diag = len(diagnosis_attempts)
+        report["checks"]["retrieval_attempt_count_consistent"] = bool(
+            attempt_count_ctx <= 0 or attempt_count_diag <= 0 or attempt_count_ctx == attempt_count_diag
+        )
+        if not report["checks"]["retrieval_attempt_count_consistent"]:
+            report["errors"].append(
+                f"retrieval_attempt_count_mismatch:context={attempt_count_ctx},diagnosis={attempt_count_diag}"
+            )
+
+        expansion_steps = list(retrieval_ctx.get("expansion_steps") or [])
+        expansion_in_diag = any(bool(item.get("expansion_applied")) for item in diagnosis_attempts)
+        candidate_shortage = bool(ranking_stats.get("candidate_shortage"))
+        requires_expansion_trace = bool(candidate_shortage or attempt_count_ctx > 1 or attempt_count_diag > 1)
+        report["checks"]["retrieval_expansion_recorded"] = bool(
+            (not requires_expansion_trace) or expansion_steps or expansion_in_diag
+        )
+        if not report["checks"]["retrieval_expansion_recorded"]:
+            report["errors"].append("retrieval_expansion_trace_missing")
+        if not report["checks"].get("retrieval_attempt_quality_fields_present", False):
+            report["errors"].append("retrieval_attempt_quality_fields_missing")
     else:
         report["checks"]["ranked_items_have_update_signal"] = True
+        report["checks"]["retrieval_selected_phase_consistent"] = True
+        report["checks"]["retrieval_attempt_count_consistent"] = True
+        report["checks"]["retrieval_expansion_recorded"] = True
 
     all_urls = []
     for path in [script_path, onepager_path, storyboard_path, prompt_bundle_path, run_dir / "materials.json", facts_path]:

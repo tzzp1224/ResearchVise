@@ -280,12 +280,52 @@ def generate_onepager(
     connector_stats = dict(context.get("connector_stats") or {})
     extraction_stats = dict(context.get("extraction_stats") or {})
     ranking_stats = dict(context.get("ranking_stats") or {})
+    retrieval = dict(context.get("retrieval") or {})
     candidate_count = int(ranking_stats.get("candidate_count", len(normalized_items)) or len(normalized_items))
     filtered_by_relevance = int(ranking_stats.get("filtered_by_relevance", 0) or 0)
     threshold_used = float(ranking_stats.get("topic_relevance_threshold_used", ranking_stats.get("relevance_threshold", 0.55)) or 0.55)
     relaxation_steps = int(ranking_stats.get("relaxation_steps", 0) or 0)
     requested_top_k = int(ranking_stats.get("requested_top_k", len(normalized_items)) or len(normalized_items))
     top_picks_count = len(normalized_items)
+    hard_match_terms_used = [
+        str(value).strip()
+        for value in list(ranking_stats.get("hard_match_terms_used") or retrieval.get("hard_match_terms_used") or [])
+        if str(value).strip()
+    ]
+    hard_match_pass_count = int(
+        ranking_stats.get("hard_match_pass_count", retrieval.get("hard_match_pass_count", 0)) or 0
+    )
+    top_picks_min_relevance = float(
+        ranking_stats.get("top_picks_min_relevance", retrieval.get("top_picks_min_relevance", 0.0)) or 0.0
+    )
+    top_picks_hard_match_count = int(
+        ranking_stats.get("top_picks_hard_match_count", retrieval.get("top_picks_hard_match_count", 0)) or 0
+    )
+    bucket_coverage = int(ranking_stats.get("bucket_coverage", retrieval.get("bucket_coverage", 0)) or 0)
+    quality_triggered_expansion = bool(
+        ranking_stats.get("quality_triggered_expansion", retrieval.get("quality_triggered_expansion", False))
+    )
+    quality_trigger_reasons = [
+        str(value).strip()
+        for value in list(ranking_stats.get("quality_trigger_reasons") or retrieval.get("quality_trigger_reasons") or [])
+        if str(value).strip()
+    ]
+    diagnosis_path = str(
+        retrieval.get("diagnosis_path")
+        or context.get("diagnosis_path")
+        or ""
+    ).strip()
+    evidence_audit_path = str(
+        retrieval.get("evidence_audit_path")
+        or ranking_stats.get("evidence_audit_path")
+        or context.get("evidence_audit_path")
+        or ""
+    ).strip()
+    selected_phase = str(
+        retrieval.get("selected_phase")
+        or ranking_stats.get("selected_recall_phase")
+        or "base"
+    ).strip()
     connector_stats_line = json.dumps(connector_stats, ensure_ascii=False, sort_keys=True)
     extraction_stats_line = json.dumps(extraction_stats, ensure_ascii=False, sort_keys=True)
 
@@ -302,7 +342,17 @@ def generate_onepager(
         f"- FilteredByRelevance: `{filtered_by_relevance}`",
         f"- TopicRelevanceThresholdUsed: `{threshold_used:.2f}`",
         f"- RelevanceRelaxationSteps: `{relaxation_steps}`",
+        f"- HardMatchTermsUsed: `{','.join(hard_match_terms_used) if hard_match_terms_used else 'N/A'}`",
+        f"- HardMatchPassCount: `{hard_match_pass_count}`",
+        f"- TopPicksMinRelevance: `{top_picks_min_relevance:.2f}`",
+        f"- TopPicksHardMatchCount: `{top_picks_hard_match_count}`",
+        f"- BucketCoverage: `{bucket_coverage}`",
+        f"- QualityTriggeredExpansion: `{str(quality_triggered_expansion).lower()}`",
+        f"- QualityTriggerReasons: `{','.join(quality_trigger_reasons) if quality_trigger_reasons else 'N/A'}`",
+        f"- RecallPhase: `{selected_phase or 'base'}`",
         f"- CitationCount: `{len(citation_list)}`",
+        f"- DiagnosisPath: `{diagnosis_path or 'N/A'}`",
+        f"- EvidenceAuditPath: `{evidence_audit_path or 'N/A'}`",
         "",
         "## Top Picks",
         "",

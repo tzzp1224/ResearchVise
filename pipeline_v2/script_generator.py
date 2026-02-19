@@ -21,6 +21,38 @@ _FACT_NOISE_PATTERNS = (
     re.compile(r"\blast(push|_push|_modified)?\s*:\s*", re.IGNORECASE),
     re.compile(r"\b(?:readme|license|contributing)\b", re.IGNORECASE),
 )
+_SECTION_HEADER = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+_SECTION_PRIORITY = {
+    "overview": 1.2,
+    "what": 1.1,
+    "feature": 1.5,
+    "quickstart": 1.8,
+    "getting started": 1.8,
+    "usage": 1.6,
+    "how it works": 1.8,
+    "example": 1.5,
+}
+_VERIFIABLE_TOKENS = (
+    "cli",
+    "api",
+    "sdk",
+    "mcp",
+    "tool calling",
+    "orchestration",
+    "workflow",
+    "pipeline",
+    "quickstart",
+    "usage",
+    "deployment",
+    "benchmark",
+    "latency",
+    "throughput",
+)
+_COMMAND_PATTERN = re.compile(r"\b(pip\s+install|npm\s+i|npm\s+install|curl\s+|python\s+\S+|docker\s+run)\b", re.IGNORECASE)
+_HYPE_PATTERN = re.compile(
+    r"\b(best|most|ultimate|revolutionary|amazing|world[- ]class|ever built|game[- ]changing)\b",
+    re.IGNORECASE,
+)
 
 
 def _compact_text(value: str, max_len: int) -> str:
@@ -45,7 +77,7 @@ def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     return _compact_text(value, max_len=max_len)
 
 
-def _split_sentences(text: str) -> List[str]:
+def _split_sentences(text: str, *, min_len: int = 20) -> List[str]:
     normalized = str(text or "")
     normalized = normalized.replace("\r\n", "\n")
     normalized = re.sub(r"(?<!\d)\.(?!\d)", "。", normalized)
@@ -54,7 +86,7 @@ def _split_sentences(text: str) -> List[str]:
     seen = set()
     for chunk in chunks:
         sentence = _clean_sentence(chunk, max_len=260)
-        if len(sentence) < 20:
+        if len(sentence) < int(min_len):
             continue
         if _MARKDOWN_NOISE.match(sentence):
             continue
@@ -64,6 +96,85 @@ def _split_sentences(text: str) -> List[str]:
         seen.add(token)
         sentences.append(sentence)
     return sentences
+
+
+def _split_sections(text: str) -> Dict[str, str]:
+    sections: Dict[str, List[str]] = {"root": []}
+    current = "root"
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        header = _SECTION_HEADER.match(str(line or "").strip())
+        if header:
+            current = str(header.group(1) or "").strip().lower()
+            if current not in sections:
+                sections[current] = []
+            continue
+        sections.setdefault(current, []).append(str(line))
+    return {title: "\n".join(lines).strip() for title, lines in sections.items()}
+
+
+def _section_boost(section_name: str) -> float:
+    key = str(section_name or "").strip().lower()
+    for marker, weight in _SECTION_PRIORITY.items():
+        if marker in key:
+            return float(weight)
+    return 0.0
+
+
+def _sentence_score(sentence: str, *, section_name: str = "root") -> float:
+    text = _clean_sentence(sentence, max_len=220)
+    if not text or _is_fact_noise(text) or _looks_like_fragment(text):
+        return -10.0
+
+    lowered = text.lower()
+    score = 0.0
+    score += min(1.5, float(len(lowered)) / 120.0)
+    score += _section_boost(section_name)
+
+    if any(token in lowered for token in _VERIFIABLE_TOKENS):
+        score += 2.0
+    if _COMMAND_PATTERN.search(lowered):
+        score += 1.8
+    if re.search(r"\b\d+(\.\d+)?(%|ms|s|x)?\b", lowered):
+        score += 1.1
+    if re.search(r"\b(implements?|supports?|routes?|orchestrates?|deploys?|provides?)\b", lowered):
+        score += 0.8
+
+    if _HYPE_PATTERN.search(lowered):
+        score -= 2.6
+    if not _has_verifiable_signal(text):
+        score -= 0.9
+    if re.search(r"\b(no|not|never|nothing)\b", lowered) and not _has_verifiable_signal(text):
+        score -= 0.8
+
+    return score
+
+
+def _has_verifiable_signal(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    if any(token in lowered for token in _VERIFIABLE_TOKENS):
+        return True
+    if _COMMAND_PATTERN.search(lowered):
+        return True
+    if re.search(r"\b\d+(\.\d+)?(%|ms|s|x)?\b", lowered):
+        return True
+    return False
+
+
+def _feature_sentences(text: str) -> List[str]:
+    sections = _split_sections(text)
+    scored: List[tuple[float, str]] = []
+    seen = set()
+    for section_name, section_text in sections.items():
+        for sentence in _split_sentences(section_text, min_len=18):
+            token = sentence.lower()
+            if token in seen:
+                continue
+            seen.add(token)
+            scored.append((_sentence_score(sentence, section_name=section_name), sentence))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    return [sentence for score, sentence in scored if score > -5.0]
 
 
 def _is_fact_noise(sentence: str) -> bool:
@@ -187,42 +298,58 @@ def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
 
 
 def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[str, object]:
-    """Extract a structured fact brief used by script/storyboard generation."""
+    """Extract a structured fact brief with verifiable functional points."""
     text = _body_text(item)
-    sentences = _split_sentences(text)
     topic_text = str(topic or "").strip()
+    feature_candidates = _feature_sentences(text)
+    metadata = dict(item.metadata or {})
+    quality_signals = dict(metadata.get("quality_signals") or {})
 
     what_it_is = ""
-    for sentence in sentences:
-        if len(sentence) >= 28 and not _is_fact_noise(sentence):
-            what_it_is = re.sub(r"\b(?:stars?|forks?|lastpush|last push)\s*[:=]\s*\S+", "", sentence, flags=re.IGNORECASE)
+    for sentence in feature_candidates:
+        cleaned = _clean_fact_point(sentence, max_len=150)
+        if not cleaned or cleaned.lower().startswith(("we believe", "our vision", "the most")):
+            continue
+        if _has_verifiable_signal(cleaned):
+            what_it_is = cleaned
             break
     if not what_it_is:
-        what_it_is = f"{item.title} is a practical update that targets production engineering workflows."
-    what_it_is = _clean_fact_point(what_it_is, max_len=140)
+        what_it_is = _clean_fact_point(
+            f"{item.title} provides a concrete workflow for engineering teams to run and validate.",
+            max_len=150,
+        )
 
     how_it_works: List[str] = []
-    for sentence in sentences:
-        if sentence.lower() == what_it_is.lower():
+    seen = {what_it_is.lower()}
+    for sentence in feature_candidates:
+        cleaned = _clean_fact_point(sentence, max_len=88)
+        token = cleaned.lower()
+        if not cleaned or token in seen:
             continue
-        if _is_fact_noise(sentence):
+        if not _has_verifiable_signal(cleaned):
             continue
-        point = _clean_fact_point(sentence, max_len=80)
-        if not point:
+        if _looks_like_fragment(cleaned):
             continue
-        if _looks_like_fragment(point):
-            continue
-        how_it_works.append(point)
+        seen.add(token)
+        how_it_works.append(cleaned)
         if len(how_it_works) >= 3:
             break
 
     while len(how_it_works) < 3:
-        fallback = _engagement_line(item) if len(how_it_works) == 0 else f"{item.title} provides concrete implementation signals for engineering teams this week."
-        how_it_works.append(_clean_fact_point(fallback, max_len=80))
+        if len(how_it_works) == 0:
+            fallback = "Quickstart includes reproducible setup and run commands."
+        elif len(how_it_works) == 1:
+            fallback = "Evidence audit and citation checks gate weak candidates before final picks."
+        else:
+            fallback = "Outputs ship as facts, script, storyboard, prompts, and validator-ready artifacts."
+        how_it_works.append(_clean_fact_point(fallback, max_len=88))
 
     links = _links(item)
-    metadata = dict(item.metadata or {})
-    quality_signals = dict(metadata.get("quality_signals") or {})
+    link_domains = []
+    for raw in links:
+        domain = _domain(raw)
+        if domain not in link_domains:
+            link_domains.append(domain)
 
     metrics = {
         "stars": int(float(metadata.get("stars", 0) or 0)),
@@ -235,66 +362,82 @@ def build_facts(item: NormalizedItem, *, topic: Optional[str] = None) -> Dict[st
 
     proof: List[str] = []
     proof_links: List[str] = []
-    if metrics["stars"] > 0:
-        proof.append(f"GitHub stars reached {metrics['stars']} with sustained maintainer activity.")
-        proof_links.append(links[0] if links else "")
-    if metrics["hn_points"] > 0 or metrics["hn_comments"] > 0:
-        proof.append(f"HN thread signal: {metrics['hn_points']} points and {metrics['hn_comments']} comments.")
-        proof_links.append(next((url for url in links if "news.ycombinator.com/item" in url), links[0] if links else ""))
-    if metrics["publish_or_update_time"]:
-        proof.append(f"Latest publish/update time: {metrics['publish_or_update_time']}.")
-        proof_links.append(links[0] if links else "")
-
+    used_pairs = set()
     for citation in list(item.citations or []):
         citation_url = canonicalize_url(str(citation.url or "").strip())
         if not is_allowed_citation_url(citation_url):
             continue
-        snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
-        if _looks_like_fragment(snippet):
+        pair = (_domain(citation_url), str(urlparse(citation_url).path or ""))
+        if pair in used_pairs:
             continue
-        if snippet and snippet not in proof:
-            proof.append(snippet)
-            proof_links.append(citation_url)
+        snippet = _clean_fact_point(citation.snippet or citation.title, max_len=120)
+        if not snippet or _looks_like_fragment(snippet):
+            continue
+        proof.append(snippet)
+        proof_links.append(citation_url)
+        used_pairs.add(pair)
         if len(proof) >= 2:
             break
 
-    if len(proof) < 2:
-        fallback = _clean_fact_point(_engagement_line(item), max_len=120)
-        if fallback:
-            proof.append(fallback)
-            proof_links.append(links[0] if links else "")
+    if len(proof) < 2 and metrics["publish_or_update_time"]:
+        proof.append(f"Latest publish/update time: {metrics['publish_or_update_time']}.")
+        proof_links.append(links[0] if links else "")
+    if len(proof) < 2 and (metrics["hn_points"] > 0 or metrics["hn_comments"] > 0):
+        proof.append(f"HN discussion: {metrics['hn_points']} points / {metrics['hn_comments']} comments.")
+        proof_links.append(next((url for url in links if "news.ycombinator.com/item" in url), links[0] if links else ""))
     while len(proof) < 2:
-        proof.append("signals insufficient; verify from primary source before publishing.")
+        fallback = _clean_fact_point("Evidence is limited; verify with release notes or docs before publishing.", max_len=120)
+        proof.append(fallback)
         proof_links.append(links[0] if links else "")
 
-    hook = (
-        f"If you're tracking {topic_text}, this is one update worth watching today."
-        if topic_text
-        else f"{item.title} is surfacing as a practical signal teams are shipping now."
-    )
-    cta = "Save this brief, review the cited sources, and use the checklist before your next rollout."
+    unique_links: List[str] = []
+    for url in links:
+        token = canonicalize_url(url)
+        if token and token not in unique_links:
+            unique_links.append(token)
+        if len(unique_links) >= 4:
+            break
+    for url in list(proof_links or []):
+        if len(unique_links) >= 2:
+            break
+        token = canonicalize_url(url)
+        if token and token not in unique_links:
+            unique_links.append(token)
 
     dedup_proof_links: List[str] = []
-    seen_links = set()
-    for link in proof_links[:4]:
+    for link in proof_links:
         token = canonicalize_url(link)
-        if not token or token in seen_links:
+        if not token or token in dedup_proof_links:
             continue
-        seen_links.add(token)
+        dedup_proof_links.append(token)
+        if len(dedup_proof_links) >= 2:
+            break
+    for link in unique_links:
+        token = canonicalize_url(link)
+        if not token or token in dedup_proof_links:
+            continue
         dedup_proof_links.append(token)
         if len(dedup_proof_links) >= 2:
             break
 
+    hook = (
+        f"If you're tracking {topic_text}, this update has concrete implementation signals."
+        if topic_text
+        else f"{item.title} has practical implementation details worth checking now."
+    )
+    cta = "Review the cited links, run quickstart commands, and validate before rollout."
+
     return {
         "topic": topic_text or None,
         "hook": _clean_sentence(hook, max_len=170),
-        "what_it_is": _clean_sentence(what_it_is, max_len=140),
+        "what_it_is": _clean_sentence(what_it_is, max_len=150),
         "why_now": _clean_sentence(_why_now(item), max_len=190),
-        "how_it_works": [_clean_fact_point(point, max_len=80) for point in how_it_works[:3]],
+        "how_it_works": [_clean_fact_point(point, max_len=88) for point in how_it_works[:3]],
         "proof": [_clean_fact_point(point, max_len=120) for point in proof[:2]],
         "proof_links": dedup_proof_links,
         "metrics": metrics,
-        "links": links,
+        "links": unique_links[:4],
+        "link_domains": link_domains[:4],
         "cta": _clean_sentence(cta, max_len=170),
     }
 

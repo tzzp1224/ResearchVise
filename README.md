@@ -1,6 +1,145 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
-## Changelog (Last Updated: 2026-02-18)
+## Changelog (Last Updated: 2026-02-19)
+### Commit: Topic Hard Gate + Bucket Coverage + Quality Trigger Expansion (New)
+- 本次目标：
+  - 修复 `topic="AI agent"` 场景的硬语义偏离，阻断 `CLIP/ViT/vision-only model card` 误入 Top picks。
+  - 引入子主题 bucket 覆盖与质量触发扩容，避免“凑满 top-k 但很水”。
+  - 增强诊断可观测：在 diagnosis 与 onepager header 直接显示 hard-match/quality-trigger 关键指标。
+- 实际改动：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/topic_profile.py`：
+    - 提供 `TopicProfile.for_topic(topic)`，内置 AI agent 专用 `hard_include_any`、`soft_boost/soft_penalty`、`source_filters` 与四类 bucket（Frameworks / Protocols & tool use / Ops & runtime / Evaluation）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - 增加 hard semantic gate：AI agent 话题下，未命中 `hard_include_any` 时 `relevance=0`。
+    - 增加 soft penalty：`clip/vit/diffusion/image classification` 等会显著降分。
+    - reasons 新增 `topic.hard_match/topic.hard_terms/topic.hard_gate_fail`，便于解释排序。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/planner.py`：
+    - planner 升级为 `ResearchPlanner`（deterministic）并预留 `LLMPlanner` 插槽（默认关闭）。
+    - AI agent 生成 bucket 查询计划，按 source 输出 bucket queries。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - 接入 `TopicProfile` + planner source-aware queries。
+    - attempt 诊断新增：`hard_match_terms_used/hard_match_pass_count/top_picks_min_relevance/top_picks_hard_match_count/quality_triggered_expansion`。
+    - TopK 选择新增 bucket 多样性软约束（优先覆盖 >=2 buckets）。
+    - 新增质量触发扩容：即使 top-k 数量已满，若 `min_relevance<0.75` 或 `hard_match_count<top_k` 或 `bucket_coverage<2`，继续进入下一 recall phase。
+    - 预留 `LLMEvidenceAuditor` 插槽（默认关闭）。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager header 新增 `HardMatchTermsUsed/HardMatchPassCount/TopPicksMinRelevance/TopPicksHardMatchCount/BucketCoverage/QualityTriggeredExpansion`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增门禁：`retrieval_attempt_quality_fields_present`、`onepager_relevance_summary_fields_present`。
+  - 测试更新：
+    - 新增 `tests/v2/test_topic_profile.py`。
+    - 新增 `tests/v2/test_quality_trigger_expansion.py`。
+    - 更新 `tests/v2/test_runtime_integration.py`、`tests/v2/test_planner.py`、`tests/v2/test_validate_artifacts_v2.py`。
+- LLM 插槽（默认 off）：
+  - `budget.use_llm_planner=true` 可切换到 `LLMPlanner`（当前为空实现，回落 deterministic）。
+  - `budget.use_llm_auditor=true` 可切换到 `LLMEvidenceAuditor`（当前为空实现，回落 deterministic）。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_planner_auditor > /tmp/ara_v2_smoke_planner_auditor/result.json`
+  - live：`OUT=\"/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)\"; mkdir -p \"$OUT\"; python main.py run-once --mode live --topic \"AI agent\" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > \"$OUT/result.json\"`
+  - validator：`python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 人工验收标准：
+  - Top picks 每条命中 `hard_include_any`（onepager header + reasons 可见 hard-match 线索）。
+  - bucket 覆盖 `>=2`。
+  - 不再出现 `CLIP/VIT/vision-only model card` 作为 `AI agent` Top pick。
+- 已知风险与回滚：
+  - 风险：硬门禁与质量扩容会提高候选不足概率，但能显著降低主题偏离。
+  - 风险：bucket 软约束会改变同分候选顺序，历史回放 Top picks 可能变化。
+  - 回滚：`git revert <this_commit_sha>`。
+
+### Commit: Planner + Evidence Auditor + Verifiable Facts (New)
+- 本次目标：
+  - 引入 deterministic `ResearchPlanner`，把 topic 扩展从“静态 expanded”升级为“可观测检索计划”。
+  - 引入 deterministic `EvidenceAuditor`，对证据弱/重复/单域自述候选做 reject/downgrade 并替补。
+  - 重构 facts 抽取为“section 优先 + 句子打分”，减少口号句，提升 WHAT/HOW 可验证性。
+- 实际改动：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/planner.py`：
+    - 输出 `RetrievalPlan`（queries/source_weights/source_limits/time_window_policy/must_include_terms/must_exclude_terms）。
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`：
+    - 输出 `evidence_audit.json`（verdict/reasons/evidence urls/duplicate ratio）。
+    - 对 top picks 执行 pass/downgrade/reject，并在 reject 时尝试替补候选。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - 接入 planner 生成 phase queries；plan 落盘到 `retrieval_diagnosis.json`。
+    - 召回尝试记录新增 `queries/must_include_terms/must_exclude_terms/deep_fetch_applied`。
+    - 新增轻量 deep extraction（HN/Web body 过短时二次抓取外链）并记录诊断。
+    - ranking 后接入 evidence auditor，落盘 `evidence_audit.json` 与 `run_context.evidence_audit_path`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`：
+    - topic-search connector 支持 planner 注入的 `queries/must_include_terms/must_exclude_terms`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - 新增 markdown section 解析与句子打分；优先 Features/Quickstart/Usage/How it works/Examples。
+    - `what_it_is/how_it_works/proof` 改为功能点优先，抑制宣言句/营销句。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager header 新增 `EvidenceAuditPath`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增门禁：`evidence_audit_parse_ok`、`top_picks_all_pass_or_downgrade_reason_present`、`citations_not_mostly_duplicate`、`onepager_evidence_audit_path_present`。
+  - 测试更新：
+    - 新增 `tests/v2/test_planner.py`、`tests/v2/test_evidence_auditor.py`。
+    - 更新 `tests/v2/test_runtime_integration.py`、`tests/v2/test_script_storyboard_prompt.py`、`tests/v2/test_validate_artifacts_v2.py`。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_planner_auditor > /tmp/ara_v2_smoke_planner_auditor/result.json`
+  - live：`OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - validator：`python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知风险与回滚：
+  - 风险：planner 引入 include/exclude 约束后，窄主题在弱网络环境可能更容易出现候选不足。
+  - 风险：auditor reject 规则变严后，live 场景 `top_k` 可能下降（但可解释性更高）。
+  - 回滚：`git revert <this_commit_sha>`。
+
+## Gap Assessment（2026-02-19 自审）
+- 漏斗解释（为什么用户仍感知“不相关/太少”）：
+  - `raw_items -> candidates -> filtered_by_relevance -> top_picks` 漏斗在 live 下会快速收缩；`retrieval_diagnosis.json` 可见每个 attempt 的 `raw_items/candidate_count/top_picks_count`。
+  - 常见掉队原因集中在 `drop_reason`: `low_relevance`、`low_density`、`no_evidence_links`、`too_old`，且在 `query` 不够细时会叠加触发。
+- facts/script 核心问题：
+  - 旧版 `facts.what_it_is/how_it_works` 仍会抽到宣言/观点句，功能点密度不足，导致“可读但不可证”。
+  - onepager 的模板复用较重，Top picks 间观感趋同，用户主观上会认为“像在凑数”。
+- 质量门禁缺口：
+  - validator 通过仅表示“结构完整”，不等于“产品可用”。
+  - 旧门禁缺少：facts 可验证性、证据多样性、引用片段重复率、子主题覆盖度的强约束。
+
+## 优先级计划（P0/P1）
+- P0：
+  - `ResearchPlanner`：topic 拆解、子主题召回、可观测 plan 落盘，解决粗粒度 query。
+  - `EvidenceAuditor`：证据质量/重复/单域自述审计，reject/downgrade 并替补。
+  - facts 抽取重构：section 优先 + 句子打分，保证 WHAT/HOW/PROOF 可验证。
+  - validator 升级：evidence audit 相关门禁 + citations 重复门禁。
+- P1：
+  - deep extraction 扩展：对 HN 外链短正文候选做低成本二次深抽取并重排。
+  - 子主题覆盖门禁：在 onepager 中显式检查 top picks 是否覆盖 planner 核心子主题。
+  - onepager 去模板同质化：在保持结构化的前提下提高每条 pick 的差异化表达。
+
+### Commit: Topic-First Retrieval + Recall Expansion Diagnosis (New)
+- 本次目标：
+  - 把 live 召回从“榜单优先”升级为“topic-first 优先”，并在候选不足时自动扩容召回范围。
+  - 为候选不足问题提供可观测诊断（attempt/phase/drop_reason），避免只能靠 onepager 肉眼排查。
+- 实际改动：
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/sources/connectors.py`：
+    - 新增 `fetch_github_topic_search` / `fetch_huggingface_search` / `fetch_hackernews_search`。
+    - 新增 topic 词扩展与时间窗解析（`today -> 3d`）能力，用于 recall expansion。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - 新增 `RecallProfile`、多阶段召回尝试（`base -> limit_x2 -> window_3d -> window_7d -> query_expanded`）。
+    - 每次尝试记录 connector 调用统计并落盘 `retrieval_diagnosis.json`。
+    - `run_context.retrieval` 新增扩容步骤与诊断路径，`ranking_stats` 新增 `selected_recall_phase/recall_attempt_count`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager header 新增 `RecallPhase` 与 `DiagnosisPath` 字段。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增诊断门禁：`retrieval_diagnosis_parse_ok`、`retrieval_diagnosis_attempts_present`、`retrieval_expansion_recorded`。
+    - 新增 onepager 诊断字段门禁：`onepager_diagnosis_path_present`。
+  - 修改测试：
+    - `tests/v2/test_runtime_integration.py` 新增“候选不足触发扩容补齐并写诊断”的集成测试。
+    - `tests/v2/test_validate_artifacts_v2.py` 新增诊断门禁断言。
+- 新增/删除文件：
+  - 无新增文件。
+  - 修改：`core/contracts.py`, `sources/connectors.py`, `pipeline_v2/runtime.py`, `pipeline_v2/report_export.py`, `scripts/validate_artifacts_v2.py`, `tests/v2/test_runtime_integration.py`, `tests/v2/test_validate_artifacts_v2.py`, `README.md`
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python scripts/e2e_smoke_v2.py --out-dir /tmp/ara_v2_smoke_recall > /tmp/ara_v2_smoke_recall/result.json`
+  - `python - <<'PY'\nimport json,pathlib,subprocess\np=pathlib.Path('/tmp/ara_v2_smoke_recall/result.json')\nd=json.loads(p.read_text())\nrun_dir=next(pathlib.Path(a['path']).parent for a in d['artifacts'] if a['type']=='script')\nrender_dir=next(pathlib.Path(a['path']).parent for a in d['artifacts'] if a['type']=='mp4')\nsubprocess.run(['python','scripts/validate_artifacts_v2.py','--run-dir',str(run_dir),'--render-dir',str(render_dir)],check=True)\nprint('diagnosis=',run_dir/'retrieval_diagnosis.json')\nPY`
+  - live（需网络）：`OUT=\"/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)\"; mkdir -p \"$OUT\"; python main.py run-once --mode live --topic \"AI agent\" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > \"$OUT/result.json\"`
+- 已知风险与回滚：
+  - 风险：网络受限时 live topic-search connector 会全部失败，run 会报 `no live items fetched from connectors`（不会自动回退 smoke）。
+  - 风险：召回扩容增加了 connector 调用次数，外部 API 限流概率上升。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: P1 Facts Cleanup + Local Asset-Driven Shots (New)
 - 本次目标：
   - 消除 facts/script/storyboard 中的 URL 碎片与 quote 残留，提升口播与分镜可读性。

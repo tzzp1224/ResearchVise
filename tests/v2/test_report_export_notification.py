@@ -59,6 +59,7 @@ def test_generate_onepager_thumbnail_and_export_package(tmp_path: Path) -> None:
     content = Path(onepager).read_text(encoding="utf-8")
     assert "Top Picks" in content
     assert "RequestedTopK" in content
+    assert "EvidenceAuditPath" in content
     assert "Source Domain" in content
     assert "#### Compact Brief" in content
     assert "#### Citations" in content

@@ -192,6 +192,99 @@ def _relaxed_connectors() -> dict:
     }
 
 
+def _expansion_connectors() -> dict:
+    low_body = ("frontend dashboard widgets and css theme updates for infra console. " * 24).strip()
+    agent_body_github = (
+        "ai agent orchestration workflow with tool calling and mcp session planning. "
+        "quickstart includes cli usage and benchmark results. "
+        "docs https://docs.example/agent runtime notes https://news.ycombinator.com/item?id=77 "
+    ) * 18
+    agent_body_hf = (
+        "agent training toolkit with eval dashboard and reproducible workflow examples. "
+        "usage card has install command and inference benchmark table. "
+        "card https://huggingface.co/acme/agent-toolkit discussion https://news.ycombinator.com/item?id=88 "
+    ) * 18
+    agent_body_hn = (
+        "production incident review for autonomous agent tool routing and rollback strategy. "
+        "thread includes score deltas and failure pattern comparison. "
+        "context https://news.ycombinator.com/item?id=77 docs https://acme.dev/agent-case-study "
+    ) * 18
+
+    async def _github_topic_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False):
+        _ = topic, limit, expanded
+        if time_window == "today":
+            return [
+                RawItem(
+                    id="exp_low_gh",
+                    source="github",
+                    title="infra dashboard theme pack",
+                    url="https://github.com/acme/dashboard-theme",
+                    body=low_body,
+                    tier="A",
+                    metadata={"stars": 320, "item_type": "repo"},
+                )
+            ]
+        return [
+            RawItem(
+                    id="exp_gh",
+                    source="github",
+                    title="agent orchestrator runtime",
+                    url="https://github.com/acme/agent-orchestrator",
+                    body=agent_body_github,
+                    tier="A",
+                    metadata={"stars": 1800, "item_type": "repo", "updated_at": "2026-02-17T10:00:00Z"},
+                )
+            ]
+
+    async def _hf_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False):
+        _ = topic, limit, expanded
+        if time_window == "today":
+            return []
+        return [
+            RawItem(
+                id="exp_hf",
+                source="huggingface",
+                title="agent workflow toolkit",
+                url="https://huggingface.co/acme/agent-toolkit",
+                body=agent_body_hf,
+                tier="A",
+                metadata={"downloads": 4200, "likes": 190, "item_type": "model", "last_modified": "2026-02-16T08:00:00Z"},
+            )
+        ]
+
+    async def _hn_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False):
+        _ = topic, limit, expanded
+        if time_window == "today":
+            return []
+        return [
+            RawItem(
+                id="exp_hn",
+                source="hackernews",
+                title="Agent tool-calling lessons from production",
+                url="https://news.ycombinator.com/item?id=77",
+                body=agent_body_hn,
+                tier="A",
+                metadata={"points": 210, "comment_count": 58, "item_type": "story"},
+            )
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _github_topic_search,
+        "fetch_huggingface_search": _hf_search,
+        "fetch_hackernews_search": _hn_search,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
 def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
     render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
@@ -258,6 +351,11 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert "top_why_ranked" in run_context_payload["ranking_stats"]
     assert "connector_stats" in run_context_payload
     assert "extraction_stats" in run_context_payload
+    assert "retrieval" in run_context_payload
+    assert Path(str(run_context_payload["retrieval"].get("diagnosis_path") or "")).exists()
+    assert Path(str(run_context_payload["retrieval"].get("evidence_audit_path") or "")).exists()
+    assert (run_dir / "retrieval_diagnosis.json").exists()
+    assert (run_dir / "evidence_audit.json").exists()
 
     materials_payload = json.loads((run_dir / "materials.json").read_text(encoding="utf-8"))
     assert materials_payload["screenshot_plan"]
@@ -279,6 +377,10 @@ def test_runrequest_to_sync_artifacts_and_async_render(tmp_path: Path) -> None:
     assert "DataMode: `live`" in onepager_text
     assert "CandidateCount: `" in onepager_text
     assert "FilteredByRelevance: `" in onepager_text
+    assert "EvidenceAuditPath" in onepager_text
+    assert "HardMatchPassCount" in onepager_text
+    assert "TopPicksMinRelevance" in onepager_text
+    assert "QualityTriggeredExpansion" in onepager_text
 
     render_status = runtime.process_next_render()
     assert render_status is not None
@@ -332,3 +434,67 @@ def test_runtime_adaptive_relevance_relaxation_and_diversity(tmp_path: Path) -> 
     onepager = (run_dir / "onepager.md").read_text(encoding="utf-8")
     assert "TopicRelevanceThresholdUsed" in onepager
     assert "RelevanceRelaxationSteps" in onepager
+
+
+def test_runtime_recall_expansion_selects_window_3d_and_records_diagnosis(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_expansion_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_expand",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="today",
+            tz="UTC",
+            budget={"top_k": 3, "include_tier_b": False},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_expand:ai-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    run_context = json.loads((run_dir / "run_context.json").read_text(encoding="utf-8"))
+    ranking = dict(run_context.get("ranking_stats") or {})
+    retrieval = dict(run_context.get("retrieval") or {})
+    diagnosis = json.loads((run_dir / "retrieval_diagnosis.json").read_text(encoding="utf-8"))
+    evidence_audit = json.loads((run_dir / "evidence_audit.json").read_text(encoding="utf-8"))
+
+    assert int(ranking.get("requested_top_k", 0)) == 3
+    assert int(ranking.get("top_picks_count", 0)) >= 2
+    assert str(ranking.get("selected_recall_phase") or "") in {"window_3d", "window_7d", "query_expanded"}
+    assert int(ranking.get("recall_attempt_count", 0)) >= 3
+    assert len(list(retrieval.get("expansion_steps") or [])) >= 1
+    assert int(retrieval.get("attempt_count", 0) or 0) >= 3
+    assert str(diagnosis.get("selected_phase") or "") == str(retrieval.get("selected_phase") or "")
+    assert len(list(diagnosis.get("attempts") or [])) >= 3
+    assert any(bool(item.get("expansion_applied")) for item in list(diagnosis.get("attempts") or []))
+    assert isinstance(diagnosis.get("plan"), dict)
+    assert "quality_triggered_expansion" in diagnosis
+    assert "hard_match_terms_used" in diagnosis
+    assert "top_picks_min_relevance" in diagnosis
+    assert "top_picks_hard_match_count" in diagnosis
+    attempts = list(diagnosis.get("attempts") or [])
+    required_attempt_fields = {
+        "hard_match_terms_used",
+        "hard_match_pass_count",
+        "top_picks_min_relevance",
+        "top_picks_hard_match_count",
+        "quality_triggered_expansion",
+    }
+    assert all(required_attempt_fields.issubset(set(dict(item).keys())) for item in attempts)
+    assert any(bool(item.get("quality_triggered_expansion")) for item in attempts)
+    base_attempt = next((item for item in attempts if str(item.get("phase")) == "base"), {})
+    expanded_attempt = next((item for item in attempts if str(item.get("phase")) == "query_expanded"), {})
+    base_queries = {str(q).strip().lower() for q in list(base_attempt.get("queries") or []) if str(q).strip()}
+    expanded_queries = {str(q).strip().lower() for q in list(expanded_attempt.get("queries") or []) if str(q).strip()}
+    if expanded_queries:
+        assert expanded_queries != base_queries
+    assert list(evidence_audit.get("records") or [])
