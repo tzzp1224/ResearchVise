@@ -454,8 +454,72 @@ def _best_attempt_regression_connectors() -> dict:
 
     return {
         "fetch_github_topic_search": _github_topic_search,
+        "fetch_github_query_fallback": _none,
         "fetch_huggingface_search": _none,
         "fetch_hackernews_search": _hn_search,
+        "fetch_github_trending": _none,
+        "fetch_huggingface_trending": _none,
+        "fetch_hackernews_top": _none,
+        "fetch_github_releases": _none,
+        "fetch_rss_feed": _none,
+        "fetch_web_article": _none,
+    }
+
+
+def _timeout_then_recover_connectors() -> dict:
+    state = {"calls": 0}
+    fallback_body = (
+        "AI agent resources roundup with references and curated links.\n"
+        "https://example.com/agent-resource-1\n"
+        "https://example.com/agent-resource-2\n"
+    ) * 6
+    strong_body = (
+        "AI agent orchestration runtime with MCP tool calling and production workflow.\n"
+        "Quickstart: pip install acme-agent && acme-agent run demo.\n"
+        "Docs: https://docs.acme.dev/agent-runtime\n"
+        "Release: https://github.com/acme/agent-runtime/releases/tag/v1.2.0\n"
+    ) * 14
+
+    async def _github_topic_search(topic: str, time_window: str = "today", limit: int = 20, expanded: bool = False, **kwargs):
+        _ = topic, time_window, limit, expanded, kwargs
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise asyncio.TimeoutError("forced timeout")
+        return [
+            RawItem(
+                id="gh_recovered",
+                source="github",
+                title="acme/agent-runtime",
+                url="https://github.com/acme/agent-runtime",
+                body=strong_body,
+                tier="A",
+                metadata={"stars": 2600, "forks": 320, "item_type": "repo", "updated_at": "2026-02-19T08:00:00Z"},
+            )
+        ]
+
+    async def _github_fallback(topic: str, time_window: str = "today", limit: int = 20, **kwargs):
+        _ = topic, time_window, limit, kwargs
+        return [
+            RawItem(
+                id="gh_fallback",
+                source="github",
+                title="acme/agent-resources",
+                url="https://github.com/acme/agent-resources",
+                body=fallback_body,
+                tier="A",
+                metadata={"stars": 90, "forks": 12, "item_type": "repo", "updated_at": "2026-02-18T08:00:00Z"},
+            )
+        ]
+
+    async def _none(*args, **kwargs):
+        _ = args, kwargs
+        return []
+
+    return {
+        "fetch_github_topic_search": _github_topic_search,
+        "fetch_github_query_fallback": _github_fallback,
+        "fetch_huggingface_search": _none,
+        "fetch_hackernews_search": _none,
         "fetch_github_trending": _none,
         "fetch_huggingface_trending": _none,
         "fetch_hackernews_top": _none,
@@ -869,6 +933,44 @@ def test_runtime_prefers_best_attempt_when_late_phase_degrades(tmp_path: Path) -
     assert int(ranking.get("top_picks_count", 0) or 0) >= 1
     assert any("selected_from_best_attempt" in str(reason) for reason in list(ranking.get("quality_trigger_reasons") or []))
     assert int(diagnosis.get("selected_attempt", 0) or 0) < len(list(diagnosis.get("attempts") or []))
+
+
+def test_runtime_skips_key_timeout_attempt_when_non_timeout_attempt_exists(tmp_path: Path) -> None:
+    orchestrator = RunOrchestrator(store=InMemoryRunStore(), queue=InMemoryRunQueue())
+    render_manager = RenderManager(renderer_adapter=AlwaysSuccessAdapter(), work_dir=tmp_path / "render")
+    runtime = RunPipelineRuntime(
+        orchestrator=orchestrator,
+        render_manager=render_manager,
+        output_root=tmp_path / "runs",
+        connector_overrides=_timeout_then_recover_connectors(),
+    )
+
+    run_id = orchestrator.enqueue_run(
+        RunRequest(
+            user_id="u_timeout_gate",
+            mode=RunMode.ONDEMAND,
+            topic="AI agent",
+            time_window="today",
+            tz="UTC",
+            budget={"top_k": 1, "include_tier_b": False, "render_enabled": False, "connector_timeout_sec": 0.5},
+            output_targets=["web"],
+        ),
+        idempotency_key="u_timeout_gate:ai-agent",
+    )
+    result = runtime.run_next()
+    assert result is not None
+    run_dir = Path(result.output_dir)
+    diagnosis = json.loads((run_dir / "retrieval_diagnosis.json").read_text(encoding="utf-8"))
+    attempts = list(diagnosis.get("attempts") or [])
+    assert len(attempts) >= 2
+    assert bool(attempts[0].get("has_key_connector_timeout"))
+    selected_attempt_idx = int(diagnosis.get("selected_attempt", 1) or 1) - 1
+    assert selected_attempt_idx >= 1
+    selected_attempt = dict(attempts[selected_attempt_idx] or {})
+    assert bool(selected_attempt.get("has_key_connector_timeout")) is False
+    assert bool(diagnosis.get("selected_attempt_has_key_connector_timeout")) is False
+    assert bool(diagnosis.get("all_attempts_key_connector_timeout")) is False
+    assert any(bool(item.get("fallback_used")) for item in attempts)
 
 
 def test_selection_priority_vector_prefers_quality_complete_attempt() -> None:

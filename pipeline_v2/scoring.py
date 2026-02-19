@@ -136,6 +136,98 @@ _AGENT_HIGH_VALUE_TERMS = {
     "plan-and-execute",
     "task decomposition",
 }
+_AGENT_EVIDENCE_SIGNAL_TERMS = {
+    "quickstart",
+    "demo",
+    "benchmark",
+    "tool calling",
+    "function calling",
+    "orchestration",
+    "mcp",
+    "langgraph",
+    "autogen",
+    "crewai",
+    "agent runtime",
+}
+
+
+def _parse_window_days(window: Optional[str]) -> int:
+    token = str(window or "").strip().lower()
+    if not token:
+        return 1
+    if token == "today":
+        return 1
+    if token.endswith("d"):
+        try:
+            return max(1, int(token[:-1]))
+        except Exception:
+            return 3
+    if token.endswith("h"):
+        try:
+            return max(1, int((int(token[:-1]) + 23) // 24))
+        except Exception:
+            return 1
+    if token in {"past_week", "last_week", "weekly"}:
+        return 7
+    if token in {"past_month", "monthly"}:
+        return 30
+    return 3
+
+
+def _activity_signals(item: NormalizedItem, *, recall_window: Optional[str]) -> Dict[str, float]:
+    metadata = dict(item.metadata or {})
+    quality = _quality_signals(item)
+    update_days_raw = quality.get("update_recency_days")
+    update_days = float(update_days_raw) if update_days_raw not in (None, "", "unknown") else None
+    stars = float(metadata.get("stars", 0) or 0)
+    forks = float(metadata.get("forks", 0) or 0)
+    points = float(metadata.get("points", 0) or 0)
+    comments = float(metadata.get("comment_count", metadata.get("comments", 0)) or 0)
+    downloads = float(metadata.get("downloads", 0) or 0)
+    engagement = stars + forks * 2.5 + points * 3.0 + comments * 2.5 + downloads / 220.0
+    engagement_score = _clamp01(math.log10(1.0 + max(0.0, engagement)) / 3.3)
+
+    recent_update_signal = 0.0
+    if update_days is not None:
+        if update_days <= 2:
+            recent_update_signal = 1.0
+        elif update_days <= 7:
+            recent_update_signal = 0.85
+        elif update_days <= 14:
+            recent_update_signal = 0.65
+        elif update_days <= 30:
+            recent_update_signal = 0.4
+        else:
+            recent_update_signal = 0.15
+
+    window_days = _parse_window_days(recall_window)
+    # Keep star separation meaningful in 7d mode; avoid saturating mid-star repos to ~1.0.
+    stars_delta_proxy = _clamp01((math.log10(1.0 + max(0.0, stars)) / 4.2) * (0.45 + 0.55 * recent_update_signal))
+
+    boost = 0.0
+    if window_days >= 7:
+        if update_days is not None and update_days <= 7:
+            boost += 0.07
+        elif update_days is not None and update_days > 21:
+            boost -= 0.04
+    if engagement_score >= 0.62:
+        boost += 0.03
+    elif engagement_score <= 0.2:
+        boost -= 0.02
+    if window_days >= 7:
+        boost += (stars_delta_proxy - 0.55) * 0.08
+        if stars_delta_proxy < 0.35:
+            boost -= 0.03
+    else:
+        boost += (stars_delta_proxy - 0.5) * 0.04
+
+    return {
+        "recent_update_signal": round(float(recent_update_signal), 4),
+        "stars_delta_proxy": round(float(stars_delta_proxy), 4),
+        "engagement_signal": round(float(engagement_score), 4),
+        "boost": round(float(max(-0.1, min(0.12, boost))), 4),
+        "window_days": float(window_days),
+    }
 
 
 def _topic_tokens(topic: Optional[str]) -> List[str]:
@@ -156,20 +248,20 @@ def _has_token(text: str, token: str) -> bool:
 
 
 def _contains_term(text: str, term: str) -> bool:
-    payload = str(text or "").lower()
+    payload = re.sub(r"[-_/]+", " ", str(text or "").lower())
     token = str(term or "").strip().lower()
     if not payload or not token:
         return False
-    pattern = r"\b" + re.escape(token).replace(r"\ ", r"\s+") + r"\b"
+    pattern = r"\b" + re.escape(token).replace(r"\ ", r"[\s\-_]+") + r"\b"
     return re.search(pattern, payload) is not None
 
 
 def _contains_negated_term(text: str, term: str) -> bool:
-    payload = str(text or "").lower()
+    payload = re.sub(r"[-_/]+", " ", str(text or "").lower())
     token = str(term or "").strip().lower()
     if not payload or not token:
         return False
-    term_pattern = re.escape(token).replace(r"\ ", r"\s+")
+    term_pattern = re.escape(token).replace(r"\ ", r"[\s\-_]+")
     pattern = r"\b(?:no|not|without|lack|lacks|lacking)\s+(?:[a-z0-9_-]+\s+){0,2}" + term_pattern + r"\b"
     return re.search(pattern, payload) is not None
 
@@ -256,20 +348,29 @@ def evaluate_relevance(
                 agent_high_value_hits.append(term)
 
         has_high_value = bool(agent_high_value_hits)
-        high_value_count = len(
-            {str(term).strip().lower() for term in agent_high_value_hits if str(term).strip()}
-        )
+        high_value_count = len({str(term).strip().lower() for term in agent_high_value_hits if str(term).strip()})
         non_generic_count = len({str(term).strip().lower() for term in agent_non_generic_hits if str(term).strip()})
-        has_semantic_depth = bool(has_high_value or non_generic_count >= 1 or has_bucket_signal)
+        evidence_signal_hits = [
+            term
+            for term in list(_AGENT_EVIDENCE_SIGNAL_TERMS)
+            if _contains_term(topic_text, term) and not _contains_negated_term(topic_text, term)
+        ]
+        has_evidence_signal = bool(evidence_signal_hits)
+        has_semantic_depth = bool(
+            high_value_count >= 2
+            or (high_value_count >= 1 and has_evidence_signal)
+            or non_generic_count >= 2
+            or has_bucket_signal
+        )
         if score >= 0.75 and not has_semantic_depth:
             score = 0.74
-            agent_score_cap = "cap_lt_0.75_requires_semantic_depth"
-        elif score >= 0.85 and not (has_high_value or non_generic_count >= 2):
-            score = 0.84
-            agent_score_cap = "cap_lt_0.85_requires_non_generic_or_high_value"
-        elif score >= 0.9 and not (has_high_value and non_generic_count >= 2):
-            score = 0.89
-            agent_score_cap = "cap_lt_0.9_requires_high_value_and_non_generic_depth"
+            agent_score_cap = "cap_lt_0.75_requires_high_value_or_depth"
+        elif score > 0.85 and not (high_value_count >= 1 and has_evidence_signal):
+            score = 0.85
+            agent_score_cap = "cap_0.85_requires_high_value_plus_evidence_signal"
+        elif score > 0.9 and not (high_value_count >= 2 and has_evidence_signal):
+            score = 0.9
+            agent_score_cap = "cap_0.90_requires_two_high_value_terms_plus_evidence_signal"
 
         signals = _quality_signals(item)
         metadata = dict(item.metadata or {})
@@ -290,28 +391,35 @@ def evaluate_relevance(
             or cross_source_corroborated
         )
         body_len = int(_to_float((item.metadata or {}).get("body_len"), len(str(item.body_md or ""))))
+        update_recency_days = signals["update_recency_days"]
         has_verifiable_content_signal = bool(
-            float(signals["content_density"]) >= 0.14
+            float(signals["content_density"]) >= 0.18
             or bool(signals["has_quickstart"])
             or bool(signals["has_results_or_bench"])
             or re.search(r"\b(quickstart|benchmark|result|usage|cli|api|workflow)\b", topic_text)
         )
+        has_update_or_hot_signal = bool(
+            (update_recency_days is not None and float(update_recency_days) <= 7.0)
+            or has_engagement_signal
+        )
         if (
-            has_high_value
-            and (high_value_count >= 2 or non_generic_count >= 2)
+            high_value_count >= 2
             and has_verifiable_content_signal
+            and has_update_or_hot_signal
             and float(signals["content_density"]) >= 0.18
             and body_len >= 500
-            and has_engagement_signal
-            and score >= 0.94
+            and score >= 0.93
         ):
             score = 1.0
         else:
-            score = min(score, 0.93)
-            if not has_engagement_signal and score >= 0.89:
-                agent_score_cap = "cap_lt_1.0_requires_engagement_or_cross_source"
-            elif not agent_score_cap and score >= 0.93:
-                agent_score_cap = "cap_lt_1.0_requires_high_value_plus_verifiable_content"
+            if high_value_count >= 2 and (has_verifiable_content_signal or has_update_or_hot_signal):
+                score = min(score, 0.9)
+                if not agent_score_cap and score >= 0.9:
+                    agent_score_cap = "cap_0.90_requires_full_triplet_for_1.0"
+            else:
+                score = min(score, 0.85)
+                if not agent_score_cap and score >= 0.85:
+                    agent_score_cap = "cap_0.85_requires_strong_high_value_and_activity_signals"
 
     return {
         "score": score,
@@ -444,6 +552,7 @@ def rank_items(
     topic: Optional[str] = None,
     topic_profile: Optional[TopicProfile] = None,
     relevance_threshold: float = 0.55,
+    recall_window: Optional[str] = None,
 ) -> List[RankedItem]:
     """Rank items with explainable subscores and Tier B top3 gate."""
     staged = []
@@ -469,6 +578,9 @@ def rank_items(
         agent_score_cap = str(relevance_payload.get("agent_score_cap") or "").strip()
         cross_source_bonus = max(0.0, min(0.08, _to_float((item.metadata or {}).get("cross_source_bonus"), 0.0)))
         repeat_penalty = max(0.0, min(0.16, _to_float((item.metadata or {}).get("recent_topic_repeat_penalty"), 0.0)))
+        if _parse_window_days(recall_window) >= 7:
+            # Keep anti-repetition, but avoid overwhelming true trending/high-signal repos in weekly mode.
+            repeat_penalty = min(0.08, repeat_penalty * 0.5)
         repeat_count = int(max(0.0, _to_float((item.metadata or {}).get("recent_topic_pick_count"), 0.0)))
         corroboration_sources = [
             str(value).strip()
@@ -494,6 +606,12 @@ def rank_items(
             "credibility": score_credibility(item),
             "visual_assets": score_visual_assets(item),
         }
+        activity = _activity_signals(item, recall_window=recall_window)
+        metadata = dict(item.metadata or {})
+        metadata["recent_update_signal"] = float(activity["recent_update_signal"])
+        metadata["stars_delta_proxy"] = float(activity["stars_delta_proxy"])
+        metadata["activity_signal_boost"] = float(activity["boost"])
+        item.metadata = metadata
         total = _weighted_total(scores)
         total = _clamp01(total * (0.5 + 0.5 * relevance_score))
         quality_boost = _quality_signal_boost(item)
@@ -508,6 +626,7 @@ def rank_items(
             total = _clamp01(total * 0.45)
         else:
             total = _clamp01(total + quality_boost)
+        total = _clamp01(total + float(activity["boost"]))
         if cross_source_bonus > 0:
             total = _clamp01(total + cross_source_bonus)
         if repeat_penalty > 0:
@@ -544,6 +663,7 @@ def rank_items(
                 repeat_penalty,
                 repeat_count,
                 corroboration_sources,
+                activity,
             )
         )
 
@@ -579,6 +699,7 @@ def rank_items(
             _repeat_penalty,
             _repeat_count,
             _corroboration_sources,
+            _activity,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -615,9 +736,10 @@ def rank_items(
         agent_score_cap,
         cross_source_bonus,
         repeat_penalty,
-        repeat_count,
-        corroboration_sources,
-    ) in enumerate(ordered, start=1):
+            repeat_count,
+            corroboration_sources,
+            activity,
+        ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
             f"talkability={scores['talkability']:.2f}",
@@ -634,6 +756,9 @@ def rank_items(
             f"topic.hard_match={'pass' if hard_match_pass else 'deferred'}",
             f"topic.hard_terms={','.join(hard_terms) if hard_terms else 'none'}",
             f"quality.boost={quality_boost:.2f}",
+            f"activity.recent_update_signal={float(activity['recent_update_signal']):.2f}",
+            f"activity.stars_delta_proxy={float(activity['stars_delta_proxy']):.2f}",
+            f"activity.boost={float(activity['boost']):.2f}",
         ]
         if boost_terms:
             reasons.append(f"topic.soft_boost_terms={','.join(boost_terms)}")

@@ -79,6 +79,11 @@ class RecallProfile:
 class RunPipelineRuntime:
     """Worker runtime that executes queued runs and dispatches render jobs."""
 
+    _KEY_TIMEOUT_CONNECTORS = {"fetch_github_topic_search"}
+    _KEY_CONNECTOR_TIMEOUT_PENALTY = 2500.0
+    _CONNECTOR_TIMEOUT_PENALTY = 800.0
+    _CONNECTOR_ERROR_PENALTY = 350.0
+
     def __init__(
         self,
         *,
@@ -208,6 +213,8 @@ class RunPipelineRuntime:
         selected: Optional[Dict[str, Any]] = None
         best_selected: Optional[Dict[str, Any]] = None
         best_priority_vector: tuple[float, ...] = tuple()
+        best_non_timeout_selected: Optional[Dict[str, Any]] = None
+        best_non_timeout_priority_vector: tuple[float, ...] = tuple()
         quality_triggered_any = False
         recent_topic_entity_counts = self._recent_topic_entity_counts(topic=topic_value, data_mode=data_mode)
 
@@ -245,6 +252,7 @@ class RunPipelineRuntime:
                 topic_profile=topic_profile,
                 data_mode=data_mode,
                 top_count=top_count,
+                recall_window=str((collect_diag.get("profile") or {}).get("window") or profile.window),
             )
             ranked = list(rank_pack["ranked"] or [])
             relevance_eligible = list(rank_pack["relevance_eligible"] or [])
@@ -293,6 +301,19 @@ class RunPipelineRuntime:
             selected_pass_count = int(
                 sum(1 for verdict in list((final_outcome.selected_verdicts or {}).values()) if str(verdict).strip().lower() == "pass")
             )
+            attempt_failures = self._attempt_failures(collect_diag)
+            timeout_penalty, has_timeout, has_key_connector_timeout = self._attempt_timeout_penalty(attempt_failures)
+            fallback_used_now = bool(collect_diag.get("fallback_used"))
+            if has_key_connector_timeout and has_next_attempt and "key_connector_timeout" not in quality_reasons:
+                quality_reasons.append("key_connector_timeout")
+            forced_timeout_expansion = bool(has_key_connector_timeout and has_next_attempt)
+            quality_triggered_expansion = bool((expansion_decision.should_expand or forced_timeout_expansion) and has_next_attempt)
+            quality_triggered_any = bool(quality_triggered_any or quality_triggered_expansion)
+            attempt_explain = self._attempt_failure_explain(
+                attempt_failures,
+                timeout_penalty=float(timeout_penalty),
+                fallback_used=fallback_used_now,
+            )
 
             attempt_payload = {
                 "attempt": idx,
@@ -307,6 +328,12 @@ class RunPipelineRuntime:
                 "relevance_threshold_used": float(rank_pack["relevance_threshold"]),
                 "relaxation_steps": int(rank_pack["relaxation_steps"]),
                 "connector_calls": list(collect_diag.get("connector_calls") or []),
+                "failures": list(attempt_failures),
+                "has_timeout": bool(has_timeout),
+                "has_key_connector_timeout": bool(has_key_connector_timeout),
+                "fallback_used": bool(fallback_used_now),
+                "fallback_details": list(collect_diag.get("fallback_details") or []),
+                "timeout_penalty": float(timeout_penalty),
                 "queries": list(collect_diag.get("queries") or []),
                 "must_include_terms": list(collect_diag.get("must_include_terms") or []),
                 "must_exclude_terms": list(collect_diag.get("must_exclude_terms") or []),
@@ -333,6 +360,7 @@ class RunPipelineRuntime:
                 "quality_trigger_reasons": list(quality_reasons),
                 "quality_deficit_count": int(len(quality_reasons)),
                 "selection_quality_ok": bool(not quality_reasons),
+                "explain": list(attempt_explain),
                 "selected_item_ids": [
                     str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "")
                     for row in list(picks or [])
@@ -342,7 +370,6 @@ class RunPipelineRuntime:
                 "next_phase_reason": list(quality_reasons),
                 "expansion_applied": idx > 1,
             }
-            attempts.append(attempt_payload)
 
             attempt_selection_payload = {
                 "raw_items": raw_items,
@@ -358,60 +385,94 @@ class RunPipelineRuntime:
                 "audit_records": audit_records,
                 "selection_priority": float("-inf"),
                 "selection_priority_vector": tuple(),
+                "has_key_connector_timeout": bool(has_key_connector_timeout),
+                "has_timeout": bool(has_timeout),
+                "failures": list(attempt_failures),
+                "fallback_used": bool(fallback_used_now),
+                "timeout_penalty": float(timeout_penalty),
             }
-            if picks:
-                attempt_priority_vector = self._selection_priority_vector(
-                    picks=picks,
-                    quality_snapshot=quality_snapshot,
-                    selected_pass_count=selected_pass_count,
-                    selected_downgrade_count=selected_downgrade_count,
-                    pass_ratio=float(final_outcome.pass_ratio),
-                    quality_reasons=quality_reasons,
-                )
-                attempt_priority = (
-                    self._selection_priority(picks=picks, quality_snapshot=quality_snapshot)
-                    + float(selected_pass_count) * 200.0
-                    + float(final_outcome.pass_ratio) * 20.0
-                    - float(selected_downgrade_count) * 25.0
-                )
-                attempt_selection_payload["selection_priority"] = float(attempt_priority)
-                attempt_selection_payload["selection_priority_vector"] = tuple(attempt_priority_vector)
-                if best_selected is None or tuple(attempt_priority_vector) > tuple(best_priority_vector):
-                    best_selected = dict(attempt_selection_payload)
-                    best_priority_vector = tuple(attempt_priority_vector)
+            attempt_priority_vector = self._selection_priority_vector(
+                picks=picks,
+                quality_snapshot=quality_snapshot,
+                selected_pass_count=selected_pass_count,
+                selected_downgrade_count=selected_downgrade_count,
+                pass_ratio=float(final_outcome.pass_ratio),
+                quality_reasons=quality_reasons,
+                has_key_connector_timeout=bool(has_key_connector_timeout),
+                timeout_penalty=float(timeout_penalty),
+                fallback_used=bool(fallback_used_now),
+            )
+            attempt_priority = (
+                self._selection_priority(picks=picks, quality_snapshot=quality_snapshot)
+                + float(selected_pass_count) * 200.0
+                + float(final_outcome.pass_ratio) * 20.0
+                - float(selected_downgrade_count) * 25.0
+                - float(timeout_penalty)
+            )
+            if not picks:
+                attempt_priority -= 120.0
+            attempt_selection_payload["selection_priority"] = float(attempt_priority)
+            attempt_selection_payload["selection_priority_vector"] = tuple(attempt_priority_vector)
+            attempt_payload["attempt_quality_score"] = float(attempt_priority)
+            attempts.append(attempt_payload)
+
+            if best_selected is None or tuple(attempt_priority_vector) > tuple(best_priority_vector):
+                best_selected = dict(attempt_selection_payload)
+                best_priority_vector = tuple(attempt_priority_vector)
+            if (not has_key_connector_timeout) and (
+                best_non_timeout_selected is None or tuple(attempt_priority_vector) > tuple(best_non_timeout_priority_vector)
+            ):
+                best_non_timeout_selected = dict(attempt_selection_payload)
+                best_non_timeout_priority_vector = tuple(attempt_priority_vector)
 
             if quality_triggered_expansion:
                 continue
 
+            if has_key_connector_timeout and has_next_attempt:
+                continue
+
             selected = dict(attempt_selection_payload)
-            if picks:
+            if picks and not has_key_connector_timeout:
                 break
 
-        if selected is None and best_selected is not None:
-            selected = dict(best_selected)
-            reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
-            if "selected_from_best_attempt" not in reasons:
-                reasons.append("selected_from_best_attempt")
-            selected["quality_reasons"] = reasons
+        all_attempts_key_timeout = bool(attempts) and all(
+            bool(dict(item or {}).get("has_key_connector_timeout")) for item in list(attempts or [])
+        )
+
+        def _append_quality_reason(payload: Dict[str, Any], token: str) -> Dict[str, Any]:
+            out = dict(payload or {})
+            reasons = [str(value) for value in list(out.get("quality_reasons") or []) if str(value).strip()]
+            if token not in reasons:
+                reasons.append(token)
+            out["quality_reasons"] = reasons
+            return out
+
+        if selected is None:
+            if best_non_timeout_selected is not None:
+                selected = _append_quality_reason(dict(best_non_timeout_selected), "selected_from_best_non_timeout_attempt")
+                selected = _append_quality_reason(dict(selected), "selected_from_best_attempt")
+            elif best_selected is not None:
+                selected = _append_quality_reason(dict(best_selected), "selected_from_best_attempt")
 
         if selected is None:
             raise RuntimeError("no relevant ranked items available")
 
-        if best_selected is not None:
-            selected_priority = float(selected.get("selection_priority", float("-inf")) or float("-inf"))
-            selected_priority_vector = tuple(selected.get("selection_priority_vector") or ())
-            if tuple(best_priority_vector) > tuple(selected_priority_vector):
-                selected = dict(best_selected)
-                reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
-                if "selected_from_best_attempt" not in reasons:
-                    reasons.append("selected_from_best_attempt")
-                selected["quality_reasons"] = reasons
-            elif float(best_selected.get("selection_priority", float("-inf")) or float("-inf")) > selected_priority + 1e-9:
-                selected = dict(best_selected)
-                reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
-                if "selected_from_best_attempt" not in reasons:
-                    reasons.append("selected_from_best_attempt")
-                selected["quality_reasons"] = reasons
+        selected_priority_vector = tuple(selected.get("selection_priority_vector") or ())
+        selected_has_key_timeout = bool(selected.get("has_key_connector_timeout"))
+        if best_non_timeout_selected is not None:
+            if selected_has_key_timeout or tuple(best_non_timeout_priority_vector) > tuple(selected_priority_vector):
+                selected = _append_quality_reason(dict(best_non_timeout_selected), "selected_from_best_non_timeout_attempt")
+                selected = _append_quality_reason(dict(selected), "selected_from_best_attempt")
+                selected_priority_vector = tuple(selected.get("selection_priority_vector") or ())
+                selected_has_key_timeout = bool(selected.get("has_key_connector_timeout"))
+
+        if selected_has_key_timeout and not all_attempts_key_timeout:
+            if best_non_timeout_selected is not None:
+                selected = _append_quality_reason(dict(best_non_timeout_selected), "selected_from_best_non_timeout_attempt")
+                selected = _append_quality_reason(dict(selected), "selected_from_best_attempt")
+                selected_has_key_timeout = bool(selected.get("has_key_connector_timeout"))
+            else:
+                selected = _append_quality_reason(dict(selected), "key_connector_timeout_attempt_disallowed")
 
         raw_items = list(selected["raw_items"] or [])
         run_context = dict(selected["run_context"] or {})
@@ -438,6 +499,9 @@ class RunPipelineRuntime:
                     ]
                     if selected_quality_reasons:
                         break
+        key_connector_timeout_degraded_result = bool(selected_has_key_timeout and all_attempts_key_timeout)
+        if key_connector_timeout_degraded_result and "critical_recall_timeout_degraded_result" not in selected_quality_reasons:
+            selected_quality_reasons.append("critical_recall_timeout_degraded_result")
 
         base_relevance_threshold = float(rank_pack.get("base_relevance_threshold", 0.55 if data_mode == "live" else 0.0))
         relevance_threshold = float(rank_pack.get("relevance_threshold", base_relevance_threshold))
@@ -543,7 +607,7 @@ class RunPipelineRuntime:
                 return "denylisted"
             return "deprioritized"
 
-        def _why_ranked(row: Any) -> str:
+        def _why_ranked(row: Any, *, record: Any | None = None) -> str:
             item = row.item
             signals = dict((item.metadata or {}).get("quality_signals") or {})
             metadata = dict(item.metadata or {})
@@ -551,9 +615,26 @@ class RunPipelineRuntime:
             hard_terms = [str(value).strip() for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()]
             if hard_terms:
                 chunks.append(f"hard={','.join(hard_terms[:2])}")
+            high_value_hits = [
+                str(value).strip()
+                for value in list(metadata.get("topic_agent_high_value_hits") or [])
+                if str(value).strip()
+            ]
+            if high_value_hits:
+                chunks.append(f"high_value={','.join(high_value_hits[:2])}")
             evidence_links = int(float(signals.get("evidence_links_quality", 0) or 0))
             if evidence_links > 0:
                 chunks.append(f"evidence={evidence_links}")
+            recent_update_signal = float(metadata.get("recent_update_signal", 0.0) or 0.0)
+            if recent_update_signal > 0:
+                chunks.append(f"recent_update={recent_update_signal:.2f}")
+            stars_delta_proxy = float(metadata.get("stars_delta_proxy", 0.0) or 0.0)
+            if stars_delta_proxy > 0:
+                chunks.append(f"stars_delta_proxy={stars_delta_proxy:.2f}")
+            if record is not None:
+                alignment = float(getattr(record, "evidence_target_alignment", 0.0) or 0.0)
+                if alignment > 0:
+                    chunks.append(f"alignment={alignment:.2f}")
             repeat_penalty = float(metadata.get("recent_topic_repeat_penalty", 0.0) or 0.0)
             if repeat_penalty > 0:
                 chunks.append(f"repeat_penalty={repeat_penalty:.2f}")
@@ -588,14 +669,25 @@ class RunPipelineRuntime:
                     "bucket_hits": [str(value) for value in list(metadata.get("bucket_hits") or []) if str(value).strip()],
                     "cross_source_corroborated": bool(metadata.get("cross_source_corroborated")),
                     "cross_source_count": int(float(metadata.get("cross_source_corroboration_count", 0) or 0)),
+                    "recent_update_signal": float(metadata.get("recent_update_signal", 0.0) or 0.0),
+                    "stars_delta_proxy": float(metadata.get("stars_delta_proxy", 0.0) or 0.0),
                     "audit_verdict": str(record.verdict if record else "unknown"),
                     "audit_reason_code": str(machine_action.get("reason_code") or ""),
+                    "evidence_target_alignment": float(getattr(record, "evidence_target_alignment", 0.0) or 0.0) if record else 0.0,
+                    "ranking_reasons": _why_ranked(row, record=record),
                     "drop_reason": None if item.id in picked_ids else _drop_reason(row),
                 }
             )
         top_dropped = [row for row in candidate_rows if row.get("drop_reason")][:10]
 
         selected_attempt_payload = (attempts[int(selected.get("attempt", 1)) - 1] or {}) if attempts else {}
+        selected_attempt_has_key_connector_timeout = bool(selected_attempt_payload.get("has_key_connector_timeout"))
+        selected_attempt_fallback_used = bool(selected_attempt_payload.get("fallback_used"))
+        selected_attempt_failures = [dict(item or {}) for item in list(selected_attempt_payload.get("failures") or [])]
+        selected_attempt_explain = [str(value).strip() for value in list(selected_attempt_payload.get("explain") or []) if str(value).strip()]
+        retrieval_explain = list(selected_attempt_explain)
+        if key_connector_timeout_degraded_result and "all_attempts_key_connector_timeout_degraded_result" not in retrieval_explain:
+            retrieval_explain.append("all_attempts_key_connector_timeout_degraded_result")
         hard_match_terms_used = [str(value) for value in list(selected_attempt_payload.get("hard_match_terms_used") or []) if str(value).strip()]
         hard_match_pass_count = int(selected_attempt_payload.get("hard_match_pass_count", 0) or 0)
         top_picks_min_relevance = float(selected_attempt_payload.get("top_picks_min_relevance", 0.0) or 0.0)
@@ -637,6 +729,8 @@ class RunPipelineRuntime:
             why_not_more.append("bucket_coverage_lt_2")
         if downgrade_cap_reached:
             why_not_more.append(f"downgrade_fill_cap_reached:{max_downgrade_allowed}")
+        if key_connector_timeout_degraded_result:
+            why_not_more.append("key_connector_timeout_degraded_result")
 
         top_cross_source_ids = [
             str(entry.item.id)
@@ -660,6 +754,12 @@ class RunPipelineRuntime:
             "attempts": attempts,
             "selected_attempt": int(selected.get("attempt", 1)),
             "selected_phase": getattr(profile, "phase", "base"),
+            "selected_attempt_has_key_connector_timeout": bool(selected_attempt_has_key_connector_timeout),
+            "selected_attempt_fallback_used": bool(selected_attempt_fallback_used),
+            "selected_attempt_failures": list(selected_attempt_failures),
+            "all_attempts_key_connector_timeout": bool(all_attempts_key_timeout),
+            "key_connector_timeout_degraded_result": bool(key_connector_timeout_degraded_result),
+            "explain": list(retrieval_explain),
             "selected_queries": list(selected_attempt_payload.get("queries") or []),
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
@@ -694,6 +794,12 @@ class RunPipelineRuntime:
             "evidence_audit_path": audit_path,
             "selected_phase": getattr(profile, "phase", "base"),
             "selected_attempt": int(selected.get("attempt", 1)),
+            "selected_attempt_has_key_connector_timeout": bool(selected_attempt_has_key_connector_timeout),
+            "selected_attempt_fallback_used": bool(selected_attempt_fallback_used),
+            "selected_attempt_failures": list(selected_attempt_failures),
+            "all_attempts_key_connector_timeout": bool(all_attempts_key_timeout),
+            "key_connector_timeout_degraded_result": bool(key_connector_timeout_degraded_result),
+            "explain": list(retrieval_explain),
             "plan": retrieval_plan.model_dump() if retrieval_plan else None,
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
@@ -726,6 +832,10 @@ class RunPipelineRuntime:
                     "source_coverage": int(item.get("source_coverage", 0) or 0),
                     "quality_triggered_expansion": bool(item.get("quality_triggered_expansion")),
                     "quality_trigger_reasons": list(item.get("quality_trigger_reasons") or []),
+                    "has_timeout": bool(item.get("has_timeout")),
+                    "has_key_connector_timeout": bool(item.get("has_key_connector_timeout")),
+                    "failures": list(item.get("failures") or []),
+                    "fallback_used": bool(item.get("fallback_used")),
                     "deep_fetch_applied": bool(item.get("deep_fetch_applied")),
                     "deep_fetch_count": int(item.get("deep_fetch_count", 0) or 0),
                     "deep_fetch_details": list(item.get("deep_fetch_details") or []),
@@ -783,6 +893,10 @@ class RunPipelineRuntime:
             "diversity_sources": sorted({str(entry.item.source or "").strip().lower() for entry in picks if str(entry.item.source or "").strip()}),
             "selected_recall_phase": getattr(profile, "phase", "base"),
             "recall_attempt_count": len(attempts),
+            "selected_attempt_has_key_connector_timeout": bool(selected_attempt_has_key_connector_timeout),
+            "selected_attempt_fallback_used": bool(selected_attempt_fallback_used),
+            "all_attempts_key_connector_timeout": bool(all_attempts_key_timeout),
+            "key_connector_timeout_degraded_result": bool(key_connector_timeout_degraded_result),
             "evidence_audit_path": audit_path,
             "evidence_audit_verdict_counts": verdict_counts,
             "top_evidence_audit_verdicts": top_verdicts,
@@ -816,7 +930,7 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
-            "top_why_ranked": [_why_ranked(entry) for entry in picks],
+            "top_why_ranked": [_why_ranked(entry, record=audit_by_item.get(str(entry.item.id))) for entry in picks],
             "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
             "drop_reason_samples": [
                 {
@@ -1015,6 +1129,10 @@ class RunPipelineRuntime:
         base_limit = 12 * limit_multiplier
         raw_items: List[RawItem] = []
         connector_calls: List[Dict[str, Any]] = []
+        connector_failures: List[Dict[str, Any]] = []
+        connector_timeout_counts: Dict[str, int] = {}
+        fallback_details: List[Dict[str, Any]] = []
+        fallback_used = False
         queries_by_source: Dict[str, List[str]] = {}
         include_terms_by_source: Dict[str, List[str]] = {}
         exclude_terms_by_source: Dict[str, List[str]] = {}
@@ -1040,6 +1158,28 @@ class RunPipelineRuntime:
                 value = float(default)
             return max(float(minimum), float(value))
 
+        def _parse_window_days(value: str) -> int:
+            token = str(value or "").strip().lower()
+            if not token:
+                return 1
+            if token == "today":
+                return 1
+            if token.endswith("d"):
+                try:
+                    return max(1, int(token[:-1]))
+                except Exception:
+                    return 3
+            if token.endswith("h"):
+                try:
+                    return max(1, int((int(token[:-1]) + 23) // 24))
+                except Exception:
+                    return 1
+            if token in {"past_week", "last_week", "weekly"}:
+                return 7
+            if token in {"past_month", "monthly"}:
+                return 30
+            return 3
+
         base_query_cap = _resolve_int_budget(
             "query_cap_base",
             env_name="ARA_V2_QUERY_CAP_BASE",
@@ -1057,8 +1197,40 @@ class RunPipelineRuntime:
             "connector_timeout_sec",
             env_name="ARA_V2_CONNECTOR_TIMEOUT_SEC",
             default=20.0,
-            minimum=5.0,
+            minimum=0.5,
         )
+        phase_window_days = _parse_window_days(str(phase_window))
+        connector_retry_backoff_sec = _resolve_float_budget(
+            "connector_retry_backoff_sec",
+            env_name="ARA_V2_CONNECTOR_RETRY_BACKOFF_SEC",
+            default=0.8,
+            minimum=0.1,
+        )
+        github_topic_timeout_base = _resolve_float_budget(
+            "connector_timeout_gh_topic",
+            env_name="ARA_CONNECTOR_TIMEOUT_GH_TOPIC",
+            default=connector_timeout_sec,
+            minimum=0.5,
+        )
+        github_topic_timeout_multiplier = 1.0
+        if phase_window_days >= 7:
+            github_topic_timeout_multiplier = max(github_topic_timeout_multiplier, 1.6)
+        if bool(phase.expanded_queries):
+            github_topic_timeout_multiplier = max(github_topic_timeout_multiplier, 2.0)
+        github_topic_timeout_sec = max(
+            github_topic_timeout_base,
+            connector_timeout_sec * float(github_topic_timeout_multiplier),
+        )
+        github_topic_retry_attempts = _resolve_int_budget(
+            "connector_retry_gh_topic",
+            env_name="ARA_CONNECTOR_RETRY_GH_TOPIC",
+            default=1,
+            minimum=1,
+        )
+        if phase_window_days >= 7:
+            github_topic_retry_attempts = max(github_topic_retry_attempts, 2)
+        if bool(phase.expanded_queries):
+            github_topic_retry_attempts = max(github_topic_retry_attempts, 3)
 
         def _trim_queries(values: Sequence[str]) -> List[str]:
             return self._dedupe_tokens(list(values or []))[: max(1, int(query_cap))]
@@ -1075,8 +1247,17 @@ class RunPipelineRuntime:
             exclude_terms.extend(list(profile_filters.get("must_exclude_any") or []))
             return self._dedupe_tokens(include_terms), self._dedupe_tokens(exclude_terms)
 
-        async def _call(name: str, **kwargs: Any) -> List[RawItem]:
-            started = perf_counter()
+        async def _call(
+            name: str,
+            *,
+            timeout_sec: Optional[float] = None,
+            retry_attempts: int = 1,
+            retry_backoff_sec: Optional[float] = None,
+            **kwargs: Any,
+        ) -> List[RawItem]:
+            effective_timeout = float(timeout_sec if timeout_sec not in (None, "") else connector_timeout_sec)
+            total_attempts = max(1, int(retry_attempts))
+            backoff = float(retry_backoff_sec if retry_backoff_sec not in (None, "") else connector_retry_backoff_sec)
             if not self._connector_exists(name):
                 connector_calls.append(
                     {
@@ -1084,49 +1265,88 @@ class RunPipelineRuntime:
                         "count": 0,
                         "duration_ms": 0,
                         "status": "missing",
+                        "attempt": 1,
+                        "timeout_sec": effective_timeout,
                         "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
                     }
                 )
                 return []
-            try:
-                payload = await asyncio.wait_for(self._invoke_connector(name, **kwargs), timeout=connector_timeout_sec)
-                duration_ms = int((perf_counter() - started) * 1000)
-                connector_calls.append(
-                    {
-                        "name": name,
-                        "count": len(payload),
-                        "duration_ms": duration_ms,
-                        "status": "ok",
-                        "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
-                    }
-                )
-                return payload
-            except asyncio.TimeoutError:
-                duration_ms = int((perf_counter() - started) * 1000)
-                connector_calls.append(
-                    {
-                        "name": name,
-                        "count": 0,
-                        "duration_ms": duration_ms,
-                        "status": "timeout",
-                        "error": f"timeout>{connector_timeout_sec:.1f}s",
-                        "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
-                    }
-                )
-                return []
-            except Exception as exc:
-                duration_ms = int((perf_counter() - started) * 1000)
-                connector_calls.append(
-                    {
-                        "name": name,
-                        "count": 0,
-                        "duration_ms": duration_ms,
-                        "status": "error",
-                        "error": str(exc),
-                        "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
-                    }
-                )
-                return []
+
+            for attempt_idx in range(1, total_attempts + 1):
+                started = perf_counter()
+                try:
+                    payload = await asyncio.wait_for(self._invoke_connector(name, **kwargs), timeout=effective_timeout)
+                    duration_ms = int((perf_counter() - started) * 1000)
+                    connector_calls.append(
+                        {
+                            "name": name,
+                            "count": len(payload),
+                            "duration_ms": duration_ms,
+                            "status": "ok",
+                            "attempt": attempt_idx,
+                            "retry_total": total_attempts,
+                            "timeout_sec": effective_timeout,
+                            "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
+                        }
+                    )
+                    return payload
+                except asyncio.TimeoutError:
+                    duration_ms = int((perf_counter() - started) * 1000)
+                    connector_calls.append(
+                        {
+                            "name": name,
+                            "count": 0,
+                            "duration_ms": duration_ms,
+                            "status": "timeout",
+                            "attempt": attempt_idx,
+                            "retry_total": total_attempts,
+                            "timeout_sec": effective_timeout,
+                            "error": f"timeout>{effective_timeout:.1f}s",
+                            "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
+                        }
+                    )
+                    connector_timeout_counts[name] = int(connector_timeout_counts.get(name, 0) or 0) + 1
+                    connector_failures.append(
+                        {
+                            "connector": name,
+                            "reason": "timeout",
+                            "timeout_sec": float(effective_timeout),
+                            "attempt": int(attempt_idx),
+                        }
+                    )
+                    if attempt_idx < total_attempts:
+                        await asyncio.sleep(min(4.0, max(0.0, backoff) * (2 ** (attempt_idx - 1))))
+                        continue
+                    return []
+                except Exception as exc:
+                    duration_ms = int((perf_counter() - started) * 1000)
+                    error_message = str(exc)
+                    connector_calls.append(
+                        {
+                            "name": name,
+                            "count": 0,
+                            "duration_ms": duration_ms,
+                            "status": "error",
+                            "attempt": attempt_idx,
+                            "retry_total": total_attempts,
+                            "timeout_sec": effective_timeout,
+                            "error": error_message,
+                            "kwargs": {key: _to_jsonable(value) for key, value in kwargs.items()},
+                        }
+                    )
+                    connector_failures.append(
+                        {
+                            "connector": name,
+                            "reason": f"error:{error_message}",
+                            "timeout_sec": float(effective_timeout),
+                            "attempt": int(attempt_idx),
+                        }
+                    )
+                    if attempt_idx < total_attempts:
+                        await asyncio.sleep(min(4.0, max(0.0, backoff) * (2 ** (attempt_idx - 1))))
+                        continue
+                    return []
+            return []
 
         if data_mode == "live" and topic:
             github_queries = _trim_queries(plan.queries_for_phase(phase.phase, source="github") if plan else phase_queries)
@@ -1144,55 +1364,86 @@ class RunPipelineRuntime:
             queries_by_source["hackernews"] = list(hn_queries or [])
             include_terms_by_source["hackernews"] = list(hn_include_terms or [])
             exclude_terms_by_source["hackernews"] = list(hn_exclude_terms or [])
-            topic_tasks: List[Awaitable[List[RawItem]]] = [
-                _call(
-                    "fetch_github_topic_search",
+
+            github_limit = (
+                plan.source_limit_for_phase(source="github", phase=phase.phase, fallback=max(8, base_limit))
+                if plan
+                else max(8, base_limit)
+            )
+            github_timeout_before = int(connector_timeout_counts.get("fetch_github_topic_search", 0) or 0)
+            github_items = await _call(
+                "fetch_github_topic_search",
+                timeout_sec=float(github_topic_timeout_sec),
+                retry_attempts=int(github_topic_retry_attempts),
+                retry_backoff_sec=float(connector_retry_backoff_sec),
+                topic=topic,
+                time_window=phase_window,
+                limit=github_limit,
+                expanded=bool(phase.expanded_queries),
+                queries=github_queries,
+                must_include_terms=github_include_terms,
+                must_exclude_terms=github_exclude_terms,
+            )
+            github_timeout_after = int(connector_timeout_counts.get("fetch_github_topic_search", 0) or 0)
+            github_timeout_triggered = github_timeout_after > github_timeout_before
+            if github_timeout_triggered:
+                fallback_used = True
+                fallback_limit = max(6, int(github_limit))
+                fallback_items = await _call(
+                    "fetch_github_query_fallback",
+                    timeout_sec=max(float(connector_timeout_sec), 8.0),
+                    retry_attempts=1,
                     topic=topic,
                     time_window=phase_window,
-                    limit=(
-                        plan.source_limit_for_phase(source="github", phase=phase.phase, fallback=max(8, base_limit))
-                        if plan
-                        else max(8, base_limit)
-                    ),
-                    expanded=bool(phase.expanded_queries),
+                    limit=fallback_limit,
                     queries=github_queries,
                     must_include_terms=github_include_terms,
                     must_exclude_terms=github_exclude_terms,
+                )
+                github_items.extend(list(fallback_items or []))
+                fallback_details.append(
+                    {
+                        "connector": "fetch_github_topic_search",
+                        "fallback_connector": "fetch_github_query_fallback",
+                        "fallback_strategy": "query_then_sort_updated_or_stars",
+                        "phase": str(phase.phase),
+                        "window": str(phase_window),
+                        "fallback_count": int(len(fallback_items)),
+                    }
+                )
+            raw_items.extend(list(github_items or []))
+
+            hf_task: Awaitable[List[RawItem]] = _call(
+                "fetch_huggingface_search",
+                topic=topic,
+                time_window=phase_window,
+                limit=(
+                    plan.source_limit_for_phase(source="huggingface", phase=phase.phase, fallback=max(6, base_limit // 2))
+                    if plan
+                    else max(6, base_limit // 2)
                 ),
-                _call(
-                    "fetch_huggingface_search",
-                    topic=topic,
-                    time_window=phase_window,
-                    limit=(
-                        plan.source_limit_for_phase(source="huggingface", phase=phase.phase, fallback=max(6, base_limit // 2))
-                        if plan
-                        else max(6, base_limit // 2)
-                    ),
-                    expanded=bool(phase.expanded_queries),
-                    queries=hf_queries,
-                    must_include_terms=hf_include_terms,
-                    must_exclude_terms=hf_exclude_terms,
+                expanded=bool(phase.expanded_queries),
+                queries=hf_queries,
+                must_include_terms=hf_include_terms,
+                must_exclude_terms=hf_exclude_terms,
+            )
+            hn_task: Awaitable[List[RawItem]] = _call(
+                "fetch_hackernews_search",
+                topic=topic,
+                time_window=phase_window,
+                limit=(
+                    plan.source_limit_for_phase(source="hackernews", phase=phase.phase, fallback=max(6, base_limit // 2))
+                    if plan
+                    else max(6, base_limit // 2)
                 ),
-                _call(
-                    "fetch_hackernews_search",
-                    topic=topic,
-                    time_window=phase_window,
-                    limit=(
-                        plan.source_limit_for_phase(source="hackernews", phase=phase.phase, fallback=max(6, base_limit // 2))
-                        if plan
-                        else max(6, base_limit // 2)
-                    ),
-                    expanded=bool(phase.expanded_queries),
-                    queries=hn_queries,
-                    must_include_terms=hn_include_terms,
-                    must_exclude_terms=hn_exclude_terms,
-                ),
-            ]
-            topic_results = await asyncio.gather(*topic_tasks, return_exceptions=True)
-            for result in topic_results:
-                if isinstance(result, Exception):
-                    continue
-                raw_items.extend(list(result or []))
+                expanded=bool(phase.expanded_queries),
+                queries=hn_queries,
+                must_include_terms=hn_include_terms,
+                must_exclude_terms=hn_exclude_terms,
+            )
+            hf_items, hn_items = await asyncio.gather(hf_task, hn_task)
+            raw_items.extend(list(hf_items or []))
+            raw_items.extend(list(hn_items or []))
 
         tasks: List[Awaitable[List[RawItem]]] = [
             _call("fetch_github_trending", max_results=base_limit),
@@ -1241,6 +1492,7 @@ class RunPipelineRuntime:
                 raw_items,
                 retrieval_plan=plan,
                 topic_profile=topic_profile,
+                window_days=phase_window_days,
             )
 
         if diagnostics is not None:
@@ -1253,6 +1505,9 @@ class RunPipelineRuntime:
             diagnostics["queries"] = phase_queries
             diagnostics["query_cap"] = int(query_cap)
             diagnostics["connector_timeout_sec"] = float(connector_timeout_sec)
+            diagnostics["github_topic_timeout_sec"] = float(github_topic_timeout_sec)
+            diagnostics["github_topic_retry_attempts"] = int(github_topic_retry_attempts)
+            diagnostics["connector_retry_backoff_sec"] = float(connector_retry_backoff_sec)
             diagnostics["queries_by_source"] = queries_by_source
             diagnostics["bucket_queries"] = bucket_queries
             diagnostics["must_include_terms"] = self._dedupe_tokens(
@@ -1267,6 +1522,10 @@ class RunPipelineRuntime:
             diagnostics["deep_fetch_count"] = deep_fetch_count
             diagnostics["deep_fetch_details"] = deep_fetch_details
             diagnostics["connector_calls"] = connector_calls
+            diagnostics["failures"] = list(connector_failures)
+            diagnostics["connector_timeout_counts"] = dict(connector_timeout_counts)
+            diagnostics["fallback_used"] = bool(fallback_used)
+            diagnostics["fallback_details"] = list(fallback_details)
 
         if not raw_items and data_mode == "live":
             raise RuntimeError("no live items fetched from connectors")
@@ -1773,6 +2032,7 @@ class RunPipelineRuntime:
         *,
         retrieval_plan: Optional[RetrievalPlan],
         topic_profile: Optional[TopicProfile],
+        window_days: int = 1,
     ) -> List[RawItem]:
         output: List[RawItem] = []
         for entry in list(raw_items or []):
@@ -1805,11 +2065,80 @@ class RunPipelineRuntime:
                 metadata["topic_hard_match_pass"] = bool(topic_profile.hard_match_pass(topic_text))
 
             metadata["bucket_hits"] = sorted(bucket_hits)
+            metadata["retrieval_window_days"] = int(max(1, int(window_days)))
             if query_bucket:
                 metadata["retrieval_bucket"] = str(query_bucket)
             item.metadata = metadata
             output.append(item)
         return output
+
+    @classmethod
+    def _attempt_failures(cls, diagnostics: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        for entry in list(diagnostics.get("failures") or []):
+            payload = dict(entry or {})
+            connector = str(payload.get("connector") or "").strip()
+            reason = str(payload.get("reason") or "").strip().lower()
+            if not connector or not reason:
+                continue
+            timeout_sec = payload.get("timeout_sec")
+            try:
+                timeout_value = float(timeout_sec) if timeout_sec not in (None, "") else None
+            except Exception:
+                timeout_value = None
+            output.append(
+                {
+                    "connector": connector,
+                    "reason": reason,
+                    "timeout_sec": timeout_value,
+                    "attempt": int(payload.get("attempt", 0) or 0),
+                }
+            )
+        return output
+
+    @classmethod
+    def _attempt_timeout_penalty(cls, failures: Sequence[Mapping[str, Any]]) -> tuple[float, bool, bool]:
+        has_timeout = False
+        has_key_timeout = False
+        penalty = 0.0
+        for failure in list(failures or []):
+            connector = str(failure.get("connector") or "").strip()
+            reason = str(failure.get("reason") or "").strip().lower()
+            if reason == "timeout":
+                has_timeout = True
+                penalty += float(cls._CONNECTOR_TIMEOUT_PENALTY)
+                if connector in cls._KEY_TIMEOUT_CONNECTORS:
+                    has_key_timeout = True
+                    penalty += float(cls._KEY_CONNECTOR_TIMEOUT_PENALTY)
+            elif reason.startswith("error:"):
+                penalty += float(cls._CONNECTOR_ERROR_PENALTY)
+        return float(penalty), bool(has_timeout), bool(has_key_timeout)
+
+    @classmethod
+    def _attempt_failure_explain(
+        cls,
+        failures: Sequence[Mapping[str, Any]],
+        *,
+        timeout_penalty: float,
+        fallback_used: bool,
+    ) -> List[str]:
+        explain: List[str] = []
+        for failure in list(failures or []):
+            connector = str(failure.get("connector") or "").strip()
+            reason = str(failure.get("reason") or "").strip().lower()
+            timeout_sec = failure.get("timeout_sec")
+            if reason == "timeout":
+                if timeout_sec not in (None, ""):
+                    explain.append(f"failure:{connector}:timeout>{float(timeout_sec):.1f}s")
+                else:
+                    explain.append(f"failure:{connector}:timeout")
+            elif reason.startswith("error:"):
+                explain.append(f"failure:{connector}:{reason}")
+        if timeout_penalty > 0:
+            explain.append(f"attempt_quality_penalty=-{float(timeout_penalty):.1f}")
+        if fallback_used:
+            explain.append("fallback_query_strategy_used")
+        return explain
 
     @staticmethod
     def _attempt_quality_snapshot(
@@ -1927,8 +2256,12 @@ class RunPipelineRuntime:
         selected_downgrade_count: int,
         pass_ratio: float,
         quality_reasons: Sequence[str],
+        has_key_connector_timeout: bool = False,
+        timeout_penalty: float = 0.0,
+        fallback_used: bool = False,
     ) -> tuple[float, ...]:
         return (
+            float(1 if not bool(has_key_connector_timeout) else 0),
             float(1 if not list(quality_reasons or []) else 0),
             float(max(0, int(selected_pass_count))),
             float(len(list(picks or []))),
@@ -1939,6 +2272,8 @@ class RunPipelineRuntime:
             float(max(0.0, pass_ratio)),
             float(-max(0, int(selected_downgrade_count))),
             float(int(quality_snapshot.get("source_coverage", 0) or 0)),
+            float(-max(0.0, float(timeout_penalty))),
+            float(1 if bool(fallback_used) else 0),
         )
 
     def _connector_exists(self, name: str) -> bool:
@@ -2259,6 +2594,7 @@ class RunPipelineRuntime:
         topic_profile: Optional[TopicProfile],
         data_mode: str,
         top_count: int,
+        recall_window: Optional[str] = None,
     ) -> Dict[str, Any]:
         base_relevance_threshold = 0.55 if data_mode == "live" else 0.0
         min_relevance_threshold = 0.45 if float(base_relevance_threshold) > 0.0 else 0.0
@@ -2274,6 +2610,7 @@ class RunPipelineRuntime:
                 topic=topic,
                 topic_profile=topic_profile,
                 relevance_threshold=relevance_threshold,
+                recall_window=recall_window,
             )
             relevance_eligible = (
                 [entry for entry in ranked if float(entry.relevance_score) >= float(relevance_threshold)]

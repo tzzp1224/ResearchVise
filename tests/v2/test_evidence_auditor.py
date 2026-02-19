@@ -369,3 +369,85 @@ def test_evidence_auditor_does_not_treat_keyword_benchmark_as_real_traction_sign
     record = auditor.audit_row(row, rank=1)
     assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
     assert any("github_low_signal_repo" in reason for reason in list(record.reasons or []))
+
+
+def test_evidence_auditor_downgrades_weekly_agent_repo_without_trending_signal() -> None:
+    row = _row(
+        "gh_weekly_mid",
+        source="github",
+        body=("agent orchestration runtime with docs and install steps " * 80).strip(),
+        citations=[
+            Citation(title="repo", url="https://github.com/acme/agent-shell", snippet="repo", source="github"),
+            Citation(title="docs", url="https://docs.acme.dev/agent-shell", snippet="docs", source="docs"),
+            Citation(title="install", url="https://acme.dev/install.sh", snippet="install", source="web"),
+        ],
+        metadata={
+            "body_len": 1500,
+            "stars": 450,
+            "forks": 25,
+            "retrieval_window_days": 7,
+            "topic_hard_match_pass": True,
+            "quality_signals": {
+                "evidence_links_quality": 3,
+                "publish_or_update_time": "2026-02-19T10:00:00Z",
+                "has_quickstart": True,
+                "has_results_or_bench": False,
+            },
+            "evidence_links": [
+                "https://github.com/acme/agent-shell",
+                "https://docs.acme.dev/agent-shell",
+                "https://acme.dev/install.sh",
+            ],
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
+    assert any("github_weekly_trending_signal_weak" in reason for reason in list(record.reasons or []))
+
+
+def test_evidence_auditor_rejects_link_heavy_handbook_with_low_alignment() -> None:
+    row = _row(
+        "gh_handbook",
+        source="github",
+        body=(
+            "AI engineer handbook curated resources roadmap and learning links. "
+            "This list aggregates references without concrete runtime implementation details. "
+            * 60
+        ).strip(),
+        citations=[
+            Citation(title="arxiv", url="https://arxiv.org/abs/2501.00001", snippet="paper", source="web"),
+            Citation(title="resources", url="https://example.com/agent-resources", snippet="resources", source="web"),
+            Citation(title="course", url="https://example.org/ai-course", snippet="course", source="web"),
+            Citation(title="awesome", url="https://github.com/other/awesome-agent-resources", snippet="awesome", source="github"),
+        ],
+        metadata={
+            "body_len": 2400,
+            "stars": 5800,
+            "forks": 700,
+            "topic_hard_match_pass": True,
+            "quality_signals": {
+                "evidence_links_quality": 5,
+                "publish_or_update_time": "2026-02-19T10:00:00Z",
+                "has_quickstart": False,
+                "has_results_or_bench": False,
+            },
+            "evidence_links": [
+                "https://arxiv.org/abs/2501.00001",
+                "https://example.com/agent-resources",
+                "https://example.org/ai-course",
+                "https://github.com/other/awesome-agent-resources",
+            ],
+        },
+        rank=1,
+    )
+    row.item.title = "DataExpert-io/ai-engineer-handbook"
+    row.item.url = "https://github.com/DataExpert-io/ai-engineer-handbook"
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
+    assert any(
+        ("link_heavy_low_alignment" in str(reason)) or ("handbook_like_for_agent_topic" in str(reason))
+        for reason in list(record.reasons or [])
+    )

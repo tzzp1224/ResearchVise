@@ -397,6 +397,35 @@ def generate_onepager(
         for value in list(ranking_stats.get("why_not_more") or retrieval.get("why_not_more") or [])
         if str(value).strip()
     ]
+    selected_attempt_has_key_timeout = bool(
+        ranking_stats.get(
+            "selected_attempt_has_key_connector_timeout",
+            retrieval.get("selected_attempt_has_key_connector_timeout", False),
+        )
+    )
+    selected_attempt_fallback_used = bool(
+        ranking_stats.get(
+            "selected_attempt_fallback_used",
+            retrieval.get("selected_attempt_fallback_used", False),
+        )
+    )
+    all_attempts_key_timeout = bool(
+        ranking_stats.get(
+            "all_attempts_key_connector_timeout",
+            retrieval.get("all_attempts_key_connector_timeout", False),
+        )
+    )
+    key_connector_timeout_degraded_result = bool(
+        ranking_stats.get(
+            "key_connector_timeout_degraded_result",
+            retrieval.get("key_connector_timeout_degraded_result", False),
+        )
+    )
+    retrieval_explain = [
+        str(value).strip()
+        for value in list(retrieval.get("explain") or [])
+        if str(value).strip()
+    ]
     top_verdicts = {str(k): str(v).strip().lower() for k, v in dict(ranking_stats.get("top_evidence_audit_verdicts") or {}).items()}
     top_reasons = {str(k): list(v or []) for k, v in dict(ranking_stats.get("top_evidence_audit_reasons") or {}).items()}
     top_evidence_urls = {
@@ -454,6 +483,11 @@ def generate_onepager(
         f"- QualityTriggeredExpansion: `{str(quality_triggered_expansion).lower()}`",
         f"- QualityTriggerReasons: `{','.join(quality_trigger_reasons) if quality_trigger_reasons else 'N/A'}`",
         f"- WhyNotMoreReasons: `{','.join(why_not_more_reasons) if why_not_more_reasons else 'N/A'}`",
+        f"- SelectedAttemptHasKeyConnectorTimeout: `{str(selected_attempt_has_key_timeout).lower()}`",
+        f"- SelectedAttemptFallbackUsed: `{str(selected_attempt_fallback_used).lower()}`",
+        f"- AllAttemptsKeyConnectorTimeout: `{str(all_attempts_key_timeout).lower()}`",
+        f"- KeyConnectorTimeoutDegradedResult: `{str(key_connector_timeout_degraded_result).lower()}`",
+        f"- RetrievalExplain: `{'; '.join(retrieval_explain) if retrieval_explain else 'N/A'}`",
         f"- RecallPhase: `{selected_phase or 'base'}`",
         f"- CitationCount: `{len(citation_list)}`",
         f"- DiagnosisPath: `{diagnosis_path or 'N/A'}`",
@@ -473,6 +507,13 @@ def generate_onepager(
         lines.extend(
             [
                 "> 当前 Top Picks 包含降级条目（证据不足或重复）。已触发扩检后仍不足。",
+                "",
+            ]
+        )
+    if key_connector_timeout_degraded_result:
+        lines.extend(
+            [
+                "> 关键召回失败，降级结果：`fetch_github_topic_search` 在全部 attempt 中超时，已切换 fallback query strategy。",
                 "",
             ]
         )

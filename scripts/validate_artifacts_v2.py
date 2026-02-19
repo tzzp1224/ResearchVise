@@ -511,10 +511,13 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             record_map[item_id] = dict(row or {})
         verdict_ok = True
         duplicate_ok = True
+        link_heavy_alignment_ok = True
         for item_id in top_item_ids:
             row = dict(record_map.get(item_id) or {})
             verdict = str(row.get("verdict") or "").strip().lower()
             reasons = list(row.get("reasons") or [])
+            machine_action = dict(row.get("machine_action") or {})
+            reason_code = str(machine_action.get("reason_code") or "").strip().lower()
             if verdict not in {"pass", "downgrade"}:
                 verdict_ok = False
                 continue
@@ -523,15 +526,25 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             duplicate_ratio = float(row.get("citation_duplicate_prefix_ratio", 0.0) or 0.0)
             if duplicate_ratio > 0.6:
                 duplicate_ok = False
+            has_link_heavy_alignment_flag = bool(
+                reason_code == "link_heavy_low_alignment"
+                or any("link_heavy_low_alignment" in str(reason).lower() for reason in list(reasons or []))
+            )
+            if verdict == "pass" and has_link_heavy_alignment_flag:
+                link_heavy_alignment_ok = False
         report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] = verdict_ok
         report["checks"]["citations_not_mostly_duplicate"] = duplicate_ok
+        report["checks"]["top_picks_not_link_heavy_low_alignment"] = link_heavy_alignment_ok
         if not verdict_ok:
             report["errors"].append("top_picks_invalid_evidence_verdicts")
         if not duplicate_ok:
             report["errors"].append("top_picks_citations_mostly_duplicate")
+        if not link_heavy_alignment_ok:
+            report["errors"].append("top_picks_link_heavy_low_alignment_passed")
     else:
         report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] = False
         report["checks"]["citations_not_mostly_duplicate"] = False
+        report["checks"]["top_picks_not_link_heavy_low_alignment"] = False
         record_map = {}
 
     top_relevance_scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
@@ -766,6 +779,37 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         if not report["checks"]["retrieval_quality_triggered_expansion_recorded"]:
             report["errors"].append("retrieval_quality_triggered_expansion_missing")
 
+        selected_attempt_idx = int(diagnosis_payload.get("selected_attempt", 0) or 0) - 1
+        selected_attempt_payload = (
+            dict(diagnosis_attempts[selected_attempt_idx] or {})
+            if 0 <= selected_attempt_idx < len(diagnosis_attempts)
+            else {}
+        )
+        selected_has_key_timeout = bool(
+            diagnosis_payload.get(
+                "selected_attempt_has_key_connector_timeout",
+                selected_attempt_payload.get("has_key_connector_timeout", False),
+            )
+        )
+        all_attempts_key_timeout = bool(diagnosis_payload.get("all_attempts_key_connector_timeout", False))
+        key_timeout_degraded_result = bool(diagnosis_payload.get("key_connector_timeout_degraded_result", False))
+        timeout_selection_ok = bool(
+            (not selected_has_key_timeout)
+            or (all_attempts_key_timeout and key_timeout_degraded_result)
+        )
+        report["checks"]["selected_attempt_has_no_key_connector_timeout"] = timeout_selection_ok
+        if not timeout_selection_ok:
+            report["errors"].append("selected_attempt_has_key_connector_timeout")
+
+        relevance_scores = [float(value) for value in list(ranking_stats.get("top_relevance_scores") or []) if value is not None]
+        if len(relevance_scores) < 3:
+            relevance_scores = [float(value) for value in list(report.get("details", {}).get("onepager_relevance_scores") or []) if value is not None]
+        top3_scores = relevance_scores[:3]
+        relevance_not_all_ones = bool(len(top3_scores) < 3 or any(abs(float(score) - 1.0) > 1e-6 for score in top3_scores))
+        report["checks"]["relevance_not_all_1.0"] = relevance_not_all_ones
+        if not relevance_not_all_ones:
+            report["errors"].append("relevance_scores_all_1.0_top3")
+
         record_map = {
             str((row or {}).get("item_id") or "").strip(): dict(row or {})
             for row in list(evidence_audit_payload.get("records") or [])
@@ -786,6 +830,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["retrieval_attempt_count_consistent"] = True
         report["checks"]["retrieval_expansion_recorded"] = True
         report["checks"]["retrieval_quality_triggered_expansion_recorded"] = True
+        report["checks"]["selected_attempt_has_no_key_connector_timeout"] = True
+        report["checks"]["relevance_not_all_1.0"] = True
         report["checks"]["top_picks_not_all_downgrade"] = True
 
     all_urls = []

@@ -83,16 +83,24 @@ def _matches_topic_constraints(
     must_include_terms: Optional[List[str]] = None,
     must_exclude_terms: Optional[List[str]] = None,
 ) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
+    payload = str(text or "").strip().lower()
+    if not payload:
         return False
 
     include_tokens = [str(item or "").strip().lower() for item in list(must_include_terms or []) if str(item or "").strip()]
     exclude_tokens = [str(item or "").strip().lower() for item in list(must_exclude_terms or []) if str(item or "").strip()]
 
-    if include_tokens and not any(token in lowered for token in include_tokens):
+    def _contains_term(value: str, term: str) -> bool:
+        normalized = re.sub(r"[-_/]+", " ", str(value or "").lower())
+        query = str(term or "").strip().lower()
+        if not normalized or not query:
+            return False
+        pattern = r"\b" + re.escape(query).replace(r"\ ", r"[\s\-_]+") + r"\b"
+        return re.search(pattern, normalized) is not None
+
+    if include_tokens and not any(_contains_term(payload, token) for token in include_tokens):
         return False
-    if exclude_tokens and any(token in lowered for token in exclude_tokens):
+    if exclude_tokens and any(_contains_term(payload, token) for token in exclude_tokens):
         return False
     return True
 
@@ -518,6 +526,132 @@ async def fetch_github_topic_search(
                     "extraction_method": "github_topic_search_readme" if readme else "github_topic_search_metadata",
                     "extraction_failed": bool(not readme),
                     "readme_len": len(readme),
+                },
+            )
+        )
+    return items
+
+
+async def fetch_github_query_fallback(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+) -> List[RawItem]:
+    """Fallback GitHub recall when topic-search call path times out."""
+    query_list = _normalize_queries(topic, expanded=False, queries=queries)
+    if not query_list:
+        return []
+
+    max_items = max(1, int(limit))
+    per_query = max(3, int(max_items / max(1, len(query_list))) + 2)
+    window_days = _parse_window_days(time_window)
+    cutoff = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
+
+    def _repo_priority(repo: Any) -> float:
+        stars = float(getattr(repo, "stars", 0) or 0)
+        forks = float(getattr(repo, "forks", 0) or 0)
+        updated = _parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None))
+        recency_bonus = 0.0
+        if updated is not None:
+            age_days = max(0.0, (datetime.now(timezone.utc) - updated).total_seconds() / 86400.0)
+            if age_days <= 2:
+                recency_bonus = 80.0
+            elif age_days <= 7:
+                recency_bonus = 55.0
+            elif age_days <= 14:
+                recency_bonus = 25.0
+        return stars + forks * 2.0 + recency_bonus
+
+    repos_by_full_name: Dict[str, Tuple[Any, str, str]] = {}
+    async with GitHubScraper() as scraper:
+        for query in query_list:
+            for sort_key in ("updated", "stars"):
+                repos = await scraper.search_repos(query=query, max_results=per_query, sort=sort_key, order="desc")
+                for repo in list(repos or []):
+                    full_name = str(getattr(repo, "full_name", "") or "").strip()
+                    if not full_name:
+                        continue
+                    relevance_text = " ".join(
+                        [
+                            full_name,
+                            str(getattr(repo, "description", "") or ""),
+                            " ".join([str(tag) for tag in list(getattr(repo, "topics", []) or [])]),
+                        ]
+                    )
+                    if not _matches_topic_constraints(
+                        text=relevance_text,
+                        must_include_terms=must_include_terms,
+                        must_exclude_terms=must_exclude_terms,
+                    ):
+                        continue
+                    updated_dt = _parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None))
+                    if updated_dt and updated_dt.timestamp() < cutoff:
+                        continue
+                    existing = repos_by_full_name.get(full_name)
+                    if existing is None:
+                        repos_by_full_name[full_name] = (repo, query, sort_key)
+                    else:
+                        prev_repo, _prev_query, _prev_sort = existing
+                        if _repo_priority(repo) > _repo_priority(prev_repo):
+                            repos_by_full_name[full_name] = (repo, query, sort_key)
+                if len(repos_by_full_name) >= max_items * 3:
+                    break
+            if len(repos_by_full_name) >= max_items * 3:
+                break
+
+    ordered = sorted(
+        list(repos_by_full_name.items()),
+        key=lambda pair: _repo_priority(pair[1][0]),
+        reverse=True,
+    )[:max_items]
+
+    items: List[RawItem] = []
+    for full_name, (repo, query, sort_key) in ordered:
+        body = _safe_truncate(
+            "\n\n".join(
+                [
+                    _coalesce_text(getattr(repo, "description", ""), ""),
+                    (
+                        f"Stars: {int(getattr(repo, 'stars', 0) or 0)} | "
+                        f"Forks: {int(getattr(repo, 'forks', 0) or 0)} | "
+                        f"LastPush: {getattr(repo, 'updated_at', '') or 'unknown'}"
+                    ),
+                ]
+            ),
+            max_len=7000,
+        )
+        items.append(
+            RawItem(
+                id=f"github_fallback_{getattr(repo, 'id', full_name)}",
+                source="github",
+                title=full_name,
+                url=_coalesce_text(getattr(repo, "url", ""), f"https://github.com/{full_name}"),
+                body=body,
+                author=getattr(repo, "owner", None),
+                published_at=_parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None)),
+                tier="A",
+                metadata={
+                    "stars": int(getattr(repo, "stars", 0) or 0),
+                    "forks": int(getattr(repo, "forks", 0) or 0),
+                    "watchers": int(getattr(repo, "watchers", 0) or 0),
+                    "last_push": str(getattr(repo, "updated_at", "") or ""),
+                    "language": getattr(repo, "language", None),
+                    "topics": list(getattr(repo, "topics", []) or []),
+                    "item_type": "repo",
+                    "retrieval_mode": "query_fallback",
+                    "source_query": query,
+                    "window_days": window_days,
+                    "search_endpoint": "github_search_repositories",
+                    "fallback_used": True,
+                    "fallback_strategy": "query_then_sort_updated_or_stars",
+                    "fallback_sort": sort_key,
+                    "extraction_method": "github_topic_fallback_metadata",
+                    "extraction_failed": False,
+                    "readme_len": 0,
                 },
             )
         )

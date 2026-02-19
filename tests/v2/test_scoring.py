@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from core import NormalizedItem
 from pipeline_v2.scoring import (
+    evaluate_relevance,
     rank_items,
     score_credibility,
     score_novelty,
@@ -323,3 +324,30 @@ def test_agent_item_without_engagement_signal_is_capped_below_one() -> None:
     )
     ranked = rank_items([item], topic="AI agent", relevance_threshold=0.55)
     assert float(ranked[0].relevance_score) < 0.9
+
+
+def test_generic_agent_evaluation_terms_fail_hard_gate_and_cannot_reach_one() -> None:
+    item = _item(
+        "agent_eval_generic_only",
+        tier="A",
+        source="github",
+        title="Agent evaluation digest",
+        metadata={
+            "credibility": "high",
+            "body_len": 980,
+            "citation_count": 2,
+            "quality_signals": {
+                "content_density": 0.16,
+                "has_quickstart": False,
+                "has_results_or_bench": False,
+                "evidence_links_quality": 1,
+            },
+        },
+    )
+    item.body_md = (
+        "Agent evaluation summary for teams. Agent status update and evaluation checklist only. "
+        "No runtime design, no tool-calling details, and no benchmark evidence."
+    )
+    payload = evaluate_relevance(item, "AI agent")
+    assert payload["hard_pass"] is False
+    assert float(payload["score"]) < 1.0

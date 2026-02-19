@@ -66,6 +66,28 @@ _AGENT_HIGH_VALUE_TOKENS = (
     "agent memory",
 )
 _AGENT_GENERIC_TOKENS = ("agent", "agents", "assistant", "copilot")
+_HANDBOOK_TOKENS = (
+    "handbook",
+    "curated",
+    "resources",
+    "awesome list",
+    "roadmap",
+    "learning path",
+)
+_AGENT_RUNTIME_TOOLING_TOKENS = (
+    "agent runtime",
+    "framework",
+    "orchestration",
+    "tool calling",
+    "function calling",
+    "mcp",
+    "langgraph",
+    "autogen",
+    "crewai",
+    "sdk",
+    "cli",
+    "tooling",
+)
 
 
 @dataclass
@@ -84,6 +106,10 @@ class AuditRecord:
     min_body_len: int
     publish_or_update_time: str
     machine_action: Dict[str, str]
+    evidence_target_alignment: float = 0.0
+    evidence_alignment_hits: int = 0
+    evidence_alignment_total: int = 0
+    link_heavy: bool = False
 
     def model_dump(self) -> Dict[str, Any]:
         return {
@@ -101,6 +127,10 @@ class AuditRecord:
             "min_body_len": int(self.min_body_len),
             "publish_or_update_time": self.publish_or_update_time or "",
             "machine_action": dict(self.machine_action or {}),
+            "evidence_target_alignment": round(float(self.evidence_target_alignment), 4),
+            "evidence_alignment_hits": int(self.evidence_alignment_hits),
+            "evidence_alignment_total": int(self.evidence_alignment_total),
+            "link_heavy": bool(self.link_heavy),
         }
 
 
@@ -216,20 +246,39 @@ def _source_min_body_len(source: str) -> int:
 
 
 def _citation_duplicate_ratio(item: NormalizedItem) -> float:
-    keys: List[str] = []
+    prefixes: List[str] = []
+    domains: List[str] = []
+    path_roots: List[str] = []
     for citation in list(item.citations or []):
         snippet = re.sub(r"\s+", " ", str(citation.snippet or citation.title or "")).strip().lower()
         if not snippet:
             continue
-        prefix = snippet[:48]
+        snippet_tokens = [token for token in re.findall(r"[a-z0-9]+", snippet) if len(token) >= 3]
+        prefix = " ".join(snippet_tokens[:8]) if snippet_tokens else snippet[:48]
+        prefixes.append(prefix)
         url = canonicalize_url(str(citation.url or "").strip())
-        host = str(urlparse(url).netloc or "").strip().lower()
-        path = str(urlparse(url).path or "").strip().lower()[:64]
-        keys.append(f"{host}|{path}|{prefix}")
-    if len(keys) < 2:
+        parsed = urlparse(url) if url else urlparse("")
+        host = str(parsed.netloc or "").strip().lower()
+        path = str(parsed.path or "").strip().lower()
+        if host:
+            domains.append(host)
+        path_parts = [part for part in path.split("/") if part]
+        path_root = "/".join(path_parts[:2]) if path_parts else ""
+        if path_root:
+            path_roots.append(path_root)
+    if len(prefixes) < 2:
         return 0.0
-    unique_keys = len(set(keys))
-    ratio = 1.0 - float(unique_keys) / float(max(1, len(keys)))
+
+    unique_prefixes = len(set(prefixes))
+    ratio = 1.0 - float(unique_prefixes) / float(max(1, len(prefixes)))
+    domain_diversity = float(len(set(domains))) / float(max(1, len(domains)))
+    root_diversity = float(len(set(path_roots))) / float(max(1, len(path_roots)))
+    # Keep duplicate detection strong for same-entity link lists, but soften when
+    # snippets come from clearly distinct domains/pages.
+    if domain_diversity >= 0.7 and root_diversity >= 0.7:
+        ratio *= 0.8
+    elif domain_diversity >= 0.5 and root_diversity >= 0.5:
+        ratio *= 0.9
     return max(0.0, min(1.0, ratio))
 
 
@@ -369,14 +418,102 @@ def _human_reason(reasons: Sequence[str]) -> str:
 
 
 def _contains_any(text: str, terms: Sequence[str]) -> bool:
-    payload = str(text or "").lower()
+    payload = re.sub(r"[-_/]+", " ", str(text or "").lower())
     for term in list(terms or []):
         token = str(term or "").strip().lower()
         if not token:
             continue
-        if re.search(r"\b" + re.escape(token).replace(r"\ ", r"\s+") + r"\b", payload):
+        if re.search(r"\b" + re.escape(token).replace(r"\ ", r"[\s\-_]+") + r"\b", payload):
             return True
     return False
+
+
+def _tokenize(text: str) -> List[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if len(token) >= 2]
+
+
+def _item_alignment_tokens(item: NormalizedItem) -> set[str]:
+    metadata = dict(item.metadata or {})
+    tokens = set(_tokenize(str(item.title or "")))
+    tokens.update(_tokenize(str(metadata.get("repo_id") or "")))
+    tokens.update(_tokenize(str(metadata.get("source_query") or "")))
+    for value in list(metadata.get("topics") or []):
+        tokens.update(_tokenize(str(value or "")))
+    canonical_url = canonicalize_url(str(item.url or "").strip())
+    if canonical_url:
+        parsed = urlparse(canonical_url)
+        tokens.update(_tokenize(str(parsed.path or "")))
+    return {token for token in tokens if token not in {"github", "com", "huggingface", "co"}}
+
+
+def _url_tokens(url: str) -> set[str]:
+    parsed = urlparse(str(url or ""))
+    combined = " ".join([str(parsed.netloc or ""), str(parsed.path or ""), str(parsed.query or "")])
+    return set(_tokenize(combined))
+
+
+def _is_same_repo_reference(url: str, item: NormalizedItem) -> bool:
+    target = canonicalize_url(str(item.url or "").strip())
+    probe = canonicalize_url(str(url or "").strip())
+    if not target or not probe:
+        return False
+    parsed_target = urlparse(target)
+    parsed_probe = urlparse(probe)
+    target_host = str(parsed_target.netloc or "").strip().lower()
+    probe_host = str(parsed_probe.netloc or "").strip().lower()
+    if target_host != probe_host:
+        return False
+    target_parts = [part for part in str(parsed_target.path or "").split("/") if part]
+    probe_parts = [part for part in str(parsed_probe.path or "").split("/") if part]
+    if len(target_parts) < 2 or len(probe_parts) < 2:
+        return False
+    return target_parts[0].lower() == probe_parts[0].lower() and target_parts[1].lower() == probe_parts[1].lower()
+
+
+def _evidence_alignment_scores(
+    *,
+    item: NormalizedItem,
+    urls: Sequence[str],
+    clean_text: str,
+    topic: str,
+) -> List[float]:
+    item_tokens = _item_alignment_tokens(item)
+    topic_tokens = set(_tokenize(topic))
+    topic_tokens.update(
+        {
+            token
+            for term in list(_AGENT_HIGH_VALUE_TOKENS)
+            for token in list(_tokenize(term))
+        }
+    )
+    body_tokens = set(_tokenize(clean_text))
+    scores: List[float] = []
+    for raw in list(urls or []):
+        token = canonicalize_url(str(raw or "").strip())
+        if not token:
+            continue
+        url_terms = _url_tokens(token)
+        overlap_item = len(url_terms.intersection(item_tokens))
+        overlap_topic = len(url_terms.intersection(topic_tokens))
+        overlap_body = len(url_terms.intersection(body_tokens))
+        score = 0.0
+        if _is_same_repo_reference(token, item):
+            score += 0.65
+        if overlap_item >= 3:
+            score += 0.45
+        elif overlap_item == 2:
+            score += 0.35
+        elif overlap_item == 1:
+            score += 0.2
+        if overlap_topic >= 2:
+            score += 0.25
+        elif overlap_topic == 1:
+            score += 0.15
+        if overlap_body >= 2:
+            score += 0.12
+        score = max(0.0, min(1.0, score))
+        scores.append(score)
+    return scores
 
 
 class EvidenceAuditor:
@@ -457,6 +594,18 @@ class EvidenceAuditor:
         duplicate_ratio = _citation_duplicate_ratio(item)
         urls = _collect_evidence_urls(item)
         domains = _domains(urls)
+        clean_text = str(metadata.get("clean_text") or item.body_md or "")
+        alignment_scores = _evidence_alignment_scores(
+            item=item,
+            urls=urls,
+            clean_text=clean_text,
+            topic=str(self._topic or ""),
+        )
+        evidence_target_alignment = (
+            float(sum(alignment_scores)) / float(max(1, len(alignment_scores))) if alignment_scores else 0.0
+        )
+        evidence_alignment_hits = int(sum(1 for value in list(alignment_scores or []) if float(value) >= 0.55))
+        link_heavy = bool(len(urls) >= 4 or evidence_links_quality >= 4)
 
         verdict = VERDICT_PASS
         reasons: List[str] = []
@@ -505,6 +654,22 @@ class EvidenceAuditor:
                 reason=f"evidence_links_quality_lt_min:{evidence_links_quality}<{effective_min_evidence}",
             )
 
+        if link_heavy and evidence_target_alignment < 0.35:
+            alignment_target = VERDICT_REJECT if evidence_alignment_hits <= 0 else VERDICT_DOWNGRADE
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=alignment_target,
+                reason="link_heavy_low_alignment",
+            )
+        elif len(urls) >= 3 and evidence_target_alignment < 0.22 and evidence_alignment_hits <= 1:
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason="evidence_alignment_weak",
+            )
+
         if duplicate_ratio > self._duplicate_ratio_threshold:
             duplicate_target = VERDICT_REJECT
             if len(domains) >= 2 and evidence_links_quality >= effective_min_evidence:
@@ -531,7 +696,6 @@ class EvidenceAuditor:
                     reason="missing_publish_or_update_time",
                 )
 
-        clean_text = str(metadata.get("clean_text") or item.body_md or "")
         head_text = " ".join(re.split(r"[.!?;\n]+", clean_text)[:3]).strip()
         if _looks_marketing(head_text) and not _has_verifiable_point(clean_text):
             verdict = self._apply_rule(
@@ -550,6 +714,15 @@ class EvidenceAuditor:
             )
 
         text = " ".join([str(item.title or ""), clean_text]).lower()
+        handbook_like = _contains_any(text, _HANDBOOK_TOKENS)
+        has_runtime_tooling_signal = _contains_any(text, _AGENT_RUNTIME_TOOLING_TOKENS)
+        if self._is_agent_topic() and handbook_like and not has_runtime_tooling_signal:
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason="handbook_like_for_agent_topic",
+            )
         hard_terms = [str(value).strip().lower() for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()]
         agent_non_generic_hits = [
             str(value).strip().lower()
@@ -648,6 +821,7 @@ class EvidenceAuditor:
         if source_key == "github":
             stars = int(float(metadata.get("stars", 0) or 0))
             forks = int(float(metadata.get("forks", 0) or 0))
+            retrieval_window_days = int(float(metadata.get("retrieval_window_days", 0) or 0))
             canonical_item_url = canonicalize_url(str(item.url or "").strip())
             parsed_item = urlparse(canonical_item_url) if canonical_item_url else None
             repo_root_path = ""
@@ -721,6 +895,23 @@ class EvidenceAuditor:
                     reason=f"github_traction_unproven:{stars}/{forks}",
                 )
 
+            if (
+                self._is_agent_topic()
+                and retrieval_window_days >= 7
+                and stars < 800
+                and forks < 80
+                and not has_release_note
+                and not has_benchmark
+                and not cross_source_corroborated
+                and not has_external_discussion
+            ):
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_DOWNGRADE,
+                    reason=f"github_weekly_trending_signal_weak:{stars}/{forks}",
+                )
+
         if source_key == "huggingface" and self._is_agent_topic():
             has_cv_token = _contains_any(text, _CV_OFFTOPIC_TOKENS)
             has_agent_high_value = _contains_any(text, _AGENT_HIGH_VALUE_TOKENS)
@@ -747,6 +938,9 @@ class EvidenceAuditor:
                 "hf_cv_offtopic_for_agent_topic",
                 "hn_low_engagement",
                 "agent_semantic_weak",
+                "link_heavy_low_alignment",
+                "handbook_like_for_agent_topic",
+                "evidence_alignment_weak",
             }
             reason_codes = {_reason_code(reason) for reason in list(reasons or [])}
             if not reason_codes.intersection(hard_reject_reasons) and "evidence_high_trust_missing" not in reason_codes:
@@ -754,7 +948,7 @@ class EvidenceAuditor:
                 if "cross_source_corroboration_bonus" not in reasons:
                     reasons.append("cross_source_corroboration_bonus")
 
-        if source_key in {"github", "huggingface"} and verdict == VERDICT_PASS:
+        if source_key in {"github", "huggingface"} and verdict != VERDICT_REJECT:
             if not _has_high_trust_technical_evidence(urls):
                 verdict = self._apply_rule(
                     verdict=verdict,
@@ -763,7 +957,17 @@ class EvidenceAuditor:
                     reason="evidence_high_trust_missing",
                 )
 
+        preferred_codes = [
+            "link_heavy_low_alignment",
+            "handbook_like_for_agent_topic",
+            "evidence_alignment_weak",
+        ]
+        reason_codes = [_reason_code(reason) for reason in list(reasons or [])]
         primary_code = _reason_code(reasons[0] if reasons else "")
+        for code in preferred_codes:
+            if code in reason_codes:
+                primary_code = code
+                break
         machine_action = {
             "action": verdict,
             "reason_code": primary_code if verdict != VERDICT_PASS else "ok",
@@ -785,6 +989,10 @@ class EvidenceAuditor:
             min_body_len=min_body_len,
             publish_or_update_time=publish_or_update_time,
             machine_action=machine_action,
+            evidence_target_alignment=float(evidence_target_alignment),
+            evidence_alignment_hits=int(evidence_alignment_hits),
+            evidence_alignment_total=int(len(alignment_scores)),
+            link_heavy=bool(link_heavy),
         )
 
     def audit_rows(self, *, ranked_rows: Sequence[Any]) -> List[AuditRecord]:

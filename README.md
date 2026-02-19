@@ -1,6 +1,45 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Timeout-Resilient Retrieval + Relevance/Evidence Hardening (New)
+- 本次目标：
+  - 修复 live `--time_window 7d --topic "AI agent"` 下“topic 检索超时导致召回塌陷、但该 attempt 仍被选中”的核心缺陷。
+  - 修复 handbook/link-heavy 内容因外链数量偏置而误过审计的问题。
+  - 收紧 AI agent 主题相关性门禁，抑制 `agent/evaluation` 等泛词误抬分。
+- 策略变化：
+  - `pipeline_v2/runtime.py`
+    - attempt 选择新增硬规则：`fetch_github_topic_search` 等关键 connector timeout 的 attempt 不得被选中（除非所有 attempt 都 key-timeout）。
+    - timeout/partial failure 进入 attempt 质量分惩罚，并在 `retrieval_diagnosis.json` 的 `attempt.failures[]` 和 `explain` 结构化落盘。
+    - GitHub topic 检索 timeout 支持配置 + 自适应：7d/query_expanded 自动提高 timeout/retry；超时后自动启用 query fallback（`fallback_used=true`）。
+  - `sources/connectors.py`
+    - 新增 `fetch_github_query_fallback`，topic 检索失败时按 query + updated/stars 回退召回。
+    - source filter include/exclude 升级为 token/词边界匹配（连字符/下划线兼容）。
+  - `pipeline_v2/topic_profile.py` + `pipeline_v2/scoring.py`
+    - hard gate 收紧：AI agent 需 `>=2` 高价值词，或 `>=1` 高价值词 + 证据信号（quickstart/demo/benchmark/tool calling/orchestration/mcp/langgraph/autogen/crewai）。
+    - 从子串匹配升级为词边界/token 级匹配，并处理否定上下文（`no/not/without ...`）。
+    - `relevance=1.0` 仅在“高价值词 + 内容密度/可验证性 + 更新/热度信号”三者同时满足时允许，否则封顶在 `0.85/0.90`。
+    - 排序加入 `recent_update_signal` / `stars_delta_proxy`，7d 模式优先近 7 天活跃信号。
+  - `pipeline_v2/evidence_auditor.py`
+    - 证据审计拆分“数量”与“对齐度（evidence-target alignment）”；link-heavy 且低对齐触发 `link_heavy_low_alignment` downgrade/reject。
+    - AI agent 下 handbook-like（handbook/curated/resources/awesome list/roadmap/learning）默认 downgrade（除非具备 runtime/tooling 信号）。
+    - 修复 citation 重复误判：不再因 URL 查询参数导致重复比率被错误压低。
+  - `scripts/validate_artifacts_v2.py`
+    - 新增门禁：`selected_attempt_has_no_key_connector_timeout`、`top_picks_not_link_heavy_low_alignment`、`relevance_not_all_1.0`。
+- 默认阈值（关键）：
+  - `ARA_CONNECTOR_TIMEOUT_GH_TOPIC`：默认继承 `ARA_V2_CONNECTOR_TIMEOUT_SEC`（默认 `20s`）。
+  - 7d 阶段 GH topic timeout multiplier：`1.6x`；`query_expanded` 阶段：`2.0x`。
+  - `ARA_CONNECTOR_RETRY_GH_TOPIC`：默认 `1`，但 `7d` 至少 `2` 次，`query_expanded` 至少 `3` 次（指数退避）。
+  - attempt 超时惩罚：connector timeout `-800`；key connector timeout 额外 `-2500`。
+  - alignment 门限：`link_heavy && alignment < 0.35` => downgrade/reject；`len(urls)>=3 && alignment < 0.22` => downgrade。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `python main.py run-once --mode live --topic "AI agent" --time_window 7d --tz Asia/Singapore --targets web --top-k 3`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <run_dir>/renders`
+- 风险与回滚：
+  - 风险：相关性与审计门槛上调后，弱信号时段可能更容易出现 `<top_k`，但会在诊断/onepager 明确“降级/短缺原因”。
+  - 风险：GH topic timeout/retry 上调会增加单次 run 的等待时间上限。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Time-Window Integrity Fix (No Reverse Narrowing + Correct Today Semantics) (New)
 - 本次目标：
   - 修复 `time_window=7d` 却被扩检阶段反向缩窄到 `3d` 的策略错误，避免 7 天查询与 today 产物高度同质。

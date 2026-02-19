@@ -44,11 +44,21 @@ def _topic_tokens(topic: str) -> List[str]:
 
 
 def _contains_term(text: str, term: str) -> bool:
-    payload = str(text or "").lower()
+    payload = re.sub(r"[-_/]+", " ", str(text or "").lower())
     token = str(term or "").strip().lower()
     if not payload or not token:
         return False
-    pattern = r"\b" + re.escape(token).replace(r"\ ", r"\s+") + r"\b"
+    pattern = r"\b" + re.escape(token).replace(r"\ ", r"[\s\-_]+") + r"\b"
+    return re.search(pattern, payload) is not None
+
+
+def _contains_negated_term(text: str, term: str) -> bool:
+    payload = re.sub(r"[-_/]+", " ", str(text or "").lower())
+    token = str(term or "").strip().lower()
+    if not payload or not token:
+        return False
+    term_pattern = re.escape(token).replace(r"\ ", r"[\s\-_]+")
+    pattern = r"\b(?:no|not|without|lack|lacks|lacking)\s+(?:[a-z0-9_-]+\s+){0,2}" + term_pattern + r"\b"
     return re.search(pattern, payload) is not None
 
 
@@ -80,6 +90,9 @@ class TopicProfile:
     source_filters: Mapping[str, Mapping[str, Tuple[str, ...]]]
     buckets: Tuple[TopicBucket, ...]
     requires_hard_gate: bool = False
+    high_value_terms: Tuple[str, ...] = ()
+    generic_terms: Tuple[str, ...] = ()
+    evidence_terms: Tuple[str, ...] = ()
 
     @property
     def minimum_bucket_coverage(self) -> int:
@@ -93,7 +106,34 @@ class TopicProfile:
             return True
         if not self.hard_include_any:
             return True
-        return len(self.matched_hard_terms(text)) > 0
+        hard_hits = self.matched_hard_terms(text)
+        if self.key != "ai_agent":
+            return len(hard_hits) > 0
+
+        high_value_hits = self.matched_high_value_terms(text)
+        high_value_count = len(
+            {str(value).strip().lower() for value in list(high_value_hits or []) if str(value).strip()}
+        )
+        if high_value_count >= 2:
+            return True
+        if high_value_count >= 1 and self.has_evidence_signal(text):
+            return True
+        return False
+
+    def matched_high_value_terms(self, text: str) -> List[str]:
+        return [
+            term
+            for term in list(self.high_value_terms or ())
+            if _contains_term(text, term) and not _contains_negated_term(text, term)
+        ]
+
+    def has_evidence_signal(self, text: str) -> bool:
+        if not self.evidence_terms:
+            return False
+        return any(
+            _contains_term(text, term) and not _contains_negated_term(text, term)
+            for term in list(self.evidence_terms or ())
+        )
 
     def matched_soft_boost_terms(self, text: str) -> List[str]:
         matches: List[str] = []
@@ -357,6 +397,35 @@ class TopicProfile:
                 },
                 buckets=buckets,
                 requires_hard_gate=True,
+                high_value_terms=(
+                    "mcp",
+                    "model context protocol",
+                    "tool calling",
+                    "function calling",
+                    "orchestration",
+                    "agent runtime",
+                    "langgraph",
+                    "autogen",
+                    "crewai",
+                    "agent framework",
+                    "agent eval",
+                    "agent benchmark",
+                ),
+                generic_terms=("agent", "agents", "assistant", "copilot", "evaluation"),
+                evidence_terms=(
+                    "quickstart",
+                    "demo",
+                    "benchmark",
+                    "tool calling",
+                    "function calling",
+                    "orchestration",
+                    "mcp",
+                    "langgraph",
+                    "autogen",
+                    "crewai",
+                    "runtime",
+                    "workflow",
+                ),
             )
 
         core_terms = tuple(_dedupe(tokens[:6] or ([raw_topic] if raw_topic else [])))
@@ -381,4 +450,7 @@ class TopicProfile:
             },
             buckets=(bucket,),
             requires_hard_gate=False,
+            high_value_terms=(),
+            generic_terms=(),
+            evidence_terms=(),
         )

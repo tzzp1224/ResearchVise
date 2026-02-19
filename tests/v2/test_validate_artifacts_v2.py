@@ -58,6 +58,9 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["retrieval_quality_triggered_expansion_recorded"] is True
     assert report["checks"]["facts_no_truncated_words"] is True
     assert report["checks"]["top_picks_hard_relevance_invariants"] is True
+    assert report["checks"]["selected_attempt_has_no_key_connector_timeout"] is True
+    assert report["checks"]["top_picks_not_link_heavy_low_alignment"] is True
+    assert report["checks"]["relevance_not_all_1.0"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:
@@ -199,3 +202,55 @@ def test_validate_artifacts_v2_allows_live_shortage_when_why_not_more_present(tm
     report = json.loads(validated.stdout)
     assert report["checks"]["candidate_shortage_explained"] is True
     assert not any(str(err).startswith("candidate_shortage_without_explanation:") for err in list(report.get("errors") or []))
+
+
+def test_validate_artifacts_v2_flags_selected_key_timeout_attempt(tmp_path: Path) -> None:
+    smoke_dir = tmp_path / "smoke_key_timeout"
+    payload = json.loads(
+        subprocess.run([sys.executable, "scripts/e2e_smoke_v2.py", "--out-dir", str(smoke_dir)], check=True, capture_output=True, text=True).stdout
+    )
+    run_id = str(payload["run_id"])
+    render_job_id = str(payload["render_job_id"])
+    run_dir = smoke_dir / "runs" / run_id
+    render_dir = smoke_dir / "render_jobs" / render_job_id
+
+    run_context_path = run_dir / "run_context.json"
+    run_context = json.loads(run_context_path.read_text(encoding="utf-8"))
+    run_context["data_mode"] = "live"
+    run_context_path.write_text(json.dumps(run_context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    onepager_path = run_dir / "onepager.md"
+    onepager_path.write_text(
+        onepager_path.read_text(encoding="utf-8").replace("DataMode: `smoke`", "DataMode: `live`"),
+        encoding="utf-8",
+    )
+
+    diagnosis_path = run_dir / "retrieval_diagnosis.json"
+    diagnosis = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+    attempts = list(diagnosis.get("attempts") or [])
+    if attempts:
+        attempts[0]["has_key_connector_timeout"] = True
+        diagnosis["attempts"] = attempts
+        diagnosis["selected_attempt"] = 1
+    diagnosis["selected_attempt_has_key_connector_timeout"] = True
+    diagnosis["all_attempts_key_connector_timeout"] = False
+    diagnosis["key_connector_timeout_degraded_result"] = False
+    diagnosis_path.write_text(json.dumps(diagnosis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    validated = subprocess.run(
+        [
+            sys.executable,
+            "scripts/validate_artifacts_v2.py",
+            "--run-dir",
+            str(run_dir),
+            "--render-dir",
+            str(render_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 1
+    report = json.loads(validated.stdout)
+    assert report["checks"]["selected_attempt_has_no_key_connector_timeout"] is False
+    assert "selected_attempt_has_key_connector_timeout" in list(report.get("errors") or [])
