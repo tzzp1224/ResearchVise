@@ -7,6 +7,8 @@ from core import RawItem, RunMode, RunRequest
 from orchestrator import RunOrchestrator
 from orchestrator.queue import InMemoryRunQueue
 from orchestrator.store import InMemoryRunStore
+from pipeline_v2.evidence_auditor import AuditRecord
+from pipeline_v2.retrieval_controller import SelectionController
 from pipeline_v2.runtime import RunPipelineRuntime
 from render.adapters import BaseRendererAdapter, ShotRenderResult
 from render.manager import RenderManager
@@ -176,9 +178,58 @@ def test_quality_trigger_forces_expansion_even_when_topk_is_filled(tmp_path: Pat
     assert attempts
 
     base = attempts[0]
-    assert int(base.get("top_picks_count", 0)) == 3
+    assert int(base.get("pass_count", 0)) < 3
     assert float(base.get("top_picks_min_relevance", 1.0)) < 0.75
     assert bool(base.get("quality_triggered_expansion")) is True
 
     assert bool(diagnosis.get("quality_triggered_expansion")) is True
     assert str(diagnosis.get("selected_phase") or "") != "base"
+
+
+def test_controller_triggers_expansion_when_all_candidates_downgraded() -> None:
+    from types import SimpleNamespace
+
+    def _row(item_id: str, source: str, bucket: str):
+        item = SimpleNamespace(id=item_id, source=source, metadata={"bucket_hits": [bucket]})
+        return SimpleNamespace(item=item)
+
+    rows = [_row("a", "github", "Frameworks"), _row("b", "hackernews", "Protocols & tool use")]
+    records = [
+        AuditRecord(
+            item_id="a",
+            title="a",
+            source="github",
+            rank=1,
+            verdict="downgrade",
+            reasons=["weak_evidence"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=1,
+            body_len=620,
+            min_body_len=600,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "downgrade", "reason_code": "weak_evidence", "human_reason": "weak"},
+        ),
+        AuditRecord(
+            item_id="b",
+            title="b",
+            source="hackernews",
+            rank=2,
+            verdict="downgrade",
+            reasons=["weak_evidence"],
+            used_evidence_urls=[],
+            evidence_domains=[],
+            citation_duplicate_prefix_ratio=0.0,
+            evidence_links_quality=1,
+            body_len=620,
+            min_body_len=600,
+            publish_or_update_time="2026-02-18T10:00:00Z",
+            machine_action={"action": "downgrade", "reason_code": "weak_evidence", "human_reason": "weak"},
+        ),
+    ]
+    controller = SelectionController(requested_top_k=2)
+    outcome = controller.evaluate(ranked_rows=rows, audit_records=records, allow_downgrade_fill=False)
+    decision = controller.expansion_decision(outcome=outcome)
+    assert decision.should_expand is True
+    assert any("pass_count_lt_2" in reason for reason in list(decision.reasons or []))

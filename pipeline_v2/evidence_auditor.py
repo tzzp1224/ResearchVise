@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from core import NormalizedItem
 from pipeline_v2.sanitize import canonicalize_url, is_allowed_citation_url
+from pipeline_v2.topic_profile import TopicProfile
 
 
 VERDICT_PASS = "pass"
@@ -35,6 +36,25 @@ _HYPE_RE = re.compile(
     r"\b(best|most|revolutionary|amazing|ultimate|world[- ]class|ever built|game[- ]changing)\b",
     re.IGNORECASE,
 )
+_CV_OFFTOPIC_TOKENS = (
+    "clip",
+    "vit",
+    "vision transformer",
+    "diffusion",
+    "image classification",
+    "text-to-image",
+)
+_AGENT_HIGH_VALUE_TOKENS = (
+    "mcp",
+    "tool calling",
+    "function calling",
+    "orchestration",
+    "langgraph",
+    "autogen",
+    "crewai",
+    "agent eval",
+    "benchmark",
+)
 
 
 @dataclass
@@ -52,6 +72,7 @@ class AuditRecord:
     body_len: int
     min_body_len: int
     publish_or_update_time: str
+    machine_action: Dict[str, str]
 
     def model_dump(self) -> Dict[str, Any]:
         return {
@@ -68,6 +89,7 @@ class AuditRecord:
             "body_len": int(self.body_len),
             "min_body_len": int(self.min_body_len),
             "publish_or_update_time": self.publish_or_update_time or "",
+            "machine_action": dict(self.machine_action or {}),
         }
 
 
@@ -183,12 +205,71 @@ def _is_evergreen_source(source: str) -> bool:
     return str(source or "").strip().lower() in {"arxiv", "semantic_scholar", "openreview"}
 
 
+def _reason_code(reason: str) -> str:
+    token = str(reason or "").strip()
+    if not token:
+        return "unspecified"
+    if ":" in token:
+        return token.split(":", 1)[0].strip().lower() or "unspecified"
+    return token.lower()
+
+
+def _human_reason(reasons: Sequence[str]) -> str:
+    values = [str(reason).strip() for reason in list(reasons or []) if str(reason).strip()]
+    if not values:
+        return "passed evidence audit checks"
+    return "; ".join(values)
+
+
+def _contains_any(text: str, terms: Sequence[str]) -> bool:
+    payload = str(text or "").lower()
+    for term in list(terms or []):
+        token = str(term or "").strip().lower()
+        if not token:
+            continue
+        if re.search(r"\b" + re.escape(token).replace(r"\ ", r"\s+") + r"\b", payload):
+            return True
+    return False
+
+
 class EvidenceAuditor:
     """Rule-based quality/evidence auditor for candidate gating."""
 
-    def __init__(self, *, min_evidence_links_quality: int = 2, duplicate_ratio_threshold: float = 0.6) -> None:
+    def __init__(
+        self,
+        *,
+        min_evidence_links_quality: int = 2,
+        duplicate_ratio_threshold: float = 0.6,
+        topic: str | None = None,
+        topic_profile: TopicProfile | None = None,
+    ) -> None:
         self._min_evidence_links_quality = max(1, int(min_evidence_links_quality))
         self._duplicate_ratio_threshold = float(max(0.0, min(1.0, duplicate_ratio_threshold)))
+        self._topic = str(topic or "").strip()
+        self._topic_profile = topic_profile
+
+    def _is_agent_topic(self) -> bool:
+        if self._topic_profile and str(self._topic_profile.key or "").strip().lower() == "ai_agent":
+            return True
+        return "agent" in str(self._topic or "").lower()
+
+    @staticmethod
+    def _promote_verdict(current: str, target: str) -> str:
+        order = {VERDICT_PASS: 0, VERDICT_DOWNGRADE: 1, VERDICT_REJECT: 2}
+        return target if order.get(target, 0) >= order.get(current, 0) else current
+
+    def _apply_rule(
+        self,
+        *,
+        verdict: str,
+        reasons: List[str],
+        target: str,
+        reason: str,
+    ) -> str:
+        updated = self._promote_verdict(verdict, target)
+        if reason not in reasons:
+            reasons.append(reason)
+        return updated
 
     def audit_row(self, row: Any, rank: int) -> AuditRecord:
         item = row.item
@@ -206,40 +287,117 @@ class EvidenceAuditor:
         reasons: List[str] = []
 
         if body_len < min_body_len:
-            verdict = VERDICT_DOWNGRADE
-            reasons.append(f"body_len_lt_min:{body_len}<{min_body_len}")
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason=f"body_len_lt_min:{body_len}<{min_body_len}",
+            )
 
         if evidence_links_quality < self._min_evidence_links_quality:
             if evidence_links_quality <= 0:
-                verdict = VERDICT_REJECT
-            elif verdict != VERDICT_REJECT:
-                verdict = VERDICT_DOWNGRADE
-            reasons.append(
-                f"evidence_links_quality_lt_min:{evidence_links_quality}<{self._min_evidence_links_quality}"
+                target = VERDICT_REJECT
+            else:
+                target = VERDICT_DOWNGRADE
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=target,
+                reason=f"evidence_links_quality_lt_min:{evidence_links_quality}<{self._min_evidence_links_quality}",
             )
 
         if duplicate_ratio > self._duplicate_ratio_threshold:
-            verdict = VERDICT_REJECT
-            reasons.append(
-                f"citation_duplicate_prefix_ratio_gt_threshold:{duplicate_ratio:.2f}>{self._duplicate_ratio_threshold:.2f}"
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_REJECT,
+                reason=f"citation_duplicate_prefix_ratio_gt_threshold:{duplicate_ratio:.2f}>{self._duplicate_ratio_threshold:.2f}",
             )
 
         if not publish_or_update_time and not _is_evergreen_source(item.source):
-            if verdict != VERDICT_REJECT:
-                verdict = VERDICT_DOWNGRADE
-            reasons.append("missing_publish_or_update_time")
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason="missing_publish_or_update_time",
+            )
 
         clean_text = str(metadata.get("clean_text") or item.body_md or "")
         head_text = " ".join(re.split(r"[.!?;\n]+", clean_text)[:3]).strip()
         if _looks_marketing(head_text) and not _has_verifiable_point(clean_text):
-            if verdict != VERDICT_REJECT:
-                verdict = VERDICT_DOWNGRADE
-            reasons.append("marketing_declaration_without_verifiable_points")
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason="marketing_declaration_without_verifiable_points",
+            )
 
         if _repo_self_only(urls):
-            if verdict != VERDICT_REJECT:
-                verdict = VERDICT_DOWNGRADE
-            reasons.append("single_domain_repo_self_evidence")
+            verdict = self._apply_rule(
+                verdict=verdict,
+                reasons=reasons,
+                target=VERDICT_DOWNGRADE,
+                reason="single_domain_repo_self_evidence",
+            )
+
+        source_key = str(item.source or "").strip().lower()
+        text = " ".join([str(item.title or ""), clean_text]).lower()
+        has_quickstart = bool(signals.get("has_quickstart"))
+        has_results = bool(signals.get("has_results_or_bench"))
+        has_multi_domain_evidence = len(domains) >= 2
+        has_release_note = any("/releases/" in str(urlparse(url).path or "").lower() for url in urls)
+
+        if source_key == "hackernews":
+            points = int(float(metadata.get("points", 0) or 0))
+            comments = int(float(metadata.get("comment_count", metadata.get("comments", 0)) or 0))
+            has_strong_signal = bool(
+                has_multi_domain_evidence and (has_quickstart or has_results or evidence_links_quality >= 3)
+            )
+            if points < 5 and comments < 2 and not has_strong_signal:
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_REJECT,
+                    reason=f"hn_low_engagement:{points}/{comments}",
+                )
+
+        if source_key == "github":
+            stars = int(float(metadata.get("stars", 0) or 0))
+            forks = int(float(metadata.get("forks", 0) or 0))
+            has_benchmark = has_results or ("benchmark" in text)
+            if stars < 30 and forks < 5 and not has_release_note and not has_benchmark and not has_quickstart:
+                target = VERDICT_REJECT if stars < 10 and forks < 2 else VERDICT_DOWNGRADE
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=target,
+                    reason=f"github_low_signal_repo:{stars}/{forks}",
+                )
+
+        if source_key == "huggingface" and self._is_agent_topic():
+            has_cv_token = _contains_any(text, _CV_OFFTOPIC_TOKENS)
+            has_agent_high_value = _contains_any(text, _AGENT_HIGH_VALUE_TOKENS)
+            if has_cv_token and not has_agent_high_value:
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_REJECT,
+                    reason="hf_cv_offtopic_for_agent_topic",
+                )
+            if not has_agent_high_value and evidence_links_quality < self._min_evidence_links_quality:
+                verdict = self._apply_rule(
+                    verdict=verdict,
+                    reasons=reasons,
+                    target=VERDICT_REJECT,
+                    reason="hf_missing_agent_signals",
+                )
+
+        primary_code = _reason_code(reasons[0] if reasons else "")
+        machine_action = {
+            "action": verdict,
+            "reason_code": primary_code if verdict != VERDICT_PASS else "ok",
+            "human_reason": _human_reason(reasons),
+        }
 
         return AuditRecord(
             item_id=item.id,
@@ -255,7 +413,14 @@ class EvidenceAuditor:
             body_len=body_len,
             min_body_len=min_body_len,
             publish_or_update_time=publish_or_update_time,
+            machine_action=machine_action,
         )
+
+    def audit_rows(self, *, ranked_rows: Sequence[Any]) -> List[AuditRecord]:
+        records: List[AuditRecord] = []
+        for idx, row in enumerate(list(ranked_rows or []), start=1):
+            records.append(self.audit_row(row, rank=idx))
+        return records
 
     def audit_and_select(
         self,
@@ -265,13 +430,8 @@ class EvidenceAuditor:
         top_count: int,
     ) -> AuditSelection:
         top_n = max(1, int(top_count))
-        records: List[AuditRecord] = []
-        records_by_id: Dict[str, AuditRecord] = {}
-
-        for idx, row in enumerate(list(ranked_rows or []), start=1):
-            record = self.audit_row(row, rank=idx)
-            records.append(record)
-            records_by_id[record.item_id] = record
+        records = self.audit_rows(ranked_rows=ranked_rows)
+        records_by_id: Dict[str, AuditRecord] = {record.item_id: record for record in list(records)}
 
         selected: List[Any] = []
         selected_ids = set()
@@ -324,6 +484,9 @@ class EvidenceAuditor:
 
 
 class EvidenceAuditorProtocol(Protocol):
+    def audit_rows(self, *, ranked_rows: Sequence[Any]) -> List[AuditRecord]:
+        ...
+
     def audit_and_select(
         self,
         *,

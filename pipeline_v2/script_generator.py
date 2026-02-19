@@ -21,6 +21,7 @@ _FACT_NOISE_PATTERNS = (
     re.compile(r"\blast(push|_push|_modified)?\s*:\s*", re.IGNORECASE),
     re.compile(r"\b(?:readme|license|contributing)\b", re.IGNORECASE),
 )
+_HN_META_LINE = re.compile(r"^\s*Points:\s*\d+\s*(?:\|\s*Comments:\s*\d+)?\s*$", re.IGNORECASE)
 _SECTION_HEADER = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 _SECTION_PRIORITY = {
     "overview": 1.2,
@@ -59,11 +60,20 @@ def _compact_text(value: str, max_len: int) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_len:
         return text
-    return text[: max_len - 3].rstrip() + "..."
+    if max_len <= 3:
+        return text[:max_len]
+    trimmed = text[: max_len - 3].rstrip()
+    if " " in trimmed:
+        safe = trimmed.rsplit(" ", 1)[0].rstrip()
+        if len(safe) >= max(12, int(max_len * 0.55)):
+            trimmed = safe
+    return trimmed + "..."
 
 
 def _clean_sentence(text: str, *, max_len: int = 220) -> str:
     value = str(text or "")
+    if _HN_META_LINE.match(value.strip()):
+        return ""
     value = re.sub(r"^\s*>+\s*", "", value)
     value = _HTML_TAGS.sub(" ", value)
     value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", value)
@@ -102,6 +112,8 @@ def _split_sections(text: str) -> Dict[str, str]:
     sections: Dict[str, List[str]] = {"root": []}
     current = "root"
     for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        if _HN_META_LINE.match(str(line or "").strip()):
+            continue
         header = _SECTION_HEADER.match(str(line or "").strip())
         if header:
             current = str(header.group(1) or "").strip().lower()
@@ -181,6 +193,8 @@ def _is_fact_noise(sentence: str) -> bool:
     text = str(sentence or "").strip()
     if not text:
         return True
+    if _HN_META_LINE.match(text):
+        return True
     lowered = text.lower()
     if lowered in {"---", "*", "-"}:
         return True
@@ -230,7 +244,13 @@ def _platform_hint(platform: str) -> Dict[str, str]:
 
 def _body_text(item: NormalizedItem) -> str:
     metadata = dict(item.metadata or {})
-    return str(metadata.get("clean_text") or item.body_md or "")
+    text = str(metadata.get("clean_text") or item.body_md or "")
+    cleaned_lines = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if _HN_META_LINE.match(str(line or "").strip()):
+            continue
+        cleaned_lines.append(str(line))
+    return "\n".join(cleaned_lines).strip()
 
 
 def _links(item: NormalizedItem) -> List[str]:
@@ -294,6 +314,8 @@ def _clean_fact_point(text: str, *, max_len: int = 160) -> str:
     value = _clean_sentence(text, max_len=max_len)
     value = re.sub(r"^(?:[-*•]+\s*)", "", value).strip()
     value = re.sub(r"\s+", " ", value).strip()
+    if value and re.search(r"[a-zA-Z0-9]$", value) and not re.search(r"[.!?。！？]$", value):
+        value = value + "."
     return value
 
 

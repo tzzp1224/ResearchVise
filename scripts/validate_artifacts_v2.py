@@ -109,6 +109,32 @@ def _evidence_dedup_issues(onepager: str) -> List[str]:
     return issues
 
 
+def _facts_truncated_issues(facts_payload: Dict) -> List[str]:
+    issues: List[str] = []
+    fields = {
+        "what_it_is": [str(facts_payload.get("what_it_is") or "")],
+        "how_it_works": [str(value) for value in list(facts_payload.get("how_it_works") or [])],
+        "proof": [str(value) for value in list(facts_payload.get("proof") or [])],
+    }
+    for field, values in fields.items():
+        for idx, raw in enumerate(values, start=1):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            if re.search(r"[A-Za-z]{4,}[\"',]\S", text):
+                issues.append(f"{field}_{idx}:punct_join_no_space")
+            tail = re.search(r"([A-Za-z]{1,12})\s*$", text)
+            if tail:
+                token = str(tail.group(1) or "")
+                if (
+                    len(token) < 6
+                    and len(text) > 30
+                    and not text.endswith((".", "!", "?", "。", "！", "？"))
+                ):
+                    issues.append(f"{field}_{idx}:short_tail_fragment:{token}")
+    return issues
+
+
 def _ffprobe_info(path: Path) -> Tuple[bool, Dict, str]:
     probe_bin = shutil.which("ffprobe")
     if not probe_bin:
@@ -320,6 +346,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("script_citation_denylist:" + ",".join(sorted(set(script_bad_urls))[:6]))
 
     onepager_urls: List[str] = []
+    onepager_has_why_not_more = False
     if onepager_path.exists():
         onepager = onepager_path.read_text(encoding="utf-8")
         urls = _extract_urls(onepager)
@@ -373,6 +400,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["details"]["onepager_quality_triggered_expansion"] = (
             str(quality_trigger_match.group(1)).strip().lower() == "true" if quality_trigger_match else None
         )
+        onepager_has_why_not_more = bool(re.search(r"^##\s+Why not more\?\s*$", onepager, flags=re.MULTILINE))
+        report["details"]["onepager_has_why_not_more"] = onepager_has_why_not_more
         report["checks"]["onepager_diagnosis_path_present"] = bool(diagnosis_header_path and diagnosis_header_path != "N/A")
         report["checks"]["onepager_evidence_audit_path_present"] = bool(
             evidence_audit_header_path and evidence_audit_header_path != "N/A"
@@ -496,8 +525,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         has_why = bool(str(facts_payload.get("why_now") or "").strip())
         proof_list = [str(item).strip() for item in list(facts_payload.get("proof") or []) if str(item).strip()]
         report["checks"]["facts_has_why_now_and_proof"] = bool(has_why and proof_list)
+        truncated_issues = _facts_truncated_issues(facts_payload)
+        report["checks"]["facts_no_truncated_words"] = len(truncated_issues) == 0
+        report["details"]["facts_truncated_issues"] = truncated_issues
         if not report["checks"]["facts_has_why_now_and_proof"]:
             report["errors"].append("facts_missing_why_now_or_proof")
+        if truncated_issues:
+            report["errors"].append("facts_truncated_words:" + ",".join(truncated_issues[:6]))
+    else:
+        report["checks"]["facts_no_truncated_words"] = False
 
     if storyboard_path.exists():
         storyboard = _load_json(storyboard_path)
@@ -597,6 +633,7 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["smoke_mode_detected"] = True
         report["checks"]["onepager_bullets_compact_ok"] = True
         report["checks"]["facts_has_why_now_and_proof"] = True
+        report["checks"]["facts_no_truncated_words"] = True
 
     topic_value = str(run_context.get("topic") or "").strip()
 
@@ -671,11 +708,38 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["errors"].append("retrieval_expansion_trace_missing")
         if not report["checks"].get("retrieval_attempt_quality_fields_present", False):
             report["errors"].append("retrieval_attempt_quality_fields_missing")
+
+        selected_pass_count = int(
+            diagnosis_payload.get("selected_pass_count", ranking_stats.get("selected_pass_count", 0)) or 0
+        )
+        requested_top_k = int(ranking_stats.get("requested_top_k", 0) or 0)
+        needs_expansion = bool(requested_top_k > 0 and selected_pass_count < requested_top_k)
+        attempts_count = len(diagnosis_attempts)
+        report["checks"]["retrieval_quality_triggered_expansion_recorded"] = bool((not needs_expansion) or attempts_count > 1)
+        if not report["checks"]["retrieval_quality_triggered_expansion_recorded"]:
+            report["errors"].append("retrieval_quality_triggered_expansion_missing")
+
+        record_map = {
+            str((row or {}).get("item_id") or "").strip(): dict(row or {})
+            for row in list(evidence_audit_payload.get("records") or [])
+            if str((row or {}).get("item_id") or "").strip()
+        }
+        top_verdicts = [
+            str((record_map.get(item_id) or {}).get("verdict") or "").strip().lower()
+            for item_id in top_item_ids
+        ]
+        all_top_downgrade = bool(top_verdicts) and all(verdict == "downgrade" for verdict in top_verdicts)
+        allow_all_downgrade = bool(onepager_has_why_not_more and attempts_count >= 2)
+        report["checks"]["top_picks_not_all_downgrade"] = bool((not all_top_downgrade) or allow_all_downgrade)
+        if not report["checks"]["top_picks_not_all_downgrade"]:
+            report["errors"].append("top_picks_all_downgrade_without_explanation")
     else:
         report["checks"]["ranked_items_have_update_signal"] = True
         report["checks"]["retrieval_selected_phase_consistent"] = True
         report["checks"]["retrieval_attempt_count_consistent"] = True
         report["checks"]["retrieval_expansion_recorded"] = True
+        report["checks"]["retrieval_quality_triggered_expansion_recorded"] = True
+        report["checks"]["top_picks_not_all_downgrade"] = True
 
     all_urls = []
     for path in [script_path, onepager_path, storyboard_path, prompt_bundle_path, run_dir / "materials.json", facts_path]:

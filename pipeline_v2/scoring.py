@@ -115,6 +115,23 @@ _TOPIC_STOP_WORDS = {
     "news",
 }
 
+_AGENT_GENERIC_TERMS = {"agent", "agents", "assistant", "copilot"}
+_AGENT_HIGH_VALUE_TERMS = {
+    "mcp",
+    "model context protocol",
+    "tool calling",
+    "function calling",
+    "orchestration",
+    "langgraph",
+    "autogen",
+    "crewai",
+    "agent eval",
+    "agent benchmark",
+    "benchmark",
+    "inspect",
+    "agent runtime",
+}
+
 
 def _topic_tokens(topic: Optional[str]) -> List[str]:
     parts = re.findall(r"[a-z0-9]+", str(topic or "").lower())
@@ -131,6 +148,25 @@ def _topic_tokens(topic: Optional[str]) -> List[str]:
 
 def _has_token(text: str, token: str) -> bool:
     return re.search(rf"\b{re.escape(token)}\b", text) is not None
+
+
+def _contains_term(text: str, term: str) -> bool:
+    payload = str(text or "").lower()
+    token = str(term or "").strip().lower()
+    if not payload or not token:
+        return False
+    pattern = r"\b" + re.escape(token).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, payload) is not None
+
+
+def _contains_negated_term(text: str, term: str) -> bool:
+    payload = str(text or "").lower()
+    token = str(term or "").strip().lower()
+    if not payload or not token:
+        return False
+    term_pattern = re.escape(token).replace(r"\ ", r"\s+")
+    pattern = r"\b(?:no|not|without|lack|lacks|lacking)\s+(?:[a-z0-9_-]+\s+){0,2}" + term_pattern + r"\b"
+    return re.search(pattern, payload) is not None
 
 
 def _topic_text(item: NormalizedItem) -> str:
@@ -195,12 +231,48 @@ def evaluate_relevance(
     base = 0.1 if coverage > 0 else 0.0
     boost, penalty, boost_terms, penalty_terms = profile.soft_adjustment(topic_text)
     score = _clamp01(base + 0.65 * coverage + 0.15 * density + phrase_bonus + proxy_bonus + boost - penalty)
+
+    agent_non_generic_hits: List[str] = []
+    agent_high_value_hits: List[str] = []
+    agent_score_cap = ""
+    if str(profile.key or "").strip().lower() == "ai_agent":
+        for term in hard_terms:
+            lowered = str(term).strip().lower()
+            if lowered and lowered not in _AGENT_GENERIC_TERMS:
+                agent_non_generic_hits.append(term)
+        for term in _AGENT_HIGH_VALUE_TERMS:
+            if _contains_term(topic_text, term) and not _contains_negated_term(topic_text, term):
+                agent_high_value_hits.append(term)
+
+        has_high_value = bool(agent_high_value_hits)
+        non_generic_count = len({str(term).strip().lower() for term in agent_non_generic_hits if str(term).strip()})
+        if score >= 0.8 and not (has_high_value or non_generic_count >= 2):
+            score = 0.79
+            agent_score_cap = "cap_lt_0.8_requires_non_generic_or_high_value"
+
+        signals = _quality_signals(item)
+        has_substantive_content = bool(
+            float(signals["content_density"]) >= 0.14
+            or bool(signals["has_quickstart"])
+            or bool(signals["has_results_or_bench"])
+            or re.search(r"\b(quickstart|benchmark|result|usage|cli|api|workflow)\b", topic_text)
+        )
+        if has_high_value and has_substantive_content and score >= 0.92:
+            score = 1.0
+        else:
+            score = min(score, 0.95)
+            if not agent_score_cap and score >= 0.95:
+                agent_score_cap = "cap_lt_1.0_requires_high_value_plus_substantive_content"
+
     return {
         "score": score,
         "hard_pass": hard_pass,
         "hard_terms": hard_terms,
         "boost_terms": boost_terms,
         "penalty_terms": penalty_terms,
+        "agent_non_generic_hits": agent_non_generic_hits,
+        "agent_high_value_hits": agent_high_value_hits,
+        "agent_score_cap": agent_score_cap,
     }
 
 
@@ -339,6 +411,13 @@ def rank_items(
         hard_terms = [str(value) for value in list(relevance_payload.get("hard_terms") or []) if str(value).strip()]
         boost_terms = [str(value) for value in list(relevance_payload.get("boost_terms") or []) if str(value).strip()]
         penalty_terms = [str(value) for value in list(relevance_payload.get("penalty_terms") or []) if str(value).strip()]
+        agent_non_generic_hits = [
+            str(value) for value in list(relevance_payload.get("agent_non_generic_hits") or []) if str(value).strip()
+        ]
+        agent_high_value_hits = [
+            str(value) for value in list(relevance_payload.get("agent_high_value_hits") or []) if str(value).strip()
+        ]
+        agent_score_cap = str(relevance_payload.get("agent_score_cap") or "").strip()
 
         metadata = dict(item.metadata or {})
         metadata["topic_hard_match_pass"] = bool(hard_match_pass)
@@ -394,6 +473,9 @@ def rank_items(
                 hard_terms,
                 boost_terms,
                 penalty_terms,
+                agent_non_generic_hits,
+                agent_high_value_hits,
+                agent_score_cap,
             )
         )
 
@@ -422,6 +504,9 @@ def rank_items(
             _hard_terms,
             _boost_terms,
             _penalty_terms,
+            _agent_non_generic_hits,
+            _agent_high_value_hits,
+            _agent_score_cap,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -453,6 +538,9 @@ def rank_items(
         hard_terms,
         boost_terms,
         penalty_terms,
+        agent_non_generic_hits,
+        agent_high_value_hits,
+        agent_score_cap,
     ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -475,6 +563,12 @@ def rank_items(
             reasons.append(f"topic.soft_boost_terms={','.join(boost_terms)}")
         if penalty_terms:
             reasons.append(f"topic.soft_penalty_terms={','.join(penalty_terms)}")
+        if agent_non_generic_hits:
+            reasons.append(f"topic.agent_non_generic_hits={','.join(agent_non_generic_hits)}")
+        if agent_high_value_hits:
+            reasons.append(f"topic.agent_high_value_hits={','.join(agent_high_value_hits)}")
+        if agent_score_cap:
+            reasons.append(f"topic.agent_score_cap={agent_score_cap}")
         signals = _quality_signals(item)
         reasons.extend(
             [

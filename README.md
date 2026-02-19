@@ -1,6 +1,44 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
 ## Changelog (Last Updated: 2026-02-19)
+### Commit: Close-the-loop Selection + Audit-driven Expansion (New)
+- 本次目标：
+  - 把 `planner + auditor` 从“仅产出报告”改为“闭环控制器”，保证 Top picks 优先由 `PASS` 候选构成，质量不足时自动扩检。
+  - 修复 `AI agent` 主题下相关性失真（泛词打高分、CV/CLIP 误入）和 facts 文本质量问题（截断词、HN 元信息污染）。
+- 核心策略变更：
+  - 新增 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/retrieval_controller.py`：
+    - `SelectionController` 执行 `pass-first -> expansion -> downgrade fallback(仅最后阶段)`。
+    - 质量触发器：`pass_count < top_k` / `pass_ratio < 0.3` / `top_picks_min_evidence_quality < 2` / `bucket_coverage < 2` / 多样性不足。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/runtime.py`：
+    - `_execute_run` 接入 controller 闭环，attempt 级别落盘 `phase/window/query_set/candidate_count/pass/downgrade/reject/next_phase_reason`。
+    - `retrieval_diagnosis.json` 与 onepager header 同步输出：`hard_match_terms_used/hard_match_pass_count/top_picks_min_relevance/top_picks_hard_match_count/quality_triggered_expansion`。
+    - Top picks 仅在最后阶段才允许 downgrade 兜底，并把 downgrade 原因写入上下文。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/evidence_auditor.py`：
+    - 新增 `machine_action`（`action/reason_code/human_reason`）供 controller 直接消费。
+    - HN 低互动（`points<5 && comments<2`）默认 reject；AI agent 话题下 HF 的 `clip/vit/diffusion` 类默认强 reject。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/scoring.py`：
+    - 保留 hard gate；新增“泛词降权”与 `1.0` 上限约束：仅在“高价值词命中 + 实质内容信号”同时满足时允许 `relevance=1.0`。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/script_generator.py`：
+    - facts 抽取按句子边界截取，避免半词截断。
+    - 过滤 `Points: x | Comments: y` 等 HN 元信息行，`how_it_works` 保证为完整可读句。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/pipeline_v2/report_export.py`：
+    - onepager Top picks 对 downgrade 条目显式标注 `(降级: reason)`。
+    - 当高质量候选不足时新增 `Why not more?` 段落，解释扩检后仍不足的原因。
+  - 修改 `/Users/dexter/Documents/Dexter_Work/AcademicResearchAgent/scripts/validate_artifacts_v2.py`：
+    - 新增门禁：`top_picks_not_all_downgrade`、`retrieval_quality_triggered_expansion_recorded`、`facts_no_truncated_words`。
+- 阈值配置（可覆盖）：
+  - 环境变量：`ARA_V2_MIN_PASS_RATIO`、`ARA_V2_MIN_EVIDENCE_QUALITY`、`ARA_V2_MIN_BUCKET_COVERAGE`、`ARA_V2_MIN_SOURCE_COVERAGE`。
+  - 或 `RunRequest.budget` 对应键：`min_pass_ratio/min_evidence_quality/min_bucket_coverage/min_source_coverage`。
+- 如何验证：
+  - `pytest -q tests/v2`
+  - `OUT="/tmp/ara_v2_live_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$OUT"; python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web,mp4 --top-k 3 > "$OUT/result.json"`
+  - `python scripts/validate_artifacts_v2.py --run-dir <run_dir> --render-dir <render_dir>`
+- 已知限制与未来扩展：
+  - 限制：在极稀疏数据窗口下，严格 pass-first 可能导致 Top picks 数量下降（但会显式解释原因而非静默凑数）。
+  - 限制：deterministic 规则对长尾新术语适应较慢，需要持续补词典。
+  - 扩展：可启用 `budget.use_llm_planner=true` / `budget.use_llm_auditor=true` 走 LLM 插槽（当前默认关闭并回退 deterministic）。
+  - 回滚：`git revert <this_commit_sha>`。
+
 ### Commit: Topic Hard Gate + Bucket Coverage + Quality Trigger Expansion (New)
 - 本次目标：
   - 修复 `topic="AI agent"` 场景的硬语义偏离，阻断 `CLIP/ViT/vision-only model card` 误入 Top picks。

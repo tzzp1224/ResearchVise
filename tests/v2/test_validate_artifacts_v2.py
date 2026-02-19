@@ -54,6 +54,9 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["evidence_audit_parse_ok"] is True
     assert report["checks"]["top_picks_all_pass_or_downgrade_reason_present"] is True
     assert report["checks"]["citations_not_mostly_duplicate"] is True
+    assert report["checks"]["top_picks_not_all_downgrade"] is True
+    assert report["checks"]["retrieval_quality_triggered_expansion_recorded"] is True
+    assert report["checks"]["facts_no_truncated_words"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:

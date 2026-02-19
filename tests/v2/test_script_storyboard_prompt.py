@@ -181,3 +181,26 @@ def test_build_facts_prefers_feature_and_quickstart_over_slogans() -> None:
     assert "most" not in what
     assert "tool-calling" in (what + " " + how) or "orchestration" in (what + " " + how)
     assert "pip install" in (what + " " + how) or "quickstart" in (what + " " + how)
+
+
+def test_build_facts_filters_hn_meta_and_keeps_sentence_boundaries() -> None:
+    item = _sample_item()
+    body = (
+        "Points: 3 | Comments: 1\n"
+        "Agent orchestration pipeline includes rollback-safe execution flow and tool-calling routes.\n"
+        "Quickstart provides pip install command and usage examples for production rollout.\n"
+        "Evidence section documents benchmark results with reproducible settings."
+    )
+    item.body_md = body
+    item.metadata["clean_text"] = body
+    facts = build_facts(item, topic="AI agent")
+    merged = " ".join(
+        [str(facts.get("what_it_is") or "")]
+        + [str(v) for v in list(facts.get("how_it_works") or [])]
+        + [str(v) for v in list(facts.get("proof") or [])]
+    )
+    assert "Points:" not in merged
+    for sentence in list(facts.get("how_it_works") or []):
+        text = str(sentence).strip()
+        assert text
+        assert text.endswith((".", "!", "?", "。", "！", "？"))

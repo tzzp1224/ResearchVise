@@ -310,6 +310,21 @@ def generate_onepager(
         for value in list(ranking_stats.get("quality_trigger_reasons") or retrieval.get("quality_trigger_reasons") or [])
         if str(value).strip()
     ]
+    top_picks_min_evidence_quality = float(
+        ranking_stats.get("top_picks_min_evidence_quality", retrieval.get("top_picks_min_evidence_quality", 0.0)) or 0.0
+    )
+    selected_pass_count = int(ranking_stats.get("selected_pass_count", retrieval.get("selected_pass_count", 0)) or 0)
+    selected_downgrade_count = int(
+        ranking_stats.get("selected_downgrade_count", retrieval.get("selected_downgrade_count", 0)) or 0
+    )
+    selected_all_downgrade = bool(ranking_stats.get("selected_all_downgrade", False))
+    why_not_more_reasons = [
+        str(value).strip()
+        for value in list(ranking_stats.get("why_not_more") or retrieval.get("why_not_more") or [])
+        if str(value).strip()
+    ]
+    top_verdicts = {str(k): str(v).strip().lower() for k, v in dict(ranking_stats.get("top_evidence_audit_verdicts") or {}).items()}
+    top_reasons = {str(k): list(v or []) for k, v in dict(ranking_stats.get("top_evidence_audit_reasons") or {}).items()}
     diagnosis_path = str(
         retrieval.get("diagnosis_path")
         or context.get("diagnosis_path")
@@ -346,9 +361,13 @@ def generate_onepager(
         f"- HardMatchPassCount: `{hard_match_pass_count}`",
         f"- TopPicksMinRelevance: `{top_picks_min_relevance:.2f}`",
         f"- TopPicksHardMatchCount: `{top_picks_hard_match_count}`",
+        f"- TopPicksMinEvidenceQuality: `{top_picks_min_evidence_quality:.2f}`",
+        f"- SelectedPassCount: `{selected_pass_count}`",
+        f"- SelectedDowngradeCount: `{selected_downgrade_count}`",
         f"- BucketCoverage: `{bucket_coverage}`",
         f"- QualityTriggeredExpansion: `{str(quality_triggered_expansion).lower()}`",
         f"- QualityTriggerReasons: `{','.join(quality_trigger_reasons) if quality_trigger_reasons else 'N/A'}`",
+        f"- WhyNotMoreReasons: `{','.join(why_not_more_reasons) if why_not_more_reasons else 'N/A'}`",
         f"- RecallPhase: `{selected_phase or 'base'}`",
         f"- CitationCount: `{len(citation_list)}`",
         f"- DiagnosisPath: `{diagnosis_path or 'N/A'}`",
@@ -364,6 +383,13 @@ def generate_onepager(
                 "",
             ]
         )
+    if selected_downgrade_count > 0:
+        lines.extend(
+            [
+                "> 当前 Top Picks 包含降级条目（证据不足或重复）。已触发扩检后仍不足。",
+                "",
+            ]
+        )
 
     for idx, item in enumerate(normalized_items, start=1):
         payload = ranked_items[idx - 1]
@@ -372,10 +398,15 @@ def generate_onepager(
         fact_bullets = _fact_bullets(item)
         citation_bullets = _citation_bullets(item)
         relevance_value = _relevance(payload)
+        verdict = top_verdicts.get(str(item.id), "")
+        downgrade_reasons = [str(reason).strip() for reason in list(top_reasons.get(str(item.id)) or []) if str(reason).strip()]
+        title_suffix = ""
+        if verdict == "downgrade":
+            title_suffix = f" (降级: {downgrade_reasons[0] if downgrade_reasons else 'evidence_weak'})"
 
         lines.extend(
             [
-                f"### {idx}. {item.title}",
+                f"### {idx}. {item.title}{title_suffix}",
                 f"- Source URL: {item.url or 'N/A'}",
                 f"- Source Domain: `{_domain(item.url)}`",
                 f"- Tier/Credibility: `{item.tier}` / `{credibility}`",
@@ -398,6 +429,19 @@ def generate_onepager(
         lines.append("#### Citations")
         for bullet in citation_bullets:
             lines.append(f"- {bullet}")
+        lines.append("")
+
+    if why_not_more_reasons:
+        lines.extend(
+            [
+                "## Why not more?",
+                "",
+            ]
+        )
+        for reason in why_not_more_reasons:
+            lines.append(f"- {reason}")
+        if selected_all_downgrade:
+            lines.append("- 当前窗口内高质量候选不足，已使用降级兜底并保留审计原因。")
         lines.append("")
 
     lines.extend(["## Evidence", ""])

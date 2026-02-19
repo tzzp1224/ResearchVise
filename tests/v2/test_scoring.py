@@ -175,3 +175,29 @@ def test_ranking_keeps_relevance_hard_gate_even_with_recency_and_engagement() ->
     assert "off_hot" not in top_ids
     off = next(row for row in ranked if row.item.id == "off_hot")
     assert any(reason.startswith("penalty.relevance_lt_0.55") for reason in off.reasons)
+
+
+def test_agent_generic_term_alone_cannot_reach_perfect_relevance() -> None:
+    item = _item(
+        "agent_only",
+        tier="A",
+        source="github",
+        title="AI agent updates",
+        metadata={
+            "credibility": "high",
+            "body_len": 820,
+            "citation_count": 2,
+            "quality_signals": {
+                "content_density": 0.16,
+                "has_quickstart": False,
+                "has_results_or_bench": False,
+                "evidence_links_quality": 1,
+            },
+        },
+    )
+    item.body_md = (
+        "Agent platform update for teams. Agent templates and agent role descriptions are included. "
+        "No tool calling, no orchestration details, and no benchmark numbers are provided."
+    )
+    score = score_relevance(item, "AI agent")
+    assert score < 1.0

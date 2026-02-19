@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
 import re
 from time import perf_counter
@@ -24,6 +25,7 @@ from pipeline_v2.normalize import normalize
 from pipeline_v2.notification import notify_user, post_to_web, send_email
 from pipeline_v2.planner import LLMPlanner, ResearchPlanner, RetrievalPlan
 from pipeline_v2.prompt_compiler import compile_storyboard
+from pipeline_v2.retrieval_controller import SelectionController
 from pipeline_v2.report_export import export_package, generate_onepager, generate_thumbnail
 from pipeline_v2.scoring import rank_items
 from pipeline_v2.script_generator import build_facts, generate_script
@@ -188,6 +190,8 @@ class RunPipelineRuntime:
             retrieval_plan = planner.plan(topic_value, time_window=request.time_window)
 
         top_count = self._top_n(request)
+        controller = self._build_selection_controller(request, top_count=top_count)
+        auditor = self._resolve_evidence_auditor(request, topic_profile=topic_profile)
         recall_profiles = self._recall_profiles(request, data_mode=data_mode, retrieval_plan=retrieval_plan)
         attempts: List[Dict[str, Any]] = []
         selected: Optional[Dict[str, Any]] = None
@@ -224,72 +228,102 @@ class RunPipelineRuntime:
                 top_count=top_count,
             )
             ranked = list(rank_pack["ranked"] or [])
-            picks = list(rank_pack["picks"] or [])
             relevance_eligible = list(rank_pack["relevance_eligible"] or [])
+            audit_records = auditor.audit_rows(ranked_rows=ranked)
+
+            pass_first_outcome = controller.evaluate(
+                ranked_rows=ranked,
+                audit_records=audit_records,
+                allow_downgrade_fill=False,
+            )
+            expansion_decision = controller.expansion_decision(outcome=pass_first_outcome)
+            quality_reasons = [str(value).strip() for value in list(expansion_decision.reasons or []) if str(value).strip()]
+            has_next_attempt = idx < len(recall_profiles)
+            quality_triggered_expansion = bool(expansion_decision.should_expand and has_next_attempt)
+            quality_triggered_any = bool(quality_triggered_any or quality_triggered_expansion)
+
+            final_outcome = pass_first_outcome
+            if not quality_triggered_expansion and not has_next_attempt:
+                final_outcome = controller.evaluate(
+                    ranked_rows=ranked,
+                    audit_records=audit_records,
+                    allow_downgrade_fill=True,
+                )
+
+            picks = list(final_outcome.selected_rows or [])
             quality_snapshot = self._attempt_quality_snapshot(
                 ranked=ranked,
                 picks=picks,
                 topic_profile=topic_profile,
-            )
-            quality_reasons = self._quality_trigger_reasons(
-                snapshot=quality_snapshot,
-                requested_top_k=top_count,
-                topic_profile=topic_profile,
-            )
-            has_next_attempt = idx < len(recall_profiles)
-            quality_triggered_expansion = bool(quality_reasons and has_next_attempt)
-            quality_triggered_any = bool(quality_triggered_any or quality_triggered_expansion)
-
-            attempts.append(
-                {
-                    "attempt": idx,
-                    "phase": profile.phase,
-                    "profile": dict(collect_diag.get("profile") or {}),
-                    "raw_items": len(raw_items),
-                    "candidate_count": len(ranked),
-                    "top_picks_count": len(picks),
-                    "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
-                    "relevance_threshold_used": float(rank_pack["relevance_threshold"]),
-                    "relaxation_steps": int(rank_pack["relaxation_steps"]),
-                    "connector_calls": list(collect_diag.get("connector_calls") or []),
-                    "queries": list(collect_diag.get("queries") or []),
-                    "must_include_terms": list(collect_diag.get("must_include_terms") or []),
-                    "must_exclude_terms": list(collect_diag.get("must_exclude_terms") or []),
-                    "deep_fetch_applied": bool(collect_diag.get("deep_fetch_applied")),
-                    "deep_fetch_count": int(collect_diag.get("deep_fetch_count", 0) or 0),
-                    "bucket_queries": dict(collect_diag.get("bucket_queries") or {}),
-                    "bucket_hits_summary": dict(quality_snapshot.get("bucket_hits_summary") or {}),
-                    "bucket_coverage": int(quality_snapshot.get("bucket_coverage", 0) or 0),
-                    "hard_match_terms_used": list(quality_snapshot.get("hard_match_terms_used") or []),
-                    "hard_match_pass_count": int(quality_snapshot.get("hard_match_pass_count", 0) or 0),
-                    "top_picks_min_relevance": float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0),
-                    "top_picks_hard_match_count": int(quality_snapshot.get("top_picks_hard_match_count", 0) or 0),
-                    "quality_trigger_reasons": list(quality_reasons or []),
-                    "quality_triggered_expansion": bool(quality_triggered_expansion),
-                    "expansion_applied": profile.phase != "base",
-                }
+                audit_records=audit_records,
+                selection_outcome=final_outcome,
             )
 
+            selected_downgrade_count = int(
+                sum(1 for verdict in list((final_outcome.selected_verdicts or {}).values()) if str(verdict).strip().lower() == "downgrade")
+            )
+            selected_pass_count = int(
+                sum(1 for verdict in list((final_outcome.selected_verdicts or {}).values()) if str(verdict).strip().lower() == "pass")
+            )
+
+            attempt_payload = {
+                "attempt": idx,
+                "phase": profile.phase,
+                "window": str((collect_diag.get("profile") or {}).get("window") or profile.window),
+                "query_set": "expanded" if bool(profile.expanded_queries) else "base",
+                "profile": dict(collect_diag.get("profile") or {}),
+                "raw_items": len(raw_items),
+                "candidate_count": int(final_outcome.candidate_count),
+                "top_picks_count": len(picks),
+                "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
+                "relevance_threshold_used": float(rank_pack["relevance_threshold"]),
+                "relaxation_steps": int(rank_pack["relaxation_steps"]),
+                "connector_calls": list(collect_diag.get("connector_calls") or []),
+                "queries": list(collect_diag.get("queries") or []),
+                "must_include_terms": list(collect_diag.get("must_include_terms") or []),
+                "must_exclude_terms": list(collect_diag.get("must_exclude_terms") or []),
+                "deep_fetch_applied": bool(collect_diag.get("deep_fetch_applied")),
+                "deep_fetch_count": int(collect_diag.get("deep_fetch_count", 0) or 0),
+                "bucket_queries": dict(collect_diag.get("bucket_queries") or {}),
+                "bucket_hits_summary": dict(quality_snapshot.get("bucket_hits_summary") or {}),
+                "bucket_coverage": int(quality_snapshot.get("bucket_coverage", 0) or 0),
+                "hard_match_terms_used": list(quality_snapshot.get("hard_match_terms_used") or []),
+                "hard_match_pass_count": int(quality_snapshot.get("hard_match_pass_count", 0) or 0),
+                "top_picks_min_relevance": float(quality_snapshot.get("top_picks_min_relevance", 0.0) or 0.0),
+                "top_picks_hard_match_count": int(quality_snapshot.get("top_picks_hard_match_count", 0) or 0),
+                "top_picks_min_evidence_quality": float(quality_snapshot.get("top_picks_min_evidence_quality", 0.0) or 0.0),
+                "pass_count": int(final_outcome.pass_count),
+                "downgrade_count": int(final_outcome.downgrade_count),
+                "reject_count": int(final_outcome.reject_count),
+                "pass_ratio": float(final_outcome.pass_ratio),
+                "selected_pass_count": selected_pass_count,
+                "selected_downgrade_count": selected_downgrade_count,
+                "selected_source_coverage": int(quality_snapshot.get("source_coverage", 0) or 0),
+                "selected_all_downgrade": bool(final_outcome.all_selected_downgrade),
+                "quality_trigger_reasons": list(quality_reasons),
+                "quality_triggered_expansion": bool(quality_triggered_expansion),
+                "next_phase_reason": list(quality_reasons),
+                "expansion_applied": idx > 1,
+            }
+            attempts.append(attempt_payload)
+
+            if quality_triggered_expansion:
+                continue
+
+            selected = {
+                "raw_items": raw_items,
+                "run_context": run_context_candidate,
+                "normalized": normalized,
+                "merged": merged,
+                "rank_pack": rank_pack,
+                "profile": profile,
+                "attempt": idx,
+                "quality_snapshot": quality_snapshot,
+                "quality_reasons": quality_reasons,
+                "selection_outcome": final_outcome,
+                "audit_records": audit_records,
+            }
             if picks:
-                candidate = {
-                    "raw_items": raw_items,
-                    "run_context": run_context_candidate,
-                    "normalized": normalized,
-                    "merged": merged,
-                    "rank_pack": rank_pack,
-                    "profile": profile,
-                    "attempt": idx,
-                    "quality_snapshot": quality_snapshot,
-                    "quality_reasons": quality_reasons,
-                    "selection_priority": self._selection_priority(
-                        picks=picks,
-                        quality_snapshot=quality_snapshot,
-                    ),
-                }
-                if selected is None or float(candidate["selection_priority"]) >= float(selected.get("selection_priority", -1.0)):
-                    selected = candidate
-
-            if len(picks) >= top_count and not quality_reasons and selected is not None:
                 break
 
         if selected is None:
@@ -302,8 +336,15 @@ class RunPipelineRuntime:
         rank_pack = dict(selected["rank_pack"] or {})
         ranked = list(rank_pack.get("ranked") or [])
         relevance_eligible = list(rank_pack.get("relevance_eligible") or [])
-        picks = list(rank_pack.get("picks") or [])
         profile = selected["profile"]
+        selection_outcome = selected["selection_outcome"]
+        picks = list(selection_outcome.selected_rows or [])
+        audit_records = list(selected.get("audit_records") or [])
+        records_by_id = {
+            str(record.item_id or "").strip(): record
+            for record in list(audit_records or [])
+            if str(record.item_id or "").strip()
+        }
         selected_quality_reasons = [str(value) for value in list(selected.get("quality_reasons") or []) if str(value).strip()]
         if not selected_quality_reasons and quality_triggered_any:
             for item in attempts:
@@ -313,25 +354,23 @@ class RunPipelineRuntime:
                     ]
                     if selected_quality_reasons:
                         break
+
         base_relevance_threshold = float(rank_pack.get("base_relevance_threshold", 0.55 if data_mode == "live" else 0.0))
         relevance_threshold = float(rank_pack.get("relevance_threshold", base_relevance_threshold))
         relaxation_steps = int(rank_pack.get("relaxation_steps", 0))
+        quality_snapshot = dict(selected.get("quality_snapshot") or {})
 
         if not picks:
-            raise RuntimeError("no relevant ranked items available")
+            raise RuntimeError("no candidates survived evidence audit")
 
-        auditor = self._resolve_evidence_auditor(request)
-        audit_selection = auditor.audit_and_select(
-            initial_picks=picks,
-            ranked_rows=ranked,
-            top_count=top_count,
-        )
-        picks = list(audit_selection.selected_rows or [])
-        audit_payload = audit_selection.report_payload(
-            topic=str(request.topic or "").strip() or None,
-            top_k=top_count,
-            selected_phase=getattr(profile, "phase", "base"),
-        )
+        audit_payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "topic": str(request.topic or "").strip() or None,
+            "requested_top_k": int(top_count),
+            "selected_phase": getattr(profile, "phase", "base"),
+            "final_top_item_ids": [str(getattr(row.item, "id", "") or "") for row in list(picks or []) if getattr(row, "item", None)],
+            "records": [record.model_dump() for record in list(audit_records or [])],
+        }
         audit_path = self._write_json(out_dir / "evidence_audit.json", audit_payload)
         self._record_artifact(
             run_id,
@@ -342,10 +381,18 @@ class RunPipelineRuntime:
             ),
         )
 
-        if not picks:
-            raise RuntimeError("no candidates survived evidence audit")
-
         def _drop_reason(row: Any) -> str:
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
+            record = records_by_id.get(item_id)
+            if record:
+                verdict = str(record.verdict or "").strip().lower()
+                machine_action = dict(record.machine_action or {})
+                reason_code = str(machine_action.get("reason_code") or "").strip().lower()
+                if verdict == "reject":
+                    return f"rejected:{reason_code or 'audit'}"
+                if verdict == "downgrade":
+                    return f"downgraded:{reason_code or 'audit'}"
+
             reasons = " ".join(str(value) for value in list(getattr(row, "reasons", []) or []))
             lowered = reasons.lower()
             if "relevance.relaxed_pick" in lowered:
@@ -365,28 +412,25 @@ class RunPipelineRuntime:
         def _why_ranked(row: Any) -> str:
             item = row.item
             signals = dict((item.metadata or {}).get("quality_signals") or {})
+            metadata = dict(item.metadata or {})
             chunks = [f"rel={float(getattr(row, 'relevance_score', 0.0)):.2f}"]
-            recency = signals.get("update_recency_days")
-            if recency not in (None, "", "unknown"):
-                chunks.append(f"更新{float(recency):.1f}d")
+            hard_terms = [str(value).strip() for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()]
+            if hard_terms:
+                chunks.append(f"hard={','.join(hard_terms[:2])}")
             evidence_links = int(float(signals.get("evidence_links_quality", 0) or 0))
             if evidence_links > 0:
-                chunks.append(f"证据链{evidence_links}")
+                chunks.append(f"evidence={evidence_links}")
             if bool(signals.get("has_quickstart")):
-                chunks.append("含Quickstart")
-            points = int(float((item.metadata or {}).get("points", 0) or 0))
-            comments = int(float((item.metadata or {}).get("comment_count", 0) or 0))
-            if points > 0 or comments > 0:
-                chunks.append(f"HN {points}/{comments}")
-            if any(str(reason).strip().lower() == "relevance.relaxed_pick" for reason in list(getattr(row, "reasons", []) or [])):
-                chunks.append("阈值放宽补位")
-            return " · ".join(chunks[:3])
+                chunks.append("quickstart")
+            return " | ".join(chunks[:4])
 
         picked_ids = {pick.item.id for pick in picks}
         candidate_rows = []
         for row in ranked[:30]:
             item = row.item
             metadata = dict(item.metadata or {})
+            record = records_by_id.get(str(item.id))
+            machine_action = dict((record.machine_action if record else {}) or {})
             candidate_rows.append(
                 {
                     "item_id": item.id,
@@ -399,6 +443,8 @@ class RunPipelineRuntime:
                     "hard_match_pass": bool(metadata.get("topic_hard_match_pass")),
                     "hard_match_terms": [str(value) for value in list(metadata.get("topic_hard_match_terms") or []) if str(value).strip()],
                     "bucket_hits": [str(value) for value in list(metadata.get("bucket_hits") or []) if str(value).strip()],
+                    "audit_verdict": str(record.verdict if record else "unknown"),
+                    "audit_reason_code": str(machine_action.get("reason_code") or ""),
                     "drop_reason": None if item.id in picked_ids else _drop_reason(row),
                 }
             )
@@ -407,26 +453,31 @@ class RunPipelineRuntime:
         selected_attempt_payload = (attempts[int(selected.get("attempt", 1)) - 1] or {}) if attempts else {}
         hard_match_terms_used = [str(value) for value in list(selected_attempt_payload.get("hard_match_terms_used") or []) if str(value).strip()]
         hard_match_pass_count = int(selected_attempt_payload.get("hard_match_pass_count", 0) or 0)
-        top_picks_min_relevance = min(
-            [float(getattr(row, "relevance_score", 0.0) or 0.0) for row in list(picks or [])],
-            default=float(selected_attempt_payload.get("top_picks_min_relevance", 0.0) or 0.0),
+        top_picks_min_relevance = float(selected_attempt_payload.get("top_picks_min_relevance", 0.0) or 0.0)
+        top_picks_hard_match_count = int(selected_attempt_payload.get("top_picks_hard_match_count", 0) or 0)
+        selected_bucket_coverage = int(selected_attempt_payload.get("bucket_coverage", 0) or 0)
+        top_picks_min_evidence_quality = float(
+            selected_attempt_payload.get("top_picks_min_evidence_quality", quality_snapshot.get("top_picks_min_evidence_quality", 0.0))
+            or 0.0
         )
-        top_picks_hard_match_count = 0
-        final_bucket_hits = set()
-        for row in list(picks or []):
-            metadata = dict((row.item.metadata or {}) if getattr(row, "item", None) else {})
-            if bool(metadata.get("topic_hard_match_pass", True)):
-                top_picks_hard_match_count += 1
-            for bucket in list(metadata.get("bucket_hits") or []):
-                token = str(bucket).strip()
-                if token:
-                    final_bucket_hits.add(token)
-            for term in list(metadata.get("topic_hard_match_terms") or []):
-                token = str(term).strip()
-                if token and token not in hard_match_terms_used:
-                    hard_match_terms_used.append(token)
-        hard_match_terms_used = sorted(hard_match_terms_used)
-        selected_bucket_coverage = int(len(final_bucket_hits))
+
+        selected_verdicts = dict(selection_outcome.selected_verdicts or {})
+        selected_downgrade_reasons = dict(selection_outcome.selected_downgrade_reasons or {})
+        selected_pass_count = int(sum(1 for verdict in list(selected_verdicts.values()) if str(verdict).strip().lower() == "pass"))
+        selected_downgrade_count = int(
+            sum(1 for verdict in list(selected_verdicts.values()) if str(verdict).strip().lower() == "downgrade")
+        )
+        why_not_more: List[str] = []
+        if selected_pass_count < top_count:
+            why_not_more.append(f"pass_count_lt_{top_count}")
+        if selected_downgrade_count > 0:
+            why_not_more.append("used_downgrade_fallback_after_expansion")
+        if bool(selection_outcome.all_selected_downgrade):
+            why_not_more.append("all_top_picks_downgrade_after_max_phase")
+        if len({str(entry.item.source or "").strip().lower() for entry in list(picks or []) if getattr(entry, "item", None)}) < 2:
+            why_not_more.append("source_diversity_lt_2")
+        if selected_bucket_coverage < 2 and (topic_profile and topic_profile.minimum_bucket_coverage >= 2):
+            why_not_more.append("bucket_coverage_lt_2")
 
         retrieval_diagnosis = {
             "run_id": run_id,
@@ -450,8 +501,13 @@ class RunPipelineRuntime:
             "top_picks_min_relevance": top_picks_min_relevance,
             "top_picks_hard_match_count": top_picks_hard_match_count,
             "bucket_coverage": selected_bucket_coverage,
+            "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
+            "selected_pass_count": selected_pass_count,
+            "selected_downgrade_count": selected_downgrade_count,
+            "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
+            "why_not_more": why_not_more,
             "candidate_rows": candidate_rows,
             "top_dropped_items": top_dropped,
             "evidence_audit_path": audit_path,
@@ -473,8 +529,12 @@ class RunPipelineRuntime:
             "top_picks_min_relevance": top_picks_min_relevance,
             "top_picks_hard_match_count": top_picks_hard_match_count,
             "bucket_coverage": selected_bucket_coverage,
+            "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
+            "selected_pass_count": selected_pass_count,
+            "selected_downgrade_count": selected_downgrade_count,
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": list(selected_quality_reasons or []),
+            "why_not_more": why_not_more,
             "expansion_steps": [
                 {
                     "attempt": int(item.get("attempt", 0) or 0),
@@ -509,17 +569,22 @@ class RunPipelineRuntime:
         self._ensure_not_canceled(run_id)
 
         picked_ids = {pick.item.id for pick in picks}
-        audit_by_item = audit_selection.by_item_id()
+        audit_by_item = dict(records_by_id or {})
         verdict_counts = {"pass": 0, "downgrade": 0, "reject": 0}
-        for record in list(audit_selection.records or []):
+        for record in list(audit_records or []):
             key = str(record.verdict or "").strip().lower()
             if key in verdict_counts:
                 verdict_counts[key] = int(verdict_counts[key]) + 1
         top_verdicts = {}
+        top_reason_codes = {}
+        top_reasons = {}
         for entry in picks:
             item_id = str(entry.item.id)
             record = audit_by_item.get(item_id)
             top_verdicts[item_id] = str(record.verdict if record else "unknown")
+            machine_action = dict((record.machine_action if record else {}) or {})
+            top_reason_codes[item_id] = str(machine_action.get("reason_code") or "")
+            top_reasons[item_id] = list(record.reasons or []) if record else []
         run_context["ranking_stats"] = {
             "topic": str(request.topic or "").strip() or None,
             "candidate_count": len(ranked),
@@ -539,11 +604,17 @@ class RunPipelineRuntime:
             "evidence_audit_path": audit_path,
             "evidence_audit_verdict_counts": verdict_counts,
             "top_evidence_audit_verdicts": top_verdicts,
+            "top_evidence_audit_reason_codes": top_reason_codes,
+            "top_evidence_audit_reasons": top_reasons,
             "min_body_len_for_top_picks": 300,
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
             "top_picks_min_relevance": top_picks_min_relevance,
             "top_picks_hard_match_count": top_picks_hard_match_count,
+            "top_picks_min_evidence_quality": top_picks_min_evidence_quality,
+            "selected_pass_count": selected_pass_count,
+            "selected_downgrade_count": selected_downgrade_count,
+            "selected_all_downgrade": bool(selection_outcome.all_selected_downgrade),
             "bucket_coverage": selected_bucket_coverage,
             "top_bucket_hits": sorted(
                 {
@@ -555,6 +626,7 @@ class RunPipelineRuntime:
             ),
             "quality_triggered_expansion": bool(quality_triggered_any),
             "quality_trigger_reasons": selected_quality_reasons,
+            "why_not_more": why_not_more,
             "top_why_ranked": [_why_ranked(entry) for entry in picks],
             "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
             "drop_reason_samples": [
@@ -1025,11 +1097,67 @@ class RunPipelineRuntime:
             return LLMPlanner(enabled=True)
         return ResearchPlanner()
 
-    def _resolve_evidence_auditor(self, request: RunRequest) -> EvidenceAuditorProtocol:
+    def _resolve_evidence_auditor(
+        self,
+        request: RunRequest,
+        *,
+        topic_profile: Optional[TopicProfile] = None,
+    ) -> EvidenceAuditorProtocol:
         budget = dict(request.budget or {})
         if bool(budget.get("use_llm_auditor")):
-            return LLMEvidenceAuditor(enabled=True)
-        return EvidenceAuditor()
+            return LLMEvidenceAuditor(
+                enabled=True,
+                topic=str(request.topic or "").strip() or None,
+                topic_profile=topic_profile,
+            )
+        return EvidenceAuditor(
+            topic=str(request.topic or "").strip() or None,
+            topic_profile=topic_profile,
+        )
+
+    def _build_selection_controller(self, request: RunRequest, *, top_count: int) -> SelectionController:
+        budget = dict(request.budget or {})
+
+        def _float(key: str, env_name: str, default: float) -> float:
+            if key in budget:
+                try:
+                    return float(budget.get(key))
+                except Exception:
+                    return float(default)
+            raw_env = os.getenv(env_name)
+            if raw_env is None:
+                return float(default)
+            try:
+                return float(raw_env)
+            except Exception:
+                return float(default)
+
+        def _int(key: str, env_name: str, default: int) -> int:
+            if key in budget:
+                try:
+                    return int(float(budget.get(key)))
+                except Exception:
+                    return int(default)
+            raw_env = os.getenv(env_name)
+            if raw_env is None:
+                return int(default)
+            try:
+                return int(float(raw_env))
+            except Exception:
+                return int(default)
+
+        min_bucket = _int(
+            "min_bucket_coverage",
+            "ARA_V2_MIN_BUCKET_COVERAGE",
+            2 if int(top_count) >= 2 else 1,
+        )
+        return SelectionController(
+            requested_top_k=int(max(1, top_count)),
+            min_pass_ratio=_float("min_pass_ratio", "ARA_V2_MIN_PASS_RATIO", 0.30),
+            min_evidence_quality=_float("min_evidence_quality", "ARA_V2_MIN_EVIDENCE_QUALITY", 2.0),
+            min_bucket_coverage=max(1, min_bucket),
+            min_source_coverage=max(1, _int("min_source_coverage", "ARA_V2_MIN_SOURCE_COVERAGE", 2)),
+        )
 
     def _annotate_raw_item_topic_context(
         self,
@@ -1082,10 +1210,17 @@ class RunPipelineRuntime:
         ranked: Sequence[Any],
         picks: Sequence[Any],
         topic_profile: Optional[TopicProfile],
+        audit_records: Optional[Sequence[Any]] = None,
+        selection_outcome: Optional[Any] = None,
     ) -> Dict[str, Any]:
         hard_match_terms = set()
         hard_match_pass_count = 0
         bucket_hits_summary: Dict[str, int] = {}
+        records_by_id = {
+            str(getattr(record, "item_id", "") or "").strip(): record
+            for record in list(audit_records or [])
+            if str(getattr(record, "item_id", "") or "").strip()
+        }
         for row in list(ranked or []):
             metadata = dict((getattr(row, "item", None).metadata or {}) if getattr(row, "item", None) else {})
             if bool(metadata.get("topic_hard_match_pass", True)):
@@ -1104,7 +1239,10 @@ class RunPipelineRuntime:
         top_picks_min_relevance = min(pick_relevance) if pick_relevance else 0.0
         top_picks_hard_match_count = 0
         pick_bucket_hits = set()
+        selected_sources = set()
+        evidence_quality_values: List[float] = []
         for row in list(picks or []):
+            item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
             metadata = dict((getattr(row, "item", None).metadata or {}) if getattr(row, "item", None) else {})
             if bool(metadata.get("topic_hard_match_pass", True)):
                 top_picks_hard_match_count += 1
@@ -1112,6 +1250,18 @@ class RunPipelineRuntime:
                 token = str(bucket).strip()
                 if token:
                     pick_bucket_hits.add(token)
+            source = str((getattr(row, "item", None).source if getattr(row, "item", None) else "") or "").strip().lower()
+            if source:
+                selected_sources.add(source)
+            record = records_by_id.get(item_id)
+            if record is not None:
+                evidence_quality_values.append(float(getattr(record, "evidence_links_quality", 0) or 0))
+
+        min_evidence_quality = min(evidence_quality_values) if evidence_quality_values else None
+        if min_evidence_quality is None and selection_outcome is not None:
+            min_evidence_quality = float(getattr(selection_outcome, "top_picks_min_evidence_quality", 0.0) or 0.0)
+        if min_evidence_quality is None:
+            min_evidence_quality = 0.0
 
         if topic_profile and topic_profile.hard_include_any:
             terms_used = [str(value) for value in list(topic_profile.hard_include_any) if str(value).strip()]
@@ -1125,6 +1275,8 @@ class RunPipelineRuntime:
             "bucket_coverage": int(len(pick_bucket_hits)),
             "bucket_names": sorted(pick_bucket_hits),
             "bucket_hits_summary": bucket_hits_summary,
+            "top_picks_min_evidence_quality": float(min_evidence_quality),
+            "source_coverage": int(len(selected_sources)),
         }
 
     @staticmethod

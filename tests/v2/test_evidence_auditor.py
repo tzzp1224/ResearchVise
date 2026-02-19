@@ -101,3 +101,23 @@ def test_evidence_auditor_substitutes_rejected_pick_with_pass_candidate() -> Non
     assert "p1" in selected_ids
     audit_by_id = selection.by_item_id()
     assert audit_by_id["d1"].verdict in {VERDICT_DOWNGRADE, VERDICT_REJECT}
+
+
+def test_evidence_auditor_rejects_low_engagement_hn_item() -> None:
+    row = _row(
+        "hn_low",
+        source="hackernews",
+        body=("agent discussion notes " * 80).strip(),
+        citations=[Citation(title="hn", url="https://news.ycombinator.com/item?id=123", snippet="discussion", source="hn")],
+        metadata={
+            "body_len": 900,
+            "points": 2,
+            "comment_count": 1,
+            "quality_signals": {"evidence_links_quality": 1, "publish_or_update_time": "2026-02-18T10:00:00Z"},
+        },
+        rank=1,
+    )
+    auditor = EvidenceAuditor(topic="AI agent")
+    record = auditor.audit_row(row, rank=1)
+    assert record.verdict == VERDICT_REJECT
+    assert any("hn_low_engagement" in reason for reason in list(record.reasons or []))
