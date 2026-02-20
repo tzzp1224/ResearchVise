@@ -100,6 +100,9 @@ def _compact_bullet_issues(onepager: str) -> List[str]:
         for label in required_labels:
             if not any(bullet.startswith(label) for bullet in bullets):
                 issues.append(f"pick_{idx}:missing_{label.rstrip('｜').lower().replace(' ', '_')}")
+        why_now_count = sum(1 for bullet in bullets if bullet.startswith("WHY NOW｜"))
+        if why_now_count < 2:
+            issues.append(f"pick_{idx}:why_now_lt_2")
     return issues
 
 
@@ -272,10 +275,12 @@ def _validate_frame_variance(mp4_path: Path, duration: Optional[float]) -> Tuple
     return max_delta >= 0.01, f"delta={max_delta:.6f}", max_delta
 
 
-def validate(run_dir: Path, render_dir: Path) -> Dict:
+def validate(run_dir: Path, render_dir: Optional[Path] = None, *, web_only: bool = False) -> Dict:
+    resolved_render_dir = Path(render_dir).resolve() if render_dir else (run_dir / "renders").resolve()
     report: Dict = {
         "run_dir": str(run_dir),
-        "render_dir": str(render_dir),
+        "render_dir": str(resolved_render_dir),
+        "web_only": bool(web_only),
         "checks": {},
         "errors": [],
         "details": {},
@@ -318,8 +323,9 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         "materials": run_dir / "materials.json",
         "diagnosis": run_dir / "retrieval_diagnosis.json",
         "evidence_audit": run_dir / "evidence_audit.json",
-        "mp4": render_dir / "rendered_final.mp4",
     }
+    if not web_only:
+        required["mp4"] = resolved_render_dir / "rendered_final.mp4"
     for key, path in required.items():
         ok = path.exists() and path.is_file()
         report["checks"][f"{key}_exists"] = ok
@@ -333,9 +339,9 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
     prompt_bundle_path = required["prompt_bundle"]
     diagnosis_path = required["diagnosis"]
     evidence_audit_path = required["evidence_audit"]
-    mp4_path = required["mp4"]
-    if not mp4_path.exists():
-        fallback_mp4 = render_dir / "fallback_render.mp4"
+    mp4_path = required.get("mp4")
+    if (not web_only) and mp4_path is not None and not mp4_path.exists():
+        fallback_mp4 = resolved_render_dir / "fallback_render.mp4"
         if fallback_mp4.exists():
             mp4_path = fallback_mp4
             report["checks"]["mp4_exists"] = True
@@ -427,7 +433,8 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         )
         onepager_has_why_not_more = bool(re.search(r"^##\s+Why not more\?\s*$", onepager, flags=re.MULTILINE))
         onepager_has_hot_new_agents_section = bool(
-            re.search(r"^##\s+Top Picks:\s+Hot New Agents \(Top3\)\s*$", onepager, flags=re.MULTILINE)
+            re.search(r"^##\s+Section A:\s+Hot New Top Picks\s*$", onepager, flags=re.MULTILINE)
+            or re.search(r"^##\s+Top Picks:\s+Hot New Agents \(Top3\)\s*$", onepager, flags=re.MULTILINE)
         )
         report["details"]["onepager_has_why_not_more"] = onepager_has_why_not_more
         report["details"]["onepager_has_hot_new_agents_section"] = onepager_has_hot_new_agents_section
@@ -653,7 +660,14 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         if not report["checks"]["prompt_bundle_no_html_tokens"]:
             report["errors"].append("prompt_bundle_html_tokens_present")
 
-    if mp4_path.exists():
+    if web_only:
+        report["checks"]["mp4_exists"] = True
+        report["checks"]["mp4_probe_ok"] = True
+        report["checks"]["mp4_duration_ge_10"] = True
+        report["checks"]["mp4_frame_variance_ok"] = True
+        report["checks"]["render_status_seedance_flag_present"] = True
+        report["details"]["render_validation_mode"] = "web_only_skipped"
+    elif mp4_path is not None and mp4_path.exists():
         ok, info, error = _ffprobe_info(mp4_path)
         report["checks"]["mp4_probe_ok"] = ok
         if not ok:
@@ -671,9 +685,15 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
             report["details"]["mp4_frame_variance_desc"] = variance_desc
             if not variance_ok and not variance_desc.startswith("skipped:"):
                 report["errors"].append("mp4_frame_variance:" + variance_desc)
+    else:
+        report["checks"]["mp4_probe_ok"] = False
+        report["checks"]["mp4_duration_ge_10"] = False
+        report["checks"]["mp4_frame_variance_ok"] = False
 
-    render_status_path = render_dir / "render_status.json"
-    if render_status_path.exists():
+    render_status_path = resolved_render_dir / "render_status.json"
+    if web_only:
+        report["checks"]["render_status_seedance_flag_present"] = True
+    elif render_status_path.exists():
         try:
             status_payload = _load_json(render_status_path)
             report["checks"]["render_status_seedance_flag_present"] = "seedance_used" in status_payload
@@ -894,6 +914,88 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
                 f"unresolved={','.join(unresolved_top3_ids[:3]) if unresolved_top3_ids else 'none'}"
             )
 
+        top_picks_no_infra_by_default = True
+        top_picks_allow_empty_not_fill_infra = True
+        four_scores_present = True
+        for item_id in list(top_item_ids or []):
+            diag_row = dict(diagnosis_candidate_map.get(item_id) or {})
+            is_infra = bool(diag_row.get("intent_is_infra", False))
+            infra_exception = bool(diag_row.get("infra_exception_event", False))
+            infra_exception_reason = str(diag_row.get("infra_exception_reason_code") or "").strip()
+            partition = str(diag_row.get("intent_partition") or "").strip().lower()
+            if is_infra and (not infra_exception or not infra_exception_reason):
+                top_picks_no_infra_by_default = False
+            if int(ranking_stats.get("top_picks_count", len(top_item_ids)) or len(top_item_ids)) < int(
+                ranking_stats.get("requested_top_k", 0) or 0
+            ):
+                if partition in {"infra", "background"} and not infra_exception:
+                    top_picks_allow_empty_not_fill_infra = False
+
+            required_score_fields = {
+                "relevance_score_component",
+                "trend_score_component",
+                "content_worth_score_component",
+                "anti_dominance_penalty_component",
+                "final_hot_score",
+                "bonus_total_component",
+            }
+            if not required_score_fields.issubset(set(diag_row.keys())):
+                hot_score_breakdown = dict(diag_row.get("hot_score_breakdown") or {})
+                if not {
+                    "relevance_score",
+                    "trend_score",
+                    "content_worth_score",
+                    "anti_dominance_penalty",
+                    "final_hot_score",
+                    "bonus",
+                }.issubset(set(hot_score_breakdown.keys())):
+                    four_scores_present = False
+
+        report["checks"]["top_picks_no_infra_by_default"] = bool((not hot_new_agents_mode) or top_picks_no_infra_by_default)
+        report["checks"]["top_picks_allow_empty_not_fill_infra"] = bool(
+            (not hot_new_agents_mode) or top_picks_allow_empty_not_fill_infra
+        )
+        report["checks"]["four_scores_present"] = bool(four_scores_present)
+        if not report["checks"]["top_picks_no_infra_by_default"]:
+            report["errors"].append("top_picks_infra_without_exception_reason")
+        if not report["checks"]["top_picks_allow_empty_not_fill_infra"]:
+            report["errors"].append("top_picks_filled_by_infra_or_background_when_hot_shortage")
+        if not report["checks"]["four_scores_present"]:
+            report["errors"].append("top_picks_missing_four_score_breakdown")
+
+        github_multi_recall = dict(
+            diagnosis_payload.get("github_multi_recall")
+            or retrieval_ctx.get("github_multi_recall")
+            or ranking_stats.get("github_multi_recall")
+            or {}
+        )
+        github_routes = dict(github_multi_recall.get("routes") or {})
+        route_ok = all(route in github_routes for route in ("R1", "R2", "R3", "R4"))
+        route_counts_ok = route_ok and all(
+            isinstance(dict(github_routes.get(route) or {}).get("count"), (int, float))
+            and isinstance(dict(github_routes.get(route) or {}).get("unique_count"), (int, float))
+            for route in ("R1", "R2", "R3", "R4")
+        )
+        merged_count_ok = isinstance(github_multi_recall.get("merged_unique_count"), (int, float))
+        report["checks"]["github_multi_recall_present"] = bool(route_counts_ok and merged_count_ok)
+        report["details"]["github_multi_recall"] = github_multi_recall
+        if not report["checks"]["github_multi_recall_present"]:
+            report["errors"].append("github_multi_recall_missing_R1_R4_or_merge_count")
+
+        selected_source_coverage = int(
+            ranking_stats.get("selected_source_coverage", retrieval_ctx.get("source_coverage", 0)) or 0
+        )
+        if selected_source_coverage <= 1 and top_item_ids:
+            cross_source_not_required = any(
+                bool(dict(diagnosis_candidate_map.get(item_id) or {}).get("single_source_hot", False))
+                for item_id in list(top_item_ids or [])
+            )
+        else:
+            cross_source_not_required = True
+        report["checks"]["cross_source_not_required"] = bool(cross_source_not_required)
+        if not report["checks"]["cross_source_not_required"]:
+            report["errors"].append("single_source_hot_missing_when_source_coverage_is_one")
+
         record_map = {
             str((row or {}).get("item_id") or "").strip(): dict(row or {})
             for row in list(evidence_audit_payload.get("records") or [])
@@ -918,6 +1020,11 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
         report["checks"]["relevance_not_all_1.0"] = True
         report["checks"]["onepager_has_hot_new_agents_section"] = True
         report["checks"]["top_picks_not_infra_dominant"] = True
+        report["checks"]["top_picks_no_infra_by_default"] = True
+        report["checks"]["top_picks_allow_empty_not_fill_infra"] = True
+        report["checks"]["cross_source_not_required"] = True
+        report["checks"]["four_scores_present"] = True
+        report["checks"]["github_multi_recall_present"] = True
         report["checks"]["top_picks_not_all_downgrade"] = True
 
     all_urls = []
@@ -936,13 +1043,14 @@ def validate(run_dir: Path, render_dir: Path) -> Dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate v2 run/render artifact quality gates")
     parser.add_argument("--run-dir", required=True, help="Run artifact directory")
-    parser.add_argument("--render-dir", required=True, help="Render job directory")
+    parser.add_argument("--render-dir", default="", help="Render job directory (optional with --web-only)")
+    parser.add_argument("--web-only", action="store_true", help="Skip render/mp4 checks and validate web artifacts only")
     parser.add_argument("--json-out", default="", help="Optional output path for JSON report")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
-    render_dir = Path(args.render_dir).resolve()
-    report = validate(run_dir=run_dir, render_dir=render_dir)
+    render_dir = Path(args.render_dir).resolve() if str(args.render_dir).strip() else None
+    report = validate(run_dir=run_dir, render_dir=render_dir, web_only=bool(args.web_only))
     payload = json.dumps(report, ensure_ascii=False, indent=2)
     print(payload)
 

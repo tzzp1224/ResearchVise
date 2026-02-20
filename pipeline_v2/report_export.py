@@ -114,13 +114,48 @@ def _fact_bullets(item: NormalizedItem) -> List[str]:
         return (shrunk.rstrip() + "...") if shrunk else value[:20]
 
     what = str(facts.get("what_it_is") or item.title or "")
-    why_now = str(facts.get("why_now") or "")
-    if not why_now:
-        recency = signals.get("update_recency_days")
-        if recency not in (None, "", "unknown"):
-            why_now = f"更新 {float(recency):.1f} 天内，窗口期明确。"
-        else:
-            why_now = "热度抬升，讨论集中在落地能力。"
+    why_now_points: List[str] = []
+
+    why_now_seed = str(facts.get("why_now") or "").strip()
+    if why_now_seed:
+        why_now_points.append(why_now_seed)
+
+    recency = signals.get("update_recency_days")
+    if recency not in (None, "", "unknown"):
+        why_now_points.append(f"更新 {float(recency):.1f} 天内，窗口期内活跃。")
+
+    created_at = str(metadata.get("created_at") or "").strip()
+    if created_at:
+        why_now_points.append(f"created_at 信号可追溯：{created_at[:10]}。")
+
+    release_published = str(metadata.get("release_published_at") or "").strip()
+    if release_published:
+        why_now_points.append(f"release 信号：{release_published[:10]} 有新里程碑。")
+
+    points = int(float(metadata.get("points", 0) or 0))
+    comments = int(float(metadata.get("comment_count", 0) or 0))
+    if points > 0 or comments > 0:
+        why_now_points.append(f"HN 互动 {points} points / {comments} comments。")
+
+    hf_rank = int(float(metadata.get("search_rank", 0) or 0))
+    hf_pool = int(float(metadata.get("search_pool_size", 0) or 0))
+    if hf_rank > 0 and hf_pool > 1 and str(item.source or "").strip().lower() == "huggingface":
+        why_now_points.append(f"HF trending proxy：rank {hf_rank}/{hf_pool}。")
+
+    if bool(metadata.get("cross_source_corroborated")):
+        why_now_points.append("跨源同时出现，可信度与关注度同步上升。")
+
+    dedup_why_now: List[str] = []
+    seen_why_now = set()
+    for point in why_now_points:
+        token = re.sub(r"\s+", " ", str(point or "")).strip()
+        key = token.lower()
+        if not token or key in seen_why_now:
+            continue
+        seen_why_now.add(key)
+        dedup_why_now.append(token)
+    while len(dedup_why_now) < 2:
+        dedup_why_now.append("关键时效信号 unknown；使用搜索排名/更新代理作为 why-now proxy。")
 
     how_points = [str(value or "") for value in list(facts.get("how_it_works") or []) if str(value or "").strip()]
     while len(how_points) < 2:
@@ -148,9 +183,9 @@ def _fact_bullets(item: NormalizedItem) -> List[str]:
 
     bullets = [
         f"WHAT｜{_trim_bytes(what)}",
-        f"WHY NOW｜{_trim_bytes(why_now)}",
+        f"WHY NOW｜{_trim_bytes(dedup_why_now[0])}",
+        f"WHY NOW｜{_trim_bytes(dedup_why_now[1])}",
         f"HOW｜{_trim_bytes(how_points[0])}",
-        f"HOW｜{_trim_bytes(how_points[1])}",
         f"PROOF｜{_trim_bytes(proof)}",
     ]
     if metrics["citation_count"] > 0:
@@ -432,6 +467,22 @@ def generate_onepager(
         )
         if str(value).strip()
     ]
+    top_single_source_hot_ids = [
+        str(value).strip()
+        for value in list(
+            ranking_stats.get(
+                "top_single_source_hot_ids",
+                retrieval.get("top_single_source_hot_ids", []),
+            )
+            or []
+        )
+        if str(value).strip()
+    ]
+    github_multi_recall = dict(
+        ranking_stats.get("github_multi_recall")
+        or retrieval.get("github_multi_recall")
+        or {}
+    )
     why_not_more_reasons = [
         str(value).strip()
         for value in list(ranking_stats.get("why_not_more") or retrieval.get("why_not_more") or [])
@@ -537,7 +588,19 @@ def generate_onepager(
         f"- DiagnosisPath: `{diagnosis_path or 'N/A'}`",
         f"- EvidenceAuditPath: `{evidence_audit_path or 'N/A'}`",
         "",
-        "## Top Picks: Hot New Agents (Top3)" if intent_mode == "hot_new_agents" else "## Top Picks",
+        f"- TopSingleSourceHotCount: `{len(top_single_source_hot_ids)}`",
+        (
+            f"- TopSingleSourceHotIds: `{','.join(top_single_source_hot_ids)}`"
+            if top_single_source_hot_ids
+            else "- TopSingleSourceHotIds: `N/A`"
+        ),
+        (
+            f"- GitHubMultiRecall: `{json.dumps(github_multi_recall, ensure_ascii=False, sort_keys=True)}`"
+            if github_multi_recall
+            else "- GitHubMultiRecall: `N/A`"
+        ),
+        "",
+        "## Section A: Hot New Top Picks",
         "",
     ]
     if top_picks_count < requested_top_k:
@@ -580,6 +643,8 @@ def generate_onepager(
             for value in list((item.metadata or {}).get("cross_source_corroboration_sources") or [])
             if str(value).strip()
         ]
+        score_breakdown = dict((item.metadata or {}).get("hot_score_breakdown") or {})
+        bonus_payload = dict(score_breakdown.get("bonus") or {})
 
         lines.extend(
             [
@@ -588,6 +653,19 @@ def generate_onepager(
                 f"- Source Domain: `{_domain(item.url)}`",
                 f"- Tier/Credibility: `{item.tier}` / `{credibility}`",
                 f"- Topic Relevance: `{relevance_value:.2f}`" if relevance_value is not None else "- Topic Relevance: `N/A`",
+                (
+                    "- Explain: "
+                    f"FinalHotScore={float(score_breakdown.get('final_hot_score', 0.0) or 0.0):.2f}; "
+                    f"RelevanceScore={float(score_breakdown.get('relevance_score', 0.0) or 0.0):.2f}; "
+                    f"TrendScore={float(score_breakdown.get('trend_score', 0.0) or 0.0):.2f}; "
+                    f"ContentWorthScore={float(score_breakdown.get('content_worth_score', 0.0) or 0.0):.2f}; "
+                    f"AntiDominancePenalty={float(score_breakdown.get('anti_dominance_penalty', 0.0) or 0.0):.2f}; "
+                    f"Bonus(total={float(bonus_payload.get('total', 0.0) or 0.0):.2f},"
+                    f"cross={float(bonus_payload.get('cross_source', 0.0) or 0.0):.2f},"
+                    f"hn={float(bonus_payload.get('hn_discussion', 0.0) or 0.0):.2f},"
+                    f"hf={float(bonus_payload.get('hf_trending', 0.0) or 0.0):.2f})"
+                ),
+                f"- SingleSourceHot: `{'true' if bool((item.metadata or {}).get('single_source_hot')) else 'false'}`",
                 (
                     f"- Cross-source Corroboration: `yes ({','.join(corroboration_sources)})`"
                     if corroborated and corroboration_sources
@@ -624,7 +702,7 @@ def generate_onepager(
     if infra_watchlist:
         lines.extend(
             [
-                "## Infra Watchlist",
+                "## Section B: Infra Watchlist",
                 "",
             ]
         )
@@ -640,7 +718,7 @@ def generate_onepager(
     if background_reading:
         lines.extend(
             [
-                "## Background Reading",
+                "## Section C: Background",
                 "",
             ]
         )

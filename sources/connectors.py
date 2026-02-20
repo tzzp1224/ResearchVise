@@ -8,6 +8,7 @@ import hashlib
 import html as html_lib
 import os
 import re
+from datetime import timedelta
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,6 +61,13 @@ _TOPIC_EXPANSION_TERMS = [
     "swe-agent",
     "rag agent",
 ]
+
+_DEFAULT_GITHUB_ROUTE_REASONS = {
+    "R1": "pushed>=window_start sort=updated",
+    "R2": "created>=window_start sort=stars",
+    "R3": "topic/tag/keyword expansion recall",
+    "R4": "release recency within time window",
+}
 
 
 def _normalize_queries(topic: str, *, expanded: bool = False, queries: Optional[List[str]] = None) -> List[str]:
@@ -127,6 +135,46 @@ def _parse_window_days(time_window: str) -> int:
     if token in {"past_month", "monthly"}:
         return 30
     return 3
+
+
+def _window_start_date(time_window: str) -> str:
+    window_days = _parse_window_days(time_window)
+    start = datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days)))
+    return start.strftime("%Y-%m-%d")
+
+
+def _repo_search_text(repo: Any) -> str:
+    return " ".join(
+        [
+            str(getattr(repo, "full_name", "") or ""),
+            str(getattr(repo, "description", "") or ""),
+            " ".join([str(tag) for tag in list(getattr(repo, "topics", []) or [])]),
+        ]
+    )
+
+
+def _repo_updated_timestamp(repo: Any) -> float:
+    updated_dt = _parse_datetime(getattr(repo, "updated_at", None) or getattr(repo, "created_at", None))
+    return float(updated_dt.timestamp()) if updated_dt else 0.0
+
+
+def _repo_created_timestamp(repo: Any) -> float:
+    created_dt = _parse_datetime(getattr(repo, "created_at", None) or getattr(repo, "updated_at", None))
+    return float(created_dt.timestamp()) if created_dt else 0.0
+
+
+def _coalesce_recall_route(existing: Any, route: str) -> List[str]:
+    routes = [str(value).strip() for value in list(existing or []) if str(value).strip()]
+    if route and route not in routes:
+        routes.append(route)
+    return routes
+
+
+def _coalesce_recall_reason(existing: Any, reason: str) -> List[str]:
+    reasons = [str(value).strip() for value in list(existing or []) if str(value).strip()]
+    if reason and reason not in reasons:
+        reasons.append(reason)
+    return reasons
 
 
 def _topic_queries(topic: str, *, expanded: bool = False) -> List[str]:
@@ -443,6 +491,8 @@ async def fetch_github_topic_search(
     queries: Optional[List[str]] = None,
     must_include_terms: Optional[List[str]] = None,
     must_exclude_terms: Optional[List[str]] = None,
+    recall_route: str = "R1",
+    recall_reason: str = "",
 ) -> List[RawItem]:
     """Topic-first GitHub repo retrieval for live mode."""
     query_list = _normalize_queries(topic, expanded=expanded, queries=queries)
@@ -530,6 +580,11 @@ async def fetch_github_topic_search(
                     "topics": list(getattr(repo, "topics", []) or []),
                     "item_type": "repo",
                     "retrieval_mode": "topic_search",
+                    "github_recall_routes": _coalesce_recall_route([], str(recall_route).strip().upper()),
+                    "github_recall_reasons": _coalesce_recall_reason(
+                        [],
+                        str(recall_reason or _DEFAULT_GITHUB_ROUTE_REASONS.get(str(recall_route).strip().upper(), "")).strip(),
+                    ),
                     "source_query": query,
                     "search_rank": int(rank_pos),
                     "search_pool_size": int(max(1, len(selected))),
@@ -554,6 +609,8 @@ async def fetch_github_query_fallback(
     queries: Optional[List[str]] = None,
     must_include_terms: Optional[List[str]] = None,
     must_exclude_terms: Optional[List[str]] = None,
+    recall_route: str = "R3",
+    recall_reason: str = "",
 ) -> List[RawItem]:
     """Fallback GitHub recall when topic-search call path times out."""
     query_list = _normalize_queries(topic, expanded=False, queries=queries)
@@ -661,6 +718,11 @@ async def fetch_github_query_fallback(
                     "topics": list(getattr(repo, "topics", []) or []),
                     "item_type": "repo",
                     "retrieval_mode": "query_fallback",
+                    "github_recall_routes": _coalesce_recall_route([], str(recall_route).strip().upper()),
+                    "github_recall_reasons": _coalesce_recall_reason(
+                        [],
+                        str(recall_reason or _DEFAULT_GITHUB_ROUTE_REASONS.get(str(recall_route).strip().upper(), "")).strip(),
+                    ),
                     "source_query": query,
                     "search_rank": int(rank_pos),
                     "search_pool_size": int(max(1, len(ordered))),
@@ -680,11 +742,212 @@ async def fetch_github_query_fallback(
     return items
 
 
+def _topic_tag_tokens(topic: str, queries: Optional[List[str]]) -> List[str]:
+    tokens = []
+    raw_values = [str(topic or "")] + [str(value or "") for value in list(queries or [])]
+    for raw in raw_values:
+        for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,30}", str(raw or "").lower()):
+            if token in {
+                "ai",
+                "the",
+                "and",
+                "for",
+                "with",
+                "latest",
+                "today",
+                "news",
+                "agent",
+                "agents",
+            }:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+    return tokens[:10]
+
+
+async def fetch_github_created_starred(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    expanded: bool = False,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+    recall_route: str = "R2",
+    recall_reason: str = "",
+) -> List[RawItem]:
+    """Created-within-window + stars-sorted recall for new breakout repos."""
+    query_list = _normalize_queries(topic, expanded=expanded, queries=queries)
+    if not query_list:
+        return []
+
+    max_items = max(1, int(limit))
+    per_query = max(2, int(max_items / max(1, len(query_list))) + 2)
+    window_days = _parse_window_days(time_window)
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
+    created_start = _window_start_date(time_window)
+
+    token = str(get_settings().github.token or os.getenv("GITHUB_TOKEN") or "").strip() or None
+    repos_by_full_name: Dict[str, Tuple[Any, str, int]] = {}
+    async with GitHubScraper() as scraper:
+        for query in query_list:
+            created_query = f"{query} created:>={created_start}".strip()
+            repos = await scraper.search_repos(query=created_query, max_results=per_query, sort="stars", order="desc")
+            for rank_pos, repo in enumerate(list(repos or []), start=1):
+                full_name = str(getattr(repo, "full_name", "") or "").strip()
+                if not full_name:
+                    continue
+                relevance_text = _repo_search_text(repo)
+                if not _matches_topic_constraints(
+                    text=relevance_text,
+                    must_include_terms=must_include_terms,
+                    must_exclude_terms=must_exclude_terms,
+                ):
+                    continue
+                created_ts = _repo_created_timestamp(repo)
+                if created_ts and created_ts < cutoff_ts:
+                    continue
+                existing = repos_by_full_name.get(full_name)
+                if existing is None:
+                    repos_by_full_name[full_name] = (repo, query, rank_pos)
+                else:
+                    prev_repo, _prev_query, prev_rank = existing
+                    prev_stars = int(getattr(prev_repo, "stars", 0) or 0)
+                    now_stars = int(getattr(repo, "stars", 0) or 0)
+                    if now_stars > prev_stars or (now_stars == prev_stars and rank_pos < prev_rank):
+                        repos_by_full_name[full_name] = (repo, query, rank_pos)
+            if len(repos_by_full_name) >= max_items * 3:
+                break
+
+    selected = sorted(
+        list(repos_by_full_name.items()),
+        key=lambda pair: (
+            int(getattr(pair[1][0], "stars", 0) or 0),
+            _repo_updated_timestamp(pair[1][0]),
+        ),
+        reverse=True,
+    )[:max_items]
+
+    route = str(recall_route).strip().upper() or "R2"
+    reason = str(recall_reason or _DEFAULT_GITHUB_ROUTE_REASONS.get(route, "")).strip()
+    items: List[RawItem] = []
+    for selected_idx, (full_name, (repo, query, rank_pos)) in enumerate(selected, start=1):
+        readme = await _fetch_github_readme(full_name, token)
+        body = _safe_truncate(
+            "\n\n".join(
+                [
+                    _coalesce_text(getattr(repo, "description", ""), ""),
+                    (
+                        f"Stars: {int(getattr(repo, 'stars', 0) or 0)} | "
+                        f"Forks: {int(getattr(repo, 'forks', 0) or 0)} | "
+                        f"Created: {getattr(repo, 'created_at', '') or 'unknown'} | "
+                        f"LastPush: {getattr(repo, 'updated_at', '') or 'unknown'}"
+                    ),
+                    readme,
+                ]
+            ),
+            max_len=9000,
+        )
+        items.append(
+            RawItem(
+                id=f"github_created_{getattr(repo, 'id', full_name)}",
+                source="github",
+                title=full_name,
+                url=_coalesce_text(getattr(repo, "url", ""), f"https://github.com/{full_name}"),
+                body=body,
+                author=getattr(repo, "owner", None),
+                published_at=_parse_datetime(getattr(repo, "created_at", None) or getattr(repo, "updated_at", None)),
+                tier="A",
+                metadata={
+                    "stars": int(getattr(repo, "stars", 0) or 0),
+                    "forks": int(getattr(repo, "forks", 0) or 0),
+                    "watchers": int(getattr(repo, "watchers", 0) or 0),
+                    "created_at": str(getattr(repo, "created_at", "") or ""),
+                    "updated_at": str(getattr(repo, "updated_at", "") or ""),
+                    "last_push": str(getattr(repo, "updated_at", "") or ""),
+                    "language": getattr(repo, "language", None),
+                    "topics": list(getattr(repo, "topics", []) or []),
+                    "item_type": "repo",
+                    "retrieval_mode": "created_stars",
+                    "github_recall_routes": _coalesce_recall_route([], route),
+                    "github_recall_reasons": _coalesce_recall_reason([], reason),
+                    "source_query": query,
+                    "search_rank": int(rank_pos),
+                    "search_pool_size": int(max(1, len(selected))),
+                    "search_sort": "stars",
+                    "search_selected_rank": int(selected_idx),
+                    "window_days": window_days,
+                    "search_endpoint": "github_search_repositories",
+                    "extraction_method": "github_created_starred_readme" if readme else "github_created_starred_metadata",
+                    "extraction_failed": bool(not readme),
+                    "readme_len": len(readme),
+                },
+            )
+        )
+    return items
+
+
+async def fetch_github_topic_tag_search(
+    topic: str,
+    time_window: str = "today",
+    limit: int = 20,
+    *,
+    expanded: bool = True,
+    queries: Optional[List[str]] = None,
+    must_include_terms: Optional[List[str]] = None,
+    must_exclude_terms: Optional[List[str]] = None,
+    recall_route: str = "R3",
+    recall_reason: str = "",
+) -> List[RawItem]:
+    """Topic/tag/keyword expansion recall to reduce miss on niche breakout repos."""
+    base_queries = _normalize_queries(topic, expanded=bool(expanded), queries=queries)
+    tag_tokens = _topic_tag_tokens(topic, base_queries)
+    tag_queries = list(base_queries)
+    for token in tag_tokens[:6]:
+        tag_queries.append(f"topic:{token}")
+    dedup_queries: List[str] = []
+    seen = set()
+    for query in tag_queries:
+        key = str(query or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup_queries.append(str(query).strip())
+
+    route = str(recall_route).strip().upper() or "R3"
+    reason = str(recall_reason or _DEFAULT_GITHUB_ROUTE_REASONS.get(route, "")).strip()
+    items = await fetch_github_query_fallback(
+        topic=topic,
+        time_window=time_window,
+        limit=max(1, int(limit)),
+        queries=dedup_queries,
+        must_include_terms=must_include_terms,
+        must_exclude_terms=must_exclude_terms,
+        recall_route=route,
+        recall_reason=reason,
+    )
+    output: List[RawItem] = []
+    for item in list(items or []):
+        payload = dict(item.metadata or {})
+        payload["retrieval_mode"] = "topic_tag_search"
+        payload["topic_tag_tokens"] = list(tag_tokens)
+        payload["topic_tag_query_count"] = int(len(dedup_queries))
+        payload["github_recall_routes"] = _coalesce_recall_route(payload.get("github_recall_routes"), route)
+        payload["github_recall_reasons"] = _coalesce_recall_reason(payload.get("github_recall_reasons"), reason)
+        item.metadata = payload
+        output.append(item)
+    return output
+
+
 async def fetch_github_releases(
     repo_full_names: List[str],
     max_results_per_repo: int = 2,
     *,
     token: Optional[str] = None,
+    time_window: str = "",
+    recall_route: str = "R4",
+    recall_reason: str = "",
 ) -> List[RawItem]:
     """Fetch latest GitHub releases for selected repositories (Tier A)."""
     normalized_repos = [str(item or "").strip() for item in list(repo_full_names or []) if str(item or "").strip()]
@@ -693,6 +956,15 @@ async def fetch_github_releases(
 
     auth_token = token or str(get_settings().github.token or os.getenv("GITHUB_TOKEN") or "").strip() or None
     headers = _github_headers(auth_token)
+    window_token = str(time_window or "").strip()
+    window_days = _parse_window_days(window_token) if window_token else 0
+    cutoff = (
+        datetime.now(timezone.utc).timestamp() - float(window_days) * 86400.0
+        if window_days > 0
+        else None
+    )
+    route = str(recall_route).strip().upper() or "R4"
+    reason = str(recall_reason or _DEFAULT_GITHUB_ROUTE_REASONS.get(route, "")).strip()
 
     items: List[RawItem] = []
     for repo in normalized_repos:
@@ -705,6 +977,9 @@ async def fetch_github_releases(
         for release in list(payload or [])[: max(1, int(max_results_per_repo))]:
             rel_name = _coalesce_text(release.get("name"), release.get("tag_name"), "Release")
             rel_url = _coalesce_text(release.get("html_url"), f"https://github.com/{repo}/releases")
+            published_dt = _parse_datetime(release.get("published_at") or release.get("created_at"))
+            if cutoff is not None and published_dt and published_dt.timestamp() < cutoff:
+                continue
             body = _safe_truncate(
                 _coalesce_text(
                     release.get("body"),
@@ -722,13 +997,18 @@ async def fetch_github_releases(
                     url=rel_url,
                     body=body,
                     author=_coalesce_text((release.get("author") or {}).get("login"), repo.split("/", 1)[0]),
-                    published_at=_parse_datetime(release.get("published_at") or release.get("created_at")),
+                    published_at=published_dt,
                     tier="A",
                     metadata={
                         "repo": repo,
                         "tag_name": release.get("tag_name"),
                         "prerelease": bool(release.get("prerelease", False)),
                         "item_type": "release",
+                        "release_published_at": str(release.get("published_at") or release.get("created_at") or ""),
+                        "retrieval_mode": "release_recency",
+                        "github_recall_routes": _coalesce_recall_route([], route),
+                        "github_recall_reasons": _coalesce_recall_reason([], reason),
+                        "window_days": int(max(0, window_days)),
                         "extraction_method": "github_release_notes",
                         "extraction_failed": False,
                     },

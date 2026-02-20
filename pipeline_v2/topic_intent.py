@@ -110,6 +110,7 @@ class TopicIntentConfig:
     handbook_keywords: Tuple[str, ...]
     hot_agent_keywords: Tuple[str, ...]
     infra_exception_keywords: Tuple[str, ...]
+    infra_identity_terms: Tuple[str, ...]
 
 
 AI_AGENT_INTENT = TopicIntentConfig(
@@ -179,6 +180,16 @@ AI_AGENT_INTENT = TopicIntentConfig(
         "incident",
         "critical bug",
     ),
+    infra_identity_terms=(
+        "langchain",
+        "langgraph",
+        "autogen",
+        "crewai",
+        "llamaindex",
+        "llama index",
+        "semantic kernel",
+        "agent framework",
+    ),
 )
 
 
@@ -215,10 +226,12 @@ class TopicIntent:
             ]
         ).lower()
 
-    def _infra_exception_event(self, item: NormalizedItem, *, text: str) -> bool:
+    def _infra_exception_event(self, item: NormalizedItem, *, text: str) -> Tuple[bool, str]:
         metadata = dict(item.metadata or {})
-        if _any_term(text, self.config.infra_exception_keywords):
-            return True
+        if _any_term(text, ("cve", "vulnerability", "security advisory")):
+            return True, "security_incident"
+        if _any_term(text, ("breaking change", "migration guide", "deprecate", "breaking")):
+            return True, "breaking_change"
 
         cross_source_count = int(float(metadata.get("cross_source_corroboration_count", 0) or 0))
         points = int(float(metadata.get("points", 0) or 0))
@@ -234,7 +247,13 @@ class TopicIntent:
             and release_days <= 7.0
             and re.search(r"\bv\d+\.\d+(\.\d+)?\b", text)
         )
-        return bool(discussion_spike and major_release)
+        if discussion_spike and major_release:
+            return True, "major_release_milestone"
+        if discussion_spike and _any_term(text, ("controversy", "backlash", "debate", "incident")):
+            return True, "community_controversy"
+        if _any_term(text, self.config.infra_exception_keywords):
+            return True, "infra_exception_keyword"
+        return False, ""
 
     def trend_signal(self, item: NormalizedItem) -> Dict[str, Any]:
         metadata = dict(item.metadata or {})
@@ -382,9 +401,10 @@ class TopicIntent:
         infra_repo_match = repo_full_name in set(self.config.infra_repo_allowlist)
         infra_org_match = repo_org in set(self.config.infra_org_allowlist)
         infra_keyword_match = _any_term(text, self.config.infra_keywords)
+        infra_identity_match = _any_term(text, self.config.infra_identity_terms)
         is_infra = bool(
             source == "github"
-            and (infra_repo_match or (infra_org_match and infra_keyword_match))
+            and (infra_repo_match or infra_org_match or (infra_identity_match and infra_keyword_match))
         )
         is_handbook = bool(_any_term(text, self.config.handbook_keywords))
         hot_keyword_hits = [
@@ -392,7 +412,10 @@ class TopicIntent:
             for token in list(self.config.hot_agent_keywords)
             if _contains_term(text, token)
         ]
-        infra_exception_event = bool(is_infra and self._infra_exception_event(item, text=text))
+        infra_exception_event = False
+        infra_exception_reason_code = ""
+        if is_infra:
+            infra_exception_event, infra_exception_reason_code = self._infra_exception_event(item, text=text)
 
         trend_payload = self.trend_signal(item)
         trend_score = float(trend_payload.get("score", 0.0) or 0.0)
@@ -401,26 +424,44 @@ class TopicIntent:
             or trend_score >= 0.75
         )
 
-        top_pick_allowed = True
+        partition = "hot"
         bucket = self.config.top_pick_bucket
+        reason_codes: List[str] = []
+        top_pick_allowed = True
         if self.hot_new_agents_mode:
             if is_handbook:
                 top_pick_allowed = False
+                partition = "background"
                 bucket = self.config.background_bucket
+                reason_codes.append("background_handbook")
             elif is_infra and not infra_exception_event:
                 top_pick_allowed = False
+                partition = "infra"
                 bucket = self.config.infra_watchlist_bucket
+                reason_codes.append("infra_default_watchlist")
+            elif not hot_candidate and not infra_exception_event:
+                top_pick_allowed = False
+                partition = "background"
+                bucket = self.config.background_bucket
+                reason_codes.append("hot_signal_below_threshold")
+            elif infra_exception_event:
+                reason_codes.append(f"infra_exception:{infra_exception_reason_code or 'unspecified'}")
+            else:
+                reason_codes.append("hot_candidate")
 
         metadata["intent_key"] = self.config.key
         metadata["intent_mode"] = self.config.top_pick_bucket if self.hot_new_agents_mode else "default"
         metadata["intent_bucket"] = bucket
+        metadata["intent_partition"] = partition
         metadata["intent_repo_full_name"] = repo_full_name
         metadata["intent_is_infra"] = bool(is_infra)
         metadata["intent_is_handbook"] = bool(is_handbook)
         metadata["infra_exception_event"] = bool(infra_exception_event)
+        metadata["infra_exception_reason_code"] = str(infra_exception_reason_code or "")
         metadata["intent_hot_keyword_hits"] = list(hot_keyword_hits)
         metadata["intent_hot_candidate"] = bool(hot_candidate)
         metadata["intent_top_pick_allowed"] = bool(top_pick_allowed)
+        metadata["intent_reason_codes"] = list(reason_codes)
         metadata["trend_signal_score"] = float(trend_score)
         metadata["trend_signal_proxy_used"] = bool(trend_payload.get("proxy_used"))
         metadata["trend_signal_reasons"] = list(trend_payload.get("reasons") or [])
@@ -431,9 +472,33 @@ class TopicIntent:
             "is_infra": bool(is_infra),
             "is_handbook": bool(is_handbook),
             "infra_exception_event": bool(infra_exception_event),
+            "infra_exception_reason_code": str(infra_exception_reason_code or ""),
             "hot_candidate": bool(hot_candidate),
             "top_pick_allowed": bool(top_pick_allowed),
+            "partition": str(partition),
             "trend_signal_score": float(trend_score),
+        }
+
+    def partition_rows(self, rows: Sequence[Any]) -> Dict[str, List[Any]]:
+        hot: List[Any] = []
+        infra: List[Any] = []
+        background: List[Any] = []
+        for row in list(rows or []):
+            item = getattr(row, "item", None)
+            if item is None:
+                continue
+            metadata = dict(getattr(item, "metadata", None) or {})
+            partition = str(metadata.get("intent_partition") or "").strip().lower()
+            if partition == "infra":
+                infra.append(row)
+            elif partition == "background":
+                background.append(row)
+            else:
+                hot.append(row)
+        return {
+            "hot": hot,
+            "infra": infra,
+            "background": background,
         }
 
     def filter_rows_for_top_picks(self, rows: Sequence[Any]) -> Tuple[List[Any], Dict[str, int]]:
@@ -442,49 +507,40 @@ class TopicIntent:
                 "infra_filtered_count": 0,
                 "handbook_filtered_count": 0,
                 "infra_exception_top_pick_count": 0,
+                "hot_filtered_count": 0,
             }
 
-        filtered: List[Any] = []
-        infra_filtered = 0
-        handbook_filtered = 0
-        infra_count = 0
-        infra_exception_count = 0
-
-        for row in list(rows or []):
-            item = getattr(row, "item", None)
-            if item is None:
-                continue
-            metadata = dict(getattr(item, "metadata", None) or {})
-            is_infra = bool(metadata.get("intent_is_infra"))
-            is_handbook = bool(metadata.get("intent_is_handbook"))
-            infra_exception_event = bool(metadata.get("infra_exception_event"))
-            top_pick_allowed = bool(metadata.get("intent_top_pick_allowed", True))
-
-            if is_handbook:
-                handbook_filtered += 1
-                continue
-            if not top_pick_allowed:
-                if is_infra:
-                    infra_filtered += 1
-                continue
-            if is_infra:
-                if infra_exception_event:
-                    if infra_exception_count >= int(self.config.top_pick_max_infra_exceptions):
-                        infra_filtered += 1
+        partitions = self.partition_rows(rows)
+        filtered = list(partitions["hot"])
+        infra_filtered = int(len(partitions["infra"]))
+        handbook_filtered = int(len(partitions["background"]))
+        hot_filtered = 0
+        infra_exception_count = int(
+            sum(
+                1
+                for row in list(filtered or [])
+                if bool(dict((getattr(getattr(row, "item", None), "metadata", None) or {})).get("infra_exception_event"))
+            )
+        )
+        if int(self.config.top_pick_max_infra_exceptions) >= 0 and infra_exception_count > int(self.config.top_pick_max_infra_exceptions):
+            allowed: List[Any] = []
+            current_ex = 0
+            for row in list(filtered or []):
+                metadata = dict((getattr(getattr(row, "item", None), "metadata", None) or {}))
+                if bool(metadata.get("infra_exception_event")):
+                    if current_ex >= int(self.config.top_pick_max_infra_exceptions):
+                        hot_filtered += 1
                         continue
-                    infra_exception_count += 1
-                    infra_count += 1
-                elif infra_count >= int(self.config.top_pick_max_infra):
-                    infra_filtered += 1
-                    continue
-                else:
-                    infra_count += 1
-            filtered.append(row)
+                    current_ex += 1
+                allowed.append(row)
+            filtered = allowed
+            infra_exception_count = current_ex
 
         return filtered, {
             "infra_filtered_count": int(infra_filtered),
             "handbook_filtered_count": int(handbook_filtered),
             "infra_exception_top_pick_count": int(infra_exception_count),
+            "hot_filtered_count": int(hot_filtered),
         }
 
     def build_watchlists(
@@ -505,7 +561,7 @@ class TopicIntent:
             if not item_id or item_id in selected:
                 continue
             metadata = dict(getattr(item, "metadata", None) or {})
-            bucket = str(metadata.get("intent_bucket") or "").strip().lower()
+            partition = str(metadata.get("intent_partition") or "").strip().lower()
             payload = {
                 "item_id": item_id,
                 "title": str(getattr(item, "title", "") or ""),
@@ -514,10 +570,11 @@ class TopicIntent:
                 "trend_signal_score": float(metadata.get("trend_signal_score", 0.0) or 0.0),
                 "trend_signal_reasons": list(metadata.get("trend_signal_reasons") or []),
                 "infra_exception_event": bool(metadata.get("infra_exception_event", False)),
+                "infra_exception_reason_code": str(metadata.get("infra_exception_reason_code") or ""),
             }
-            if bucket == self.config.infra_watchlist_bucket and len(infra) < int(self.config.infra_watchlist_max):
+            if partition == "infra" and len(infra) < int(self.config.infra_watchlist_max):
                 infra.append(payload)
-            elif bucket == self.config.background_bucket and len(background) < int(self.config.background_max):
+            elif partition == "background" and len(background) < int(self.config.background_max):
                 background.append(payload)
             if len(infra) >= int(self.config.infra_watchlist_max) and len(background) >= int(self.config.background_max):
                 break
@@ -526,4 +583,3 @@ class TopicIntent:
             "infra_watchlist": infra,
             "background_reading": background,
         }
-

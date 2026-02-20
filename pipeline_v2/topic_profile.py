@@ -93,6 +93,8 @@ class TopicProfile:
     high_value_terms: Tuple[str, ...] = ()
     generic_terms: Tuple[str, ...] = ()
     evidence_terms: Tuple[str, ...] = ()
+    hot_new_priority_terms: Tuple[str, ...] = ()
+    infra_dominance_terms: Tuple[str, ...] = ()
 
     @property
     def minimum_bucket_coverage(self) -> int:
@@ -425,6 +427,25 @@ class TopicProfile:
                     "crewai",
                     "runtime",
                     "workflow",
+                ),
+                hot_new_priority_terms=(
+                    "vertical agent",
+                    "agent app",
+                    "mcp server",
+                    "browser agent",
+                    "computer use",
+                    "demo",
+                    "tool calling",
+                    "agent eval",
+                ),
+                infra_dominance_terms=(
+                    "langchain",
+                    "langgraph",
+                    "autogen",
+                    "crewai",
+                    "llamaindex",
+                    "agent framework",
+                    "agent sdk",
                 ),
             )
 

@@ -276,9 +276,17 @@ class RunPipelineRuntime:
                 "infra_filtered_count": 0,
                 "handbook_filtered_count": 0,
                 "infra_exception_top_pick_count": 0,
+                "hot_filtered_count": 0,
+                "hot_candidate_count": len(relevance_eligible),
+                "infra_candidate_count": 0,
+                "background_candidate_count": 0,
             }
             if attempt_intent is not None and attempt_intent.hot_new_agents_mode:
+                partitions = attempt_intent.partition_rows(relevance_eligible)
                 filtered_relevance_rows, intent_filter_stats = attempt_intent.filter_rows_for_top_picks(relevance_eligible)
+                intent_filter_stats["hot_candidate_count"] = int(len(partitions.get("hot") or []))
+                intent_filter_stats["infra_candidate_count"] = int(len(partitions.get("infra") or []))
+                intent_filter_stats["background_candidate_count"] = int(len(partitions.get("background") or []))
             if str(data_mode or "").strip().lower() == "smoke":
                 selection_relevance_floor = float(rank_pack["relevance_threshold"])
             else:
@@ -302,6 +310,10 @@ class RunPipelineRuntime:
             if int(intent_filter_stats.get("handbook_filtered_count", 0) or 0) > 0:
                 quality_reasons.append(
                     f"background_filtered_for_top_picks:{int(intent_filter_stats.get('handbook_filtered_count', 0) or 0)}"
+                )
+            if int(intent_filter_stats.get("hot_filtered_count", 0) or 0) > 0:
+                quality_reasons.append(
+                    f"non_hot_filtered_for_top_picks:{int(intent_filter_stats.get('hot_filtered_count', 0) or 0)}"
                 )
             has_next_attempt = idx < len(recall_profiles)
             quality_triggered_expansion = bool(expansion_decision.should_expand and has_next_attempt)
@@ -356,6 +368,9 @@ class RunPipelineRuntime:
                 "top_picks_count": len(picks),
                 "filtered_by_relevance": max(0, len(ranked) - len(relevance_eligible)),
                 "intent_filtered_out": max(0, len(relevance_eligible) - len(filtered_relevance_rows)),
+                "hot_candidate_count": int(intent_filter_stats.get("hot_candidate_count", len(filtered_relevance_rows)) or 0),
+                "infra_candidate_count": int(intent_filter_stats.get("infra_candidate_count", 0) or 0),
+                "background_candidate_count": int(intent_filter_stats.get("background_candidate_count", 0) or 0),
                 "relevance_threshold_used": float(rank_pack["relevance_threshold"]),
                 "relaxation_steps": int(rank_pack["relaxation_steps"]),
                 "connector_calls": list(collect_diag.get("connector_calls") or []),
@@ -372,6 +387,7 @@ class RunPipelineRuntime:
                 "deep_fetch_count": int(collect_diag.get("deep_fetch_count", 0) or 0),
                 "deep_fetch_details": list(collect_diag.get("deep_fetch_details") or []),
                 "bucket_queries": dict(collect_diag.get("bucket_queries") or {}),
+                "github_multi_recall": dict(collect_diag.get("github_multi_recall") or {}),
                 "bucket_hits_summary": dict(quality_snapshot.get("bucket_hits_summary") or {}),
                 "bucket_coverage": int(quality_snapshot.get("bucket_coverage", 0) or 0),
                 "source_coverage": int(quality_snapshot.get("source_coverage", 0) or 0),
@@ -398,6 +414,7 @@ class RunPipelineRuntime:
                 "infra_filtered_count": int(intent_filter_stats.get("infra_filtered_count", 0) or 0),
                 "handbook_filtered_count": int(intent_filter_stats.get("handbook_filtered_count", 0) or 0),
                 "infra_exception_top_pick_count": int(intent_filter_stats.get("infra_exception_top_pick_count", 0) or 0),
+                "hot_filtered_count": int(intent_filter_stats.get("hot_filtered_count", 0) or 0),
                 "explain": list(attempt_explain),
                 "selected_item_ids": [
                     str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "")
@@ -667,6 +684,15 @@ class RunPipelineRuntime:
             trend_signal = float(metadata.get("trend_signal_score", 0.0) or 0.0)
             if trend_signal > 0:
                 chunks.append(f"trend={trend_signal:.2f}")
+            final_hot_score = float(metadata.get("final_hot_score", 0.0) or 0.0)
+            if final_hot_score > 0:
+                chunks.append(f"final_hot={final_hot_score:.2f}")
+            content_worth = float(metadata.get("content_worth_score_component", 0.0) or 0.0)
+            if content_worth > 0:
+                chunks.append(f"content={content_worth:.2f}")
+            penalty_component = float(metadata.get("anti_dominance_penalty_component", 0.0) or 0.0)
+            if penalty_component > 0:
+                chunks.append(f"penalty={penalty_component:.2f}")
             recent_update_signal = float(metadata.get("recent_update_signal", 0.0) or 0.0)
             if recent_update_signal > 0:
                 chunks.append(f"recent_update={recent_update_signal:.2f}")
@@ -714,12 +740,25 @@ class RunPipelineRuntime:
                     "cross_source_corroborated": bool(metadata.get("cross_source_corroborated")),
                     "cross_source_count": int(float(metadata.get("cross_source_corroboration_count", 0) or 0)),
                     "intent_bucket": str(metadata.get("intent_bucket") or ""),
+                    "intent_partition": str(metadata.get("intent_partition") or ""),
+                    "intent_reason_codes": list(metadata.get("intent_reason_codes") or []),
                     "intent_is_infra": bool(metadata.get("intent_is_infra", False)),
                     "intent_is_handbook": bool(metadata.get("intent_is_handbook", False)),
                     "infra_exception_event": bool(metadata.get("infra_exception_event", False)),
+                    "infra_exception_reason_code": str(metadata.get("infra_exception_reason_code") or ""),
                     "intent_hot_candidate": bool(metadata.get("intent_hot_candidate", False)),
                     "trend_signal_score": float(metadata.get("trend_signal_score", 0.0) or 0.0),
                     "trend_signal_reasons": list(metadata.get("trend_signal_reasons") or []),
+                    "relevance_score_component": float(metadata.get("relevance_score_component", 0.0) or 0.0),
+                    "trend_score_component": float(metadata.get("trend_score_component", 0.0) or 0.0),
+                    "content_worth_score_component": float(metadata.get("content_worth_score_component", 0.0) or 0.0),
+                    "anti_dominance_penalty_component": float(metadata.get("anti_dominance_penalty_component", 0.0) or 0.0),
+                    "bonus_total_component": float(metadata.get("bonus_total_component", 0.0) or 0.0),
+                    "final_hot_score": float(metadata.get("final_hot_score", 0.0) or 0.0),
+                    "single_source_hot": bool(metadata.get("single_source_hot", False)),
+                    "hot_score_breakdown": dict(metadata.get("hot_score_breakdown") or {}),
+                    "github_recall_routes": list(metadata.get("github_recall_routes") or []),
+                    "github_recall_reasons": list(metadata.get("github_recall_reasons") or []),
                     "recent_update_signal": float(metadata.get("recent_update_signal", 0.0) or 0.0),
                     "stars_delta_proxy": float(metadata.get("stars_delta_proxy", 0.0) or 0.0),
                     "audit_verdict": str(record.verdict if record else "unknown"),
@@ -752,6 +791,9 @@ class RunPipelineRuntime:
         selected_intent_mode = str(selected_attempt_payload.get("intent_mode") or "default")
         infra_filtered_count = int(selected_attempt_payload.get("infra_filtered_count", 0) or 0)
         handbook_filtered_count = int(selected_attempt_payload.get("handbook_filtered_count", 0) or 0)
+        hot_candidate_count = int(selected_attempt_payload.get("hot_candidate_count", 0) or 0)
+        infra_candidate_count = int(selected_attempt_payload.get("infra_candidate_count", 0) or 0)
+        background_candidate_count = int(selected_attempt_payload.get("background_candidate_count", 0) or 0)
 
         selected_intent = TopicIntent.for_request(
             topic=topic_value,
@@ -787,6 +829,8 @@ class RunPipelineRuntime:
         why_not_more: List[str] = []
         if len(picks) < top_count:
             why_not_more.append(f"top_picks_lt_{top_count}")
+        if selected_intent_mode == "hot_new_agents" and hot_candidate_count < top_count:
+            why_not_more.append(f"hot_candidates_lt_{top_count}")
         if selected_pass_count < top_count:
             why_not_more.append(f"pass_count_lt_{top_count}")
         if selected_downgrade_count > 0:
@@ -806,6 +850,11 @@ class RunPipelineRuntime:
             str(entry.item.id)
             for entry in list(picks or [])
             if bool((entry.item.metadata or {}).get("cross_source_corroborated"))
+        ]
+        top_single_source_hot_ids = [
+            str(entry.item.id)
+            for entry in list(picks or [])
+            if bool((entry.item.metadata or {}).get("single_source_hot"))
         ]
 
         retrieval_diagnosis = {
@@ -831,6 +880,7 @@ class RunPipelineRuntime:
             "key_connector_timeout_degraded_result": bool(key_connector_timeout_degraded_result),
             "explain": list(retrieval_explain),
             "selected_queries": list(selected_attempt_payload.get("queries") or []),
+            "github_multi_recall": dict(selected_attempt_payload.get("github_multi_recall") or {}),
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
             "top_picks_min_relevance": top_picks_min_relevance,
@@ -849,8 +899,13 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
+            "top_single_source_hot_ids": top_single_source_hot_ids,
+            "top_single_source_hot_count": len(top_single_source_hot_ids),
             "intent": selected_intent_key or None,
             "intent_mode": selected_intent_mode,
+            "hot_candidate_count": int(hot_candidate_count),
+            "infra_candidate_count": int(infra_candidate_count),
+            "background_candidate_count": int(background_candidate_count),
             "infra_filtered_count": int(infra_filtered_count),
             "handbook_filtered_count": int(handbook_filtered_count),
             "infra_watchlist": infra_watchlist,
@@ -879,6 +934,7 @@ class RunPipelineRuntime:
             "key_connector_timeout_degraded_result": bool(key_connector_timeout_degraded_result),
             "explain": list(retrieval_explain),
             "plan": retrieval_plan.model_dump() if retrieval_plan else None,
+            "github_multi_recall": dict(selected_attempt_payload.get("github_multi_recall") or {}),
             "hard_match_terms_used": hard_match_terms_used,
             "hard_match_pass_count": hard_match_pass_count,
             "top_picks_min_relevance": top_picks_min_relevance,
@@ -896,8 +952,13 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
+            "top_single_source_hot_ids": top_single_source_hot_ids,
+            "top_single_source_hot_count": len(top_single_source_hot_ids),
             "intent": selected_intent_key or None,
             "intent_mode": selected_intent_mode,
+            "hot_candidate_count": int(hot_candidate_count),
+            "infra_candidate_count": int(infra_candidate_count),
+            "background_candidate_count": int(background_candidate_count),
             "infra_filtered_count": int(infra_filtered_count),
             "handbook_filtered_count": int(handbook_filtered_count),
             "infra_watchlist": infra_watchlist,
@@ -979,6 +1040,7 @@ class RunPipelineRuntime:
             "diversity_sources": sorted({str(entry.item.source or "").strip().lower() for entry in picks if str(entry.item.source or "").strip()}),
             "selected_recall_phase": getattr(profile, "phase", "base"),
             "recall_attempt_count": len(attempts),
+            "github_multi_recall": dict(selected_attempt_payload.get("github_multi_recall") or {}),
             "selected_attempt_has_key_connector_timeout": bool(selected_attempt_has_key_connector_timeout),
             "selected_attempt_fallback_used": bool(selected_attempt_fallback_used),
             "all_attempts_key_connector_timeout": bool(all_attempts_key_timeout),
@@ -992,6 +1054,9 @@ class RunPipelineRuntime:
             "min_body_len_for_top_picks": 300,
             "intent": selected_intent_key or None,
             "intent_mode": selected_intent_mode,
+            "hot_candidate_count": int(hot_candidate_count),
+            "infra_candidate_count": int(infra_candidate_count),
+            "background_candidate_count": int(background_candidate_count),
             "infra_filtered_count": int(infra_filtered_count),
             "handbook_filtered_count": int(handbook_filtered_count),
             "infra_watchlist": infra_watchlist,
@@ -1024,6 +1089,8 @@ class RunPipelineRuntime:
             "why_not_more": why_not_more,
             "top_cross_source_corroborated_ids": top_cross_source_ids,
             "top_cross_source_corroborated_count": len(top_cross_source_ids),
+            "top_single_source_hot_ids": top_single_source_hot_ids,
+            "top_single_source_hot_count": len(top_single_source_hot_ids),
             "top_why_ranked": [_why_ranked(entry, record=audit_by_item.get(str(entry.item.id))) for entry in picks],
             "top_quality_signals": [dict((entry.item.metadata or {}).get("quality_signals") or {}) for entry in picks],
             "drop_reason_samples": [
@@ -1227,6 +1294,7 @@ class RunPipelineRuntime:
         connector_timeout_counts: Dict[str, int] = {}
         fallback_details: List[Dict[str, Any]] = []
         fallback_used = False
+        github_multi_recall_diag: Dict[str, Any] = {}
         queries_by_source: Dict[str, List[str]] = {}
         include_terms_by_source: Dict[str, List[str]] = {}
         exclude_terms_by_source: Dict[str, List[str]] = {}
@@ -1464,48 +1532,234 @@ class RunPipelineRuntime:
                 if plan
                 else max(8, base_limit)
             )
-            github_timeout_before = int(connector_timeout_counts.get("fetch_github_topic_search", 0) or 0)
-            github_items = await _call(
-                "fetch_github_topic_search",
-                timeout_sec=float(github_topic_timeout_sec),
-                retry_attempts=int(github_topic_retry_attempts),
-                retry_backoff_sec=float(connector_retry_backoff_sec),
-                topic=topic,
-                time_window=phase_window,
-                limit=github_limit,
-                expanded=bool(phase.expanded_queries),
-                queries=github_queries,
-                must_include_terms=github_include_terms,
-                must_exclude_terms=github_exclude_terms,
-            )
-            github_timeout_after = int(connector_timeout_counts.get("fetch_github_topic_search", 0) or 0)
-            github_timeout_triggered = github_timeout_after > github_timeout_before
-            if github_timeout_triggered:
-                fallback_used = True
-                fallback_limit = max(6, int(github_limit))
-                fallback_items = await _call(
-                    "fetch_github_query_fallback",
-                    timeout_sec=max(float(connector_timeout_sec), 8.0),
-                    retry_attempts=1,
+
+            async def _github_route_call(
+                *,
+                route: str,
+                reason: str,
+                connectors_chain: Sequence[str],
+                expanded: bool,
+                queries: Sequence[str],
+                limit: int,
+                timeout_sec: float,
+                retry_attempts: int,
+            ) -> tuple[List[RawItem], Dict[str, Any]]:
+                chosen_connector = ""
+                for connector_name in list(connectors_chain or []):
+                    if self._connector_exists(connector_name):
+                        chosen_connector = connector_name
+                        break
+                if not chosen_connector:
+                    return [], {
+                        "route": route,
+                        "reason": reason,
+                        "connector": None,
+                        "count": 0,
+                        "unique_count": 0,
+                    }
+
+                timeout_before = int(connector_timeout_counts.get(chosen_connector, 0) or 0)
+                items = await _call(
+                    chosen_connector,
+                    timeout_sec=float(timeout_sec),
+                    retry_attempts=int(max(1, retry_attempts)),
+                    retry_backoff_sec=float(connector_retry_backoff_sec),
                     topic=topic,
                     time_window=phase_window,
-                    limit=fallback_limit,
-                    queries=github_queries,
+                    limit=max(1, int(limit)),
+                    expanded=bool(expanded),
+                    queries=list(queries or []),
                     must_include_terms=github_include_terms,
                     must_exclude_terms=github_exclude_terms,
+                    recall_route=str(route),
+                    recall_reason=str(reason),
                 )
-                github_items.extend(list(fallback_items or []))
-                fallback_details.append(
-                    {
-                        "connector": "fetch_github_topic_search",
-                        "fallback_connector": "fetch_github_query_fallback",
-                        "fallback_strategy": "query_then_sort_updated_or_stars",
-                        "phase": str(phase.phase),
-                        "window": str(phase_window),
-                        "fallback_count": int(len(fallback_items)),
-                    }
+                timeout_after = int(connector_timeout_counts.get(chosen_connector, 0) or 0)
+                timeout_triggered = timeout_after > timeout_before
+                if route == "R1" and timeout_triggered:
+                    nonlocal_fallback = await _call(
+                        "fetch_github_query_fallback",
+                        timeout_sec=max(float(connector_timeout_sec), 8.0),
+                        retry_attempts=1,
+                        topic=topic,
+                        time_window=phase_window,
+                        limit=max(6, int(limit)),
+                        queries=list(queries or []),
+                        must_include_terms=github_include_terms,
+                        must_exclude_terms=github_exclude_terms,
+                        recall_route="R1",
+                        recall_reason="fallback(query_then_sort_updated_or_stars) after timeout",
+                    )
+                    if nonlocal_fallback:
+                        items.extend(list(nonlocal_fallback))
+                    if timeout_triggered:
+                        fallback_details.append(
+                            {
+                                "connector": chosen_connector,
+                                "fallback_connector": "fetch_github_query_fallback",
+                                "fallback_strategy": "query_then_sort_updated_or_stars",
+                                "phase": str(phase.phase),
+                                "window": str(phase_window),
+                                "route": "R1",
+                                "fallback_count": int(len(nonlocal_fallback)),
+                            }
+                        )
+                for entry in list(items or []):
+                    meta = dict(entry.metadata or {})
+                    routes = [str(value).strip().upper() for value in list(meta.get("github_recall_routes") or []) if str(value).strip()]
+                    reasons = [str(value).strip() for value in list(meta.get("github_recall_reasons") or []) if str(value).strip()]
+                    if route not in routes:
+                        routes.append(str(route))
+                    if reason and reason not in reasons:
+                        reasons.append(str(reason))
+                    meta["github_recall_routes"] = routes
+                    meta["github_recall_reasons"] = reasons
+                    entry.metadata = meta
+                return list(items or []), {
+                    "route": route,
+                    "reason": reason,
+                    "connector": chosen_connector,
+                    "count": int(len(items or [])),
+                    "unique_count": 0,
+                }
+
+            github_routes = [
+                {
+                    "route": "R1",
+                    "reason": "pushed>=window_start sort=updated",
+                    "connectors": ["fetch_github_topic_search", "fetch_github_query_fallback"],
+                    "expanded": bool(phase.expanded_queries),
+                    "queries": github_queries,
+                    "timeout_sec": float(github_topic_timeout_sec),
+                    "retry_attempts": int(github_topic_retry_attempts),
+                },
+                {
+                    "route": "R2",
+                    "reason": "created>=window_start sort=stars",
+                    "connectors": ["fetch_github_created_starred", "fetch_github_query_fallback", "fetch_github_topic_search"],
+                    "expanded": bool(phase.expanded_queries),
+                    "queries": github_queries,
+                    "timeout_sec": max(float(connector_timeout_sec), 8.0),
+                    "retry_attempts": 1,
+                },
+                {
+                    "route": "R3",
+                    "reason": "topic/tag/keyword expansion recall",
+                    "connectors": ["fetch_github_topic_tag_search", "fetch_github_query_fallback", "fetch_github_topic_search"],
+                    "expanded": True,
+                    "queries": github_queries,
+                    "timeout_sec": max(float(connector_timeout_sec), 8.0),
+                    "retry_attempts": 1,
+                },
+            ]
+
+            route_tasks: List[Awaitable[tuple[List[RawItem], Dict[str, Any]]]] = []
+            for route_cfg in list(github_routes):
+                route_tasks.append(
+                    _github_route_call(
+                        route=str(route_cfg.get("route") or ""),
+                        reason=str(route_cfg.get("reason") or ""),
+                        connectors_chain=list(route_cfg.get("connectors") or []),
+                        expanded=bool(route_cfg.get("expanded")),
+                        queries=list(route_cfg.get("queries") or []),
+                        limit=int(github_limit),
+                        timeout_sec=float(route_cfg.get("timeout_sec") or connector_timeout_sec),
+                        retry_attempts=int(route_cfg.get("retry_attempts") or 1),
+                    )
                 )
-            raw_items.extend(list(github_items or []))
+            route_results = await asyncio.gather(*route_tasks)
+
+            github_route_items: Dict[str, List[RawItem]] = {}
+            github_route_stats: Dict[str, Dict[str, Any]] = {}
+            repo_candidates: List[str] = []
+            for items, stats in route_results:
+                route_key = str(stats.get("route") or "").strip().upper()
+                github_route_items[route_key] = list(items or [])
+                github_route_stats[route_key] = dict(stats or {})
+                for entry in list(items or []):
+                    title = str(entry.title or "").strip()
+                    if "/" in title and title not in repo_candidates:
+                        repo_candidates.append(title)
+                connector = str(stats.get("connector") or "").strip()
+                if connector and int(connector_timeout_counts.get(connector, 0) or 0) > 0:
+                    fallback_used = True
+
+            release_connector = "fetch_github_releases" if self._connector_exists("fetch_github_releases") else ""
+            r4_items: List[RawItem] = []
+            if release_connector and repo_candidates:
+                r4_items = await _call(
+                    release_connector,
+                    timeout_sec=max(float(connector_timeout_sec), 8.0),
+                    retry_attempts=1,
+                    repo_full_names=list(repo_candidates[:8]),
+                    max_results_per_repo=1,
+                    time_window=phase_window,
+                    recall_route="R4",
+                    recall_reason="release recency within time window",
+                )
+            github_route_items["R4"] = list(r4_items or [])
+            github_route_stats["R4"] = {
+                "route": "R4",
+                "reason": "release recency within time window",
+                "connector": release_connector or None,
+                "count": int(len(r4_items or [])),
+                "unique_count": 0,
+            }
+
+            def _github_dedupe_key(entry: RawItem) -> str:
+                url_key = normalize_url(str(entry.url or "").strip())
+                if url_key:
+                    return url_key
+                return f"{str(entry.source or '').strip().lower()}::{str(entry.title or '').strip().lower()}"
+
+            merged_by_key: Dict[str, RawItem] = {}
+            route_unique_keys: Dict[str, set[str]] = {key: set() for key in github_route_items.keys()}
+            route_order = ["R1", "R2", "R3", "R4"]
+            for route_key in route_order:
+                for entry in list(github_route_items.get(route_key) or []):
+                    key = _github_dedupe_key(entry)
+                    if not key:
+                        continue
+                    route_unique_keys.setdefault(route_key, set()).add(key)
+                    if key not in merged_by_key:
+                        merged_by_key[key] = entry
+                        continue
+                    existing = merged_by_key[key]
+                    old_meta = dict(existing.metadata or {})
+                    new_meta = dict(entry.metadata or {})
+                    old_routes = [str(value).strip().upper() for value in list(old_meta.get("github_recall_routes") or []) if str(value).strip()]
+                    new_routes = [str(value).strip().upper() for value in list(new_meta.get("github_recall_routes") or []) if str(value).strip()]
+                    old_reasons = [str(value).strip() for value in list(old_meta.get("github_recall_reasons") or []) if str(value).strip()]
+                    new_reasons = [str(value).strip() for value in list(new_meta.get("github_recall_reasons") or []) if str(value).strip()]
+                    merged_routes = self._dedupe_tokens(old_routes + new_routes)
+                    merged_reasons = self._dedupe_tokens(old_reasons + new_reasons)
+                    old_meta["github_recall_routes"] = merged_routes
+                    old_meta["github_recall_reasons"] = merged_reasons
+                    old_meta["github_recall_count"] = int(len(merged_routes))
+                    old_meta["github_recall_merged"] = True
+                    if int(float(new_meta.get("stars", 0) or 0)) > int(float(old_meta.get("stars", 0) or 0)):
+                        for token in ["stars", "forks", "watchers", "created_at", "updated_at", "last_push", "search_rank"]:
+                            if token in new_meta:
+                                old_meta[token] = new_meta[token]
+                    existing.metadata = old_meta
+                    merged_by_key[key] = existing
+
+            github_merged_items = list(merged_by_key.values())
+            for route_key, stat in list(github_route_stats.items()):
+                payload = dict(stat or {})
+                payload["unique_count"] = int(len(route_unique_keys.get(route_key, set())))
+                github_route_stats[route_key] = payload
+
+            github_multi_recall_diag = {
+                "routes": {key: github_route_stats.get(key, {"count": 0, "unique_count": 0}) for key in ["R1", "R2", "R3", "R4"]},
+                "merged_unique_count": int(len(github_merged_items)),
+                "pre_merge_total_count": int(sum(int(len(github_route_items.get(key) or [])) for key in ["R1", "R2", "R3", "R4"])),
+                "used_connectors": {
+                    key: str((github_route_stats.get(key) or {}).get("connector") or "")
+                    for key in ["R1", "R2", "R3", "R4"]
+                },
+            }
+            raw_items.extend(github_merged_items)
 
             hf_task: Awaitable[List[RawItem]] = _call(
                 "fetch_huggingface_search",
@@ -1620,6 +1874,7 @@ class RunPipelineRuntime:
             diagnostics["connector_timeout_counts"] = dict(connector_timeout_counts)
             diagnostics["fallback_used"] = bool(fallback_used)
             diagnostics["fallback_details"] = list(fallback_details)
+            diagnostics["github_multi_recall"] = dict(github_multi_recall_diag or {})
 
         if not raw_items and data_mode == "live":
             raise RuntimeError("no live items fetched from connectors")
@@ -2106,9 +2361,15 @@ class RunPipelineRuntime:
                 is_handbook = bool(metadata.get("intent_is_handbook", False))
                 is_infra = bool(metadata.get("intent_is_infra", False))
                 infra_exception_event = bool(metadata.get("infra_exception_event", False))
+                intent_hot_candidate = bool(metadata.get("intent_hot_candidate", False))
+                intent_partition = str(metadata.get("intent_partition") or "").strip().lower()
                 if is_handbook:
                     continue
+                if intent_partition in {"background", "infra"} and not infra_exception_event:
+                    continue
                 if is_infra and not infra_exception_event:
+                    continue
+                if (not intent_hot_candidate) and (not infra_exception_event):
                     continue
             item_id = str((getattr(row, "item", None).id if getattr(row, "item", None) else "") or "").strip()
             record = records_by_id.get(item_id)

@@ -204,9 +204,9 @@ def test_onepager_hot_new_agents_and_infra_watchlist_sections(tmp_path: Path) ->
     }
     onepager = generate_onepager([item], item.citations, out_dir=tmp_path, run_context=run_context)
     text = Path(onepager).read_text(encoding="utf-8")
-    assert "## Top Picks: Hot New Agents (Top3)" in text
+    assert "## Section A: Hot New Top Picks" in text
     assert "- Intent: `hot_new_agents`" in text
     assert "- InfraFilteredCount: `2`" in text
     assert "- WatchlistCount: `1`" in text
     assert "#### Why trending" in text
-    assert "## Infra Watchlist" in text
+    assert "## Section B: Infra Watchlist" in text

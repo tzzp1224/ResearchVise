@@ -1,5 +1,60 @@
 # AcademicResearchAgent v2 状态说明（实装审计版）
 
+## Product Contract (TrendBrief v1.0 MVP)
+
+### 1) 产品定位（必须）
+- 本产品默认目标不是“最相关基础框架”，而是“Hot New（新且爆）的增量信息”。
+- `topic=AI agent` 时，Top Picks 优先：垂直 agent、agent apps、MCP servers、browser-use 类工具、可演示 demo、agent eval tooling。
+
+### 2) Top Picks / Infra / Background 物理隔离（必须）
+- 先分区再排序：`HotCandidates`、`InfraCandidates`、`BackgroundCandidates`。
+- Top Picks 只从 `HotCandidates` 选；Hot 不足允许 `< top_k`，不会用 Infra/Background 硬凑。
+- Infra（如 LangChain/LangGraph/AutoGen/CrewAI/LlamaIndex）默认进 `Infra Watchlist`。
+- Infra 仅在 `infra_exception_event=true` 且有 `infra_exception_reason_code` 时允许进入 Top Picks。
+
+### 3) Cross-source 语义（必须）
+- Cross-source 仅作为 bonus（加分与解释增强），不是 hard gate。
+- 单源强趋势允许入选，并在 explain 中标注 `single_source_hot=true`。
+
+### 4) GitHub 多路召回（必须）
+- R1: `pushed>=window_start`，`sort=updated`（活跃）
+- R2: `created>=window_start`，`sort=stars`（新爆）
+- R3: `topic/tag/keyword` 扩展召回（补全）
+- R4: `release recency`（窗口内 release）
+- `retrieval_diagnosis.json` 会记录 R1–R4 的命中计数、去重后计数与 merge 后总去重数。
+
+### 5) 四分数 + FinalHotScore（必须）
+- 每个候选输出并可审计：
+  - `RelevanceScore`
+  - `TrendScore`
+  - `ContentWorthScore`
+  - `AntiDominancePenalty`
+- Hot New 排序函数：
+  - `FinalHotScore = w1*Trend + w2*ContentWorth + w3*Relevance - w4*Penalty + bonus(cross_source, hn_discussion, hf_trending)`
+- 解释字段在 `retrieval_diagnosis.candidate_rows[*]`、`run_context.ranking_stats`、`onepager` 可见。
+
+### 6) Onepager 结构（必须）
+- Section A: `Hot New Top Picks`
+- Section B: `Infra Watchlist`
+- Section C: `Background`（可选）
+- 每个 Top Pick 的 facts 至少包含 2 条 `WHY NOW`，且尽量给出可验证信号；拿不到时标记 `unknown + proxy`。
+
+### 7) 验收命令（必须）
+- `pytest -q tests/v2`
+- `python main.py run-once --mode live --topic "AI agent" --time_window today --tz Asia/Singapore --targets web --top-k 3`
+- `python main.py run-once --mode live --topic "AI agent" --time_window 7d --tz Asia/Singapore --targets web --top-k 5`
+- 校验（web-only）：
+  - `python scripts/validate_artifacts_v2.py --run-dir <RUN_DIR> --web-only`
+- 校验（含 render）：
+  - `python scripts/validate_artifacts_v2.py --run-dir <RUN_DIR> --render-dir <RENDER_DIR>`
+
+### 8) 已知限制
+- 外部 API 限流/超时时，召回质量会受影响；系统会落盘 timeout/fallback 诊断并尽量降级可解释。
+- Hot New 严格隔离策略下，在弱信号窗口会更频繁出现 `< top_k`，这是预期行为。
+
+### 9) 回滚
+- 单提交回滚：`git revert <commit_sha>`
+
 ## Changelog (Last Updated: 2026-02-19)
 ### Commit: Hot-New-Agents Intent Calibration (Top Picks vs Infra Watchlist) (New)
 - 本次目标：

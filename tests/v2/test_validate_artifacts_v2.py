@@ -63,6 +63,11 @@ def test_validate_artifacts_v2_smoke_gate(tmp_path: Path) -> None:
     assert report["checks"]["relevance_not_all_1.0"] is True
     assert report["checks"]["top_picks_not_infra_dominant"] is True
     assert report["checks"]["onepager_has_hot_new_agents_section"] is True
+    assert report["checks"]["top_picks_no_infra_by_default"] is True
+    assert report["checks"]["top_picks_allow_empty_not_fill_infra"] is True
+    assert report["checks"]["cross_source_not_required"] is True
+    assert report["checks"]["four_scores_present"] is True
+    assert report["checks"]["github_multi_recall_present"] is True
 
 
 def test_validate_artifacts_v2_rejects_smoke_tokens_in_live_mode(tmp_path: Path) -> None:
@@ -364,7 +369,7 @@ def test_validate_artifacts_v2_flags_missing_hot_new_agents_section(tmp_path: Pa
     onepager_path = run_dir / "onepager.md"
     onepager = onepager_path.read_text(encoding="utf-8")
     onepager = onepager.replace("DataMode: `smoke`", "DataMode: `live`")
-    onepager = onepager.replace("## Top Picks: Hot New Agents (Top3)", "## Top Picks")
+    onepager = onepager.replace("## Section A: Hot New Top Picks", "## Top Picks")
     onepager_path.write_text(onepager, encoding="utf-8")
 
     validated = subprocess.run(

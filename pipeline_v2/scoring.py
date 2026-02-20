@@ -5,11 +5,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core import NormalizedItem, RankedItem
 from pipeline_v2.topic_profile import TopicProfile
 from pipeline_v2.topic_intent import TopicIntent
+
+
+_HOT_SCORE_WEIGHTS = {
+    "trend": 0.46,
+    "content_worth": 0.29,
+    "relevance": 0.25,
+    "penalty": 0.42,
+}
 
 
 def _clamp01(value: float) -> float:
@@ -228,6 +236,173 @@ def _activity_signals(item: NormalizedItem, *, recall_window: Optional[str]) -> 
         "engagement_signal": round(float(engagement_score), 4),
         "boost": round(float(max(-0.1, min(0.12, boost))), 4),
         "window_days": float(window_days),
+    }
+
+
+def _parse_iso_datetime(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _days_since(value: object) -> Optional[float]:
+    dt = _parse_iso_datetime(value)
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
+
+
+def _content_worth_score(item: NormalizedItem) -> float:
+    signals = _quality_signals(item)
+    text = _topic_text(item)
+    score = 0.0
+
+    density = float(signals["content_density"])
+    if density >= 0.24:
+        score += 0.24
+    elif density >= 0.16:
+        score += 0.18
+    elif density >= 0.1:
+        score += 0.12
+    else:
+        score += 0.05
+
+    if bool(signals["has_quickstart"]):
+        score += 0.20
+    if bool(signals["has_results_or_bench"]):
+        score += 0.18
+    if bool(signals["has_images_non_badge"]):
+        score += 0.12
+
+    evidence_links = int(signals["evidence_links_quality"])
+    if evidence_links >= 3:
+        score += 0.18
+    elif evidence_links >= 1:
+        score += 0.11
+    else:
+        score += 0.03
+
+    if re.search(r"\b(what|how|demo|usage|quickstart|screenshot|showcase|example)\b", text):
+        score += 0.11
+    if re.search(r"\b(cli|api|sdk|install|run|deploy|workflow)\b", text):
+        score += 0.08
+
+    return _clamp01(score)
+
+
+def _anti_dominance_penalty(item: NormalizedItem) -> float:
+    metadata = dict(item.metadata or {})
+    intent_is_infra = bool(metadata.get("intent_is_infra"))
+    infra_exception_event = bool(metadata.get("infra_exception_event"))
+    intent_is_handbook = bool(metadata.get("intent_is_handbook"))
+    intent_partition = str(metadata.get("intent_partition") or "").strip().lower()
+    repeat_penalty = max(0.0, min(0.2, _to_float(metadata.get("recent_topic_repeat_penalty"), 0.0)))
+    score = float(repeat_penalty)
+    if intent_is_infra and not infra_exception_event:
+        score += 0.82
+    elif intent_is_infra and infra_exception_event:
+        score += 0.34
+    if intent_is_handbook or intent_partition == "background":
+        score += 0.76
+    return _clamp01(score)
+
+
+def _bonus_scores(item: NormalizedItem, *, trend_score: float) -> Dict[str, float]:
+    metadata = dict(item.metadata or {})
+    cross_source_count = int(_to_float(metadata.get("cross_source_corroboration_count"), 0.0))
+    cross_source_corroborated = bool(metadata.get("cross_source_corroborated")) or cross_source_count >= 2
+    cross_source_bonus = 0.06 if cross_source_corroborated else 0.0
+
+    points = _to_float(metadata.get("points"), 0.0)
+    comments = _to_float(metadata.get("comment_count", metadata.get("comments", 0)), 0.0)
+    hn_discussion_bonus = 0.0
+    if str(item.source or "").strip().lower() == "hackernews" or points > 0 or comments > 0:
+        hn_discussion_bonus = min(0.1, (points / 320.0) * 0.06 + (comments / 140.0) * 0.04)
+
+    downloads = _to_float(metadata.get("downloads"), 0.0)
+    likes = _to_float(metadata.get("likes"), 0.0)
+    hf_rank = _to_float(metadata.get("search_rank"), 0.0)
+    hf_pool = _to_float(metadata.get("search_pool_size"), 0.0)
+    hf_trending_bonus = 0.0
+    if str(item.source or "").strip().lower() == "huggingface" or downloads > 0:
+        hf_trending_bonus = min(0.08, (downloads / 9000.0) * 0.05 + (likes / 400.0) * 0.03)
+        if hf_rank > 0 and hf_pool > 1:
+            hf_trending_bonus = min(0.08, hf_trending_bonus + max(0.0, 0.03 * (1.0 - (hf_rank - 1.0) / max(1.0, hf_pool - 1.0))))
+
+    bonus_total = max(0.0, min(0.24, cross_source_bonus + hn_discussion_bonus + hf_trending_bonus))
+    single_source_hot = bool(not cross_source_corroborated and float(trend_score) >= 0.72)
+    return {
+        "cross_source": round(float(cross_source_bonus), 4),
+        "hn_discussion": round(float(hn_discussion_bonus), 4),
+        "hf_trending": round(float(hf_trending_bonus), 4),
+        "total": round(float(bonus_total), 4),
+        "single_source_hot": float(1.0 if single_source_hot else 0.0),
+    }
+
+
+def _trend_score(item: NormalizedItem, *, activity: Mapping[str, float], recall_window: Optional[str]) -> float:
+    metadata = dict(item.metadata or {})
+    trend_signal = _clamp01(_to_float(metadata.get("trend_signal_score"), 0.0))
+    recent_update = _clamp01(_to_float(activity.get("recent_update_signal"), 0.0))
+    stars_proxy = _clamp01(_to_float(activity.get("stars_delta_proxy"), 0.0))
+    base = _clamp01(0.55 * trend_signal + 0.25 * recent_update + 0.2 * stars_proxy)
+
+    recency_bonus = 0.0
+    created_days = _days_since(metadata.get("created_at"))
+    pushed_days = _days_since(metadata.get("updated_at") or metadata.get("last_push"))
+    release_days = _days_since(metadata.get("release_published_at"))
+    window_days = max(1, _parse_window_days(recall_window))
+    if created_days is not None and created_days <= min(window_days, 7):
+        recency_bonus += 0.07
+    if pushed_days is not None and pushed_days <= min(window_days, 7):
+        recency_bonus += 0.08
+    if release_days is not None and release_days <= min(window_days, 7):
+        recency_bonus += 0.1
+    return _clamp01(base + recency_bonus)
+
+
+def _hot_score_breakdown(
+    item: NormalizedItem,
+    *,
+    relevance_score: float,
+    activity: Mapping[str, float],
+    recall_window: Optional[str],
+) -> Dict[str, object]:
+    trend_score = _trend_score(item, activity=activity, recall_window=recall_window)
+    content_worth_score = _content_worth_score(item)
+    relevance_component = _clamp01(relevance_score)
+    penalty_score = _anti_dominance_penalty(item)
+    bonus = _bonus_scores(item, trend_score=trend_score)
+    bonus_total = _to_float(bonus.get("total"), 0.0)
+
+    final_hot_score = _clamp01(
+        _HOT_SCORE_WEIGHTS["trend"] * trend_score
+        + _HOT_SCORE_WEIGHTS["content_worth"] * content_worth_score
+        + _HOT_SCORE_WEIGHTS["relevance"] * relevance_component
+        - _HOT_SCORE_WEIGHTS["penalty"] * penalty_score
+        + bonus_total
+    )
+    return {
+        "relevance_score": round(float(relevance_component), 4),
+        "trend_score": round(float(trend_score), 4),
+        "content_worth_score": round(float(content_worth_score), 4),
+        "anti_dominance_penalty": round(float(penalty_score), 4),
+        "bonus": {
+            "cross_source": round(float(_to_float(bonus.get("cross_source"), 0.0)), 4),
+            "hn_discussion": round(float(_to_float(bonus.get("hn_discussion"), 0.0)), 4),
+            "hf_trending": round(float(_to_float(bonus.get("hf_trending"), 0.0)), 4),
+            "total": round(float(bonus_total), 4),
+        },
+        "single_source_hot": bool(_to_float(bonus.get("single_source_hot"), 0.0) > 0.0),
+        "final_hot_score": round(float(final_hot_score), 4),
+        "weights": dict(_HOT_SCORE_WEIGHTS),
     }
 
 
@@ -617,6 +792,24 @@ def rank_items(
         metadata["stars_delta_proxy"] = float(activity["stars_delta_proxy"])
         metadata["activity_signal_boost"] = float(activity["boost"])
         item.metadata = metadata
+
+        hot_breakdown = _hot_score_breakdown(
+            item,
+            relevance_score=float(relevance_score),
+            activity=activity,
+            recall_window=recall_window,
+        )
+        metadata = dict(item.metadata or {})
+        metadata["hot_score_breakdown"] = dict(hot_breakdown)
+        metadata["single_source_hot"] = bool(hot_breakdown.get("single_source_hot"))
+        metadata["final_hot_score"] = float(hot_breakdown.get("final_hot_score", 0.0) or 0.0)
+        metadata["relevance_score_component"] = float(hot_breakdown.get("relevance_score", 0.0) or 0.0)
+        metadata["trend_score_component"] = float(hot_breakdown.get("trend_score", 0.0) or 0.0)
+        metadata["content_worth_score_component"] = float(hot_breakdown.get("content_worth_score", 0.0) or 0.0)
+        metadata["anti_dominance_penalty_component"] = float(hot_breakdown.get("anti_dominance_penalty", 0.0) or 0.0)
+        metadata["bonus_total_component"] = float(dict(hot_breakdown.get("bonus") or {}).get("total", 0.0) or 0.0)
+        item.metadata = metadata
+
         total = _weighted_total(scores)
         total = _clamp01(total * (0.5 + 0.5 * relevance_score))
         quality_boost = _quality_signal_boost(item)
@@ -655,16 +848,7 @@ def rank_items(
         )
 
         if topic_intent is not None and topic_intent.hot_new_agents_mode:
-            trend_objective = _clamp01(0.68 * trend_signal_score + 0.32 * evidence_alignment_proxy)
-            total = _clamp01(0.15 * total + 0.60 * trend_objective + 0.25 * relevance_score)
-            if intent_hot_candidate:
-                total = _clamp01(total + 0.06)
-            else:
-                total = _clamp01(total - 0.04)
-            if intent_is_infra and not infra_exception_event:
-                total = _clamp01(total - 0.22)
-            if intent_is_handbook:
-                total = _clamp01(total - 0.28)
+            total = _clamp01(float(hot_breakdown.get("final_hot_score", 0.0) or 0.0))
 
         # Tier B default exclusion from top3 can be overridden by exceptional talkability.
         if item.tier == "B" and scores["talkability"] >= float(tier_b_top3_talkability_threshold):
@@ -707,6 +891,7 @@ def rank_items(
                 intent_is_handbook,
                 infra_exception_event,
                 intent_bucket,
+                hot_breakdown,
             )
         )
 
@@ -752,6 +937,7 @@ def rank_items(
             _intent_is_handbook,
             _infra_exception_event,
             _intent_bucket,
+            _hot_breakdown,
         ) = row
         if topic and float(relevance_threshold) > 0.0 and not relevance_eligible:
             deferred_relevance_gate.append(row)
@@ -787,19 +973,20 @@ def rank_items(
         agent_high_value_hits,
         agent_score_cap,
         cross_source_bonus,
-            repeat_penalty,
-            repeat_count,
-            corroboration_sources,
-            activity,
-            trend_signal_score,
-            evidence_alignment_proxy,
-            trend_reasons,
-            trend_proxy_used,
-            intent_hot_candidate,
-            intent_is_infra,
-            intent_is_handbook,
-            infra_exception_event,
-            intent_bucket,
+        repeat_penalty,
+        repeat_count,
+        corroboration_sources,
+        activity,
+        trend_signal_score,
+        evidence_alignment_proxy,
+        trend_reasons,
+        trend_proxy_used,
+        intent_hot_candidate,
+        intent_is_infra,
+        intent_is_handbook,
+        infra_exception_event,
+        intent_bucket,
+        hot_breakdown,
         ) in enumerate(ordered, start=1):
         reasons = [
             f"novelty={scores['novelty']:.2f}",
@@ -855,6 +1042,22 @@ def rank_items(
             reasons.append("infra_exception_event=true")
         if intent_bucket:
             reasons.append(f"intent.bucket={intent_bucket}")
+        hot_bonus_payload = dict(hot_breakdown.get("bonus") or {})
+        reasons.extend(
+            [
+                f"hot.relevance_score={float(hot_breakdown.get('relevance_score', 0.0) or 0.0):.2f}",
+                f"hot.trend_score={float(hot_breakdown.get('trend_score', 0.0) or 0.0):.2f}",
+                f"hot.content_worth_score={float(hot_breakdown.get('content_worth_score', 0.0) or 0.0):.2f}",
+                f"hot.anti_dominance_penalty={float(hot_breakdown.get('anti_dominance_penalty', 0.0) or 0.0):.2f}",
+                f"hot.bonus.cross_source={float(hot_bonus_payload.get('cross_source', 0.0) or 0.0):.2f}",
+                f"hot.bonus.hn_discussion={float(hot_bonus_payload.get('hn_discussion', 0.0) or 0.0):.2f}",
+                f"hot.bonus.hf_trending={float(hot_bonus_payload.get('hf_trending', 0.0) or 0.0):.2f}",
+                f"hot.bonus.total={float(hot_bonus_payload.get('total', 0.0) or 0.0):.2f}",
+                f"hot.final_score={float(hot_breakdown.get('final_hot_score', 0.0) or 0.0):.2f}",
+            ]
+        )
+        if bool(hot_breakdown.get("single_source_hot")):
+            reasons.append("single_source_hot=true")
         signals = _quality_signals(item)
         reasons.extend(
             [

@@ -1199,8 +1199,8 @@ def test_runtime_ai_agent_7d_pushes_infra_to_watchlist_not_top_picks(tmp_path: P
     assert all(bool(candidate_map.get(item_id, {}).get("intent_is_infra")) is False for item_id in top_ids[:3])
 
     onepager = (run_dir / "onepager.md").read_text(encoding="utf-8")
-    assert "## Top Picks: Hot New Agents (Top3)" in onepager
-    assert "## Infra Watchlist" in onepager
+    assert "## Section A: Hot New Top Picks" in onepager
+    assert "## Section B: Infra Watchlist" in onepager
 
 
 def test_selection_priority_vector_prefers_quality_complete_attempt() -> None:

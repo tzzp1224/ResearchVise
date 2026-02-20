@@ -130,8 +130,11 @@ def main() -> None:
 
         validator_payload = None
         validator_ok = None
-        if render_dir and run_dir.exists() and render_dir.exists():
-            validator_payload = validate_artifacts(run_dir=run_dir, render_dir=render_dir)
+        if run_dir.exists():
+            if render_dir and render_dir.exists():
+                validator_payload = validate_artifacts(run_dir=run_dir, render_dir=render_dir, web_only=False)
+            else:
+                validator_payload = validate_artifacts(run_dir=run_dir, render_dir=None, web_only=True)
             validator_ok = bool(validator_payload.get("ok"))
 
         print(
